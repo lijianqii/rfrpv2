@@ -1310,3 +1310,21 @@ M1 启动「无输出」的根因是**配置解析静默丢弃 `[[proxy]]`**，�
 - **根因**：`ClientConfig` 的代理数组字段命名为 `proxies`，而 TOML 用 `[[proxy]]`（键为 `proxy`）。serde 默认忽略未知键，导致所有代理条目被静默丢弃（`proxies.len()==0`），控制循环无代理可注册 → 静默空转。单测 `full_client_config_validates` 此前只调 `validate()`（0 代理时恒通过），未捕获该回归。
 - **修复**：`crates/rfrp-common/src/config/client.rs` 给 `proxies` 字段加 `#[serde(rename = "proxy")]`，与 `[[proxy]]` 对齐；并加固单测断言 `proxies.len()==2`，`example_smoke` 同时断言。
 - **附带可观测性增强**（直接缓解「无输出」困惑）：控制/工作连接建立与代理注册/拒绝均补 `INFO/WARN` 日志（`connected to server` / `control connection established` / `registering proxies` / `received NewProxy` / `proxy registered (tcp)` / `proxy registered` / `proxy registration rejected`）。
+
+#### 17.13 M2 推进（健壮性，进行中）
+
+M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、优雅退出、工作连接池预热（§12 / §8.3 / §14.4）。为控制步幅与回归风险，拆分为可独立测试的子任务：
+
+| 子任务 | 内容 | 状态 |
+|----|----|----|
+| M2a | 控制连接心跳保活 + 控制循环分支单测 | 完成 |
+| M2b | 客户端断线检测 + 指数退避重连 + run_id 复用（服务端按 run_id 清理旧 Session 后恢复 Proxy） | 待做 |
+| M2c | 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充，work_id=0 语义） | 待做 |
+| M2d | 优雅退出（tokio signal -> 资源回收，在途连接 GRACEFUL_SHUTDOWN_TIMEOUT 强制关闭） | 待做 |
+
+**M2a 完成内容**
+- 服务端控制连接主动发送 Heartbeat（每 HEARTBEAT_INTERVAL=30s），并通过 Notify + last_resp 时间戳实现超时断开（HEARTBEAT_TIMEOUT=10s 内未收到 HeartbeatResp 即清理 Session 并中止所有代理监听）。客户端维持对 Heartbeat 的 HeartbeatResp 应答（§8.3 服务端->客户端方向已生效；客户端->服务端主动心跳与重连在 M2b 补齐）。
+- 控制循环泛型化（handle_control_login<S> / control_loop<S>，S: AsyncRead+AsyncWrite+Unpin+Send+'static）：既服务生产 TcpStream，也便于用内存双工流做单测。
+- 补齐控制循环分支单测（§17.12.1 缺口）：服务端 newproxy->resp / heartbeat->resp / close->退出 / heartbeat 超时断开 / 非 Login 首帧报错；客户端 NewProxyResp->oneshot 路由 / heartbeat->应答 / ReqWorkConn->派生任务且不退出 / close->退出。全部经 tokio::io::duplex 内存双工驱动，无需真实端口。
+
+**测试计数**：全量 53 -> 60（rfrps lib 7->10，rfrpc lib 1->5）。

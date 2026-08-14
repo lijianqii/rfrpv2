@@ -12,18 +12,20 @@ use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use tokio::io::split;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::client::ClientState;
 use crate::workconn;
 
-pub async fn control_loop(
-    stream: TcpStream,
+pub async fn control_loop<S>(
+    stream: S,
     mut rx: mpsc::Receiver<Message>,
     state: Arc<ClientState>,
     config: ClientConfig,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (read_half, write_half) = split(stream);
     let mut reader = FramedRead::new(read_half, FrameCodec);
     let mut writer = FramedWrite::new(write_half, FrameCodec);
@@ -98,4 +100,137 @@ pub async fn control_loop(
 
     writer_task.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfrp_common::protocol::msg::{Close, Heartbeat, Message, NewProxyResp, ReqWorkConn};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::io::{duplex, AsyncRead, AsyncWrite};
+    use tokio::sync::{mpsc, oneshot};
+
+    async fn send_msg<W: AsyncWrite + Unpin>(w: &mut FramedWrite<W, FrameCodec>, m: Message) {
+        w.send(m.to_frame().unwrap()).await.unwrap();
+    }
+
+    async fn recv_msg<R: AsyncRead + Unpin>(r: &mut FramedRead<R, FrameCodec>) -> Message {
+        Message::from_frame(&r.next().await.unwrap().unwrap()).unwrap()
+    }
+
+    fn client_state_with_resp(name: &str) -> (Arc<ClientState>, oneshot::Receiver<NewProxyResp>) {
+        let state = Arc::new(ClientState {
+            server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            proxies: vec![],
+            resps: Mutex::new(HashMap::new()),
+        });
+        let (otx, orx) = oneshot::channel();
+        state.resps.lock().unwrap().insert(name.into(), otx);
+        (state, orx)
+    }
+
+    fn default_state() -> Arc<ClientState> {
+        Arc::new(ClientState {
+            server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            proxies: vec![],
+            resps: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn newproxy_resp_routed_to_oneshot() {
+        let (client_end, server_end) = duplex(8192);
+        let (state, orx) = client_state_with_resp("ssh");
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(client_end, rx, state, config));
+
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+
+        assert!(matches!(recv_msg(&mut sr).await, Message::Login(_)));
+        send_msg(
+            &mut sw,
+            Message::NewProxyResp(NewProxyResp {
+                proxy_name: "ssh".into(),
+                ok: true,
+                error: None,
+            }),
+        )
+        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(2), orx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resp.ok);
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_responds() {
+        let (client_end, server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        let _ = recv_msg(&mut sr).await; // Login
+        send_msg(&mut sw, Message::Heartbeat(Heartbeat { ts: 7 })).await;
+        match recv_msg(&mut sr).await {
+            Message::HeartbeatResp(h) => assert_eq!(h.ts, 7),
+            other => panic!("expected HeartbeatResp, got {other:?}"),
+        }
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reqworkconn_keeps_loop_alive() {
+        let (client_end, server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        let _ = recv_msg(&mut sr).await; // Login
+        send_msg(
+            &mut sw,
+            Message::ReqWorkConn(ReqWorkConn {
+                proxy_name: "ssh".into(),
+                work_id: 1,
+            }),
+        )
+        .await;
+        send_msg(&mut sw, Message::Heartbeat(Heartbeat { ts: 9 })).await;
+        match recv_msg(&mut sr).await {
+            Message::HeartbeatResp(h) => assert_eq!(h.ts, 9),
+            other => panic!("expected HeartbeatResp, got {other:?}"),
+        }
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_exits() {
+        let (client_end, server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        let _ = recv_msg(&mut sr).await; // Login
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
 }

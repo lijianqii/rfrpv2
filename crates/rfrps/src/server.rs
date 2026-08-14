@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
+use rfrp_common::constants::{HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
@@ -90,7 +92,17 @@ async fn handle_connection(
 ) -> Result<()> {
     let (frame, stream) = read_one_frame(stream).await?;
     match frame.msg_type {
-        MSG_LOGIN => control::handle_control_login(frame, stream, state, config).await,
+        MSG_LOGIN => {
+            control::handle_control_login(
+                frame,
+                stream,
+                state,
+                config,
+                Duration::from_secs(HEARTBEAT_INTERVAL),
+                Duration::from_secs(HEARTBEAT_TIMEOUT),
+            )
+            .await
+        }
         MSG_START_WORK_CONN => work::handle_work_connection(frame, stream, state).await,
         other => {
             tracing::warn!("unexpected first frame msg_type={other:#x}, closing");
