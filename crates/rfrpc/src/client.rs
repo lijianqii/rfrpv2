@@ -1,10 +1,13 @@
-//! 客户端主控：连接服务端、登录、按配置串行注册代理，然后长驻控制循环。
+//! 客户端主控：连接服务端、登录、按配置串行注册代理，长驻控制循环；
+//! 断开后按指数退避重连，并复用 run_id 恢复代理（DESIGN §8.1 / §8.3 / §6.6）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
+use rfrp_common::constants::{MAX_RUN_ID_LEN, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX};
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
 use tokio::net::TcpStream;
@@ -16,9 +19,21 @@ use crate::control;
 /// 客户端运行时共享状态（控制循环与注册逻辑共享）。
 pub struct ClientState {
     pub server_addr: std::net::SocketAddr,
+    /// 重连身份标识（持久化复用，DESIGN §6.6）。
+    pub run_id: String,
     pub proxies: Vec<ClientProxy>,
     /// proxy_name → NewProxyResp 的一次性回传通道（注册时 await）。
     pub resps: Mutex<HashMap<String, oneshot::Sender<NewProxyResp>>>,
+    /// Login 结果一次性回传通道（连接时 await，用于区分致命/可恢复失败）。
+    pub login_tx: Mutex<Option<oneshot::Sender<LoginResp>>>,
+}
+
+/// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
+enum ConnectOutcome {
+    /// 正常断开或瞬断，应重连。
+    Reconnect,
+    /// 致命错误（鉴权 / 版本不兼容），不应重连。
+    Fatal(String),
 }
 
 /// rfrpc 客户端实例。
@@ -31,30 +46,93 @@ impl Client {
         Ok(Self { config })
     }
 
-    /// 连接服务端并完成注册，随后长驻控制循环直到断开。
+    /// 长驻运行：连接 → 注册 → 控制循环；断开后按指数退避重连（§8.3）。
+    /// 仅当收到致命 Login 失败（鉴权 / 版本不兼容）时返回错误退出。
     pub async fn run(self) -> AnyResult<()> {
+        let run_id = self.load_or_create_run_id();
+        let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
+        loop {
+            match self.connect_once(&run_id).await {
+                Ok(ConnectOutcome::Fatal(reason)) => {
+                    return Err(anyhow::anyhow!("login fatal: {reason}"));
+                }
+                Ok(ConnectOutcome::Reconnect) => {
+                    tracing::info!(
+                        backoff_secs = backoff.as_secs(),
+                        "control closed, reconnecting"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "transient error, reconnecting");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
+                }
+            }
+        }
+    }
+
+    /// 单次连接：建连、登录、注册代理、长驻控制循环直到断开。
+    async fn connect_once(&self, run_id: &str) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
-        let stream = TcpStream::connect(server_addr).await?;
+        let stream = match TcpStream::connect(server_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "connect failed");
+                return Err(anyhow::anyhow!(e));
+            }
+        };
         tracing::info!(server = %server_addr, "connected to server");
 
         let state = Arc::new(ClientState {
             server_addr,
+            run_id: run_id.to_string(),
             proxies: self.config.proxies.clone(),
             resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
+        let (login_otx, login_orx) = oneshot::channel();
+        state.login_tx.lock().unwrap().replace(login_otx);
 
-        // 先启动控制循环（消费 rx、处理 NewProxyResp / ReqWorkConn / Heartbeat），
-        // 否则注册阶段 await NewProxyResp 会因控制循环尚未运行而超时（见 DESIGN §8.1）。
         let ctrl = tokio::spawn(control::control_loop(
             stream,
             rx,
             state.clone(),
             self.config.clone(),
         ));
-        tracing::info!(count = state.proxies.len(), "registering proxies");
 
-        // 串行注册代理：每个 NewProxy 发送后等待对应 NewProxyResp。
+        // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
+        match tokio::time::timeout(Duration::from_secs(10), login_orx).await {
+            Ok(Ok(resp)) => {
+                if !resp.ok {
+                    let reason = resp
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "login rejected".into());
+                    let lower = reason.to_lowercase();
+                    if lower.contains("version mismatch") || lower.contains("auth failed") {
+                        tracing::error!(error = %reason, "login fatal; not reconnecting");
+                        let _ = ctrl.await;
+                        return Ok(ConnectOutcome::Fatal(reason));
+                    }
+                    tracing::warn!(error = ?resp.error, "login rejected; reconnecting");
+                    let _ = ctrl.await;
+                    return Ok(ConnectOutcome::Reconnect);
+                }
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("login response channel dropped; reconnecting");
+                return Ok(ConnectOutcome::Reconnect);
+            }
+            Err(_) => {
+                tracing::warn!("login response timeout; reconnecting");
+                return Ok(ConnectOutcome::Reconnect);
+            }
+        }
+
+        tracing::info!(count = state.proxies.len(), "registering proxies");
         for p in &state.proxies {
             let (otx, orx) = oneshot::channel();
             state.resps.lock().unwrap().insert(p.name.clone(), otx);
@@ -77,11 +155,53 @@ impl Client {
             }
         }
 
-        // 注册完成后长驻控制循环（直到断开）。
         let _ = ctrl.await;
-        Ok(())
+        Ok(ConnectOutcome::Reconnect)
+    }
+
+    /// 生成或复用 run_id 并持久化（§6.6 / §8.3 重连身份）。
+    fn load_or_create_run_id(&self) -> String {
+        let path = match &self.config.client.run_id_file {
+            Some(p) => PathBuf::from(p),
+            None => default_run_id_path(),
+        };
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN {
+                return s;
+            }
+        }
+        let rid = uuid::Uuid::new_v4().to_string();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::File::create(&path) {
+            Ok(mut f) => {
+                let _ = std::io::Write::write_all(&mut f, rid.as_bytes());
+                set_file_mode_0600(&path);
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to persist run_id"),
+        }
+        rid
     }
 }
+
+/// 默认 run_id 持久化路径：`$HOME/.rfrp/run_id`（Windows 用 `$USERPROFILE`）。
+fn default_run_id_path() -> PathBuf {
+    let base = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(base).join(".rfrp").join("run_id")
+}
+
+/// Unix 下将 run_id 文件权限设为 0600；其他平台静默跳过（§6.6）。
+#[cfg(unix)]
+fn set_file_mode_0600(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn set_file_mode_0600(_path: &std::path::Path) {}
 
 /// 由配置条目构造 `NewProxy` 控制消息。
 pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {
@@ -96,6 +216,7 @@ pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rfrp_common::config::{ClientConfig, ClientProxy, ClientSection};
     use rfrp_common::protocol::msg::{NewProxy, ProxyType};
 
     #[test]
@@ -114,5 +235,27 @@ mod tests {
         assert_eq!(np.r#type, ProxyType::Tcp);
         assert_eq!(np.remote_port, Some(8022));
         assert_eq!(np.custom_domains, Some(vec!["a.example.com".into()]));
+    }
+
+    #[test]
+    fn run_id_persisted_and_reused() {
+        let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("run_id");
+        let r1 = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+        let r2 = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+        assert!(!r1.is_empty());
+        assert_eq!(r1, r2, "run_id must be reused across starts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 构造仅覆盖 run_id_file 的 ClientConfig，避免依赖完整字段。
+    fn cfg_for(path: &std::path::Path) -> ClientConfig {
+        ClientConfig {
+            client: ClientSection {
+                run_id_file: Some(path.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 }

@@ -132,6 +132,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
+    use tokio::sync::Notify;
 
     fn test_config(allow_ports: &str) -> ServerConfig {
         let proxy = ProxySection {
@@ -161,6 +162,7 @@ mod tests {
             session_id: "s".into(),
             tx,
             proxies: Mutex::new(HashMap::new()),
+            stop: Arc::new(Notify::new()),
         })
     }
 

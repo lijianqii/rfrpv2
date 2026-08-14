@@ -34,6 +34,8 @@ pub struct Session {
     pub tx: mpsc::Sender<Message>,
     /// 已注册代理的监听任务句柄（用于断开时清理）。
     pub proxies: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// 断开 / 重连通知（§8.3）：清理旧会话或正常断开时唤醒控制循环退出。
+    pub stop: Arc<Notify>,
 }
 
 /// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
@@ -66,7 +68,18 @@ where
         session_id: session_id.clone(),
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
+        stop: Arc::new(Notify::new()),
     });
+
+    // 重连去重（§8.3）：同一 run_id 的旧会话先清理再接受新登录。
+    {
+        let mut reg = state.sessions.lock().unwrap();
+        if let Some(old) = reg.get(&session.run_id) {
+            cleanup(old, &state);
+            reg.remove(&session.run_id);
+        }
+        reg.insert(session.run_id.clone(), session.clone());
+    }
 
     let (read_half, write_half) = split(stream);
     let mut reader = FramedRead::new(read_half, FrameCodec);
@@ -169,17 +182,31 @@ where
                 tracing::info!(session = %session_id, "control connection closed by heartbeat timeout");
                 break;
             }
+            _ = session.stop.notified() => {
+                tracing::info!(session = %session_id, "control connection stopped (replaced or shutdown)");
+                break;
+            }
         }
     }
 
     heartbeat_task.abort();
     writer_task.abort();
+    // 从会话注册表移除自身（仅当仍是当前条目，避免误删重连后的新会话）。
+    {
+        let mut reg = state.sessions.lock().unwrap();
+        if let Some(s) = reg.get(&session.run_id) {
+            if s.session_id == session.session_id {
+                reg.remove(&session.run_id);
+            }
+        }
+    }
     cleanup(&session, &state);
     Ok(())
 }
 
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
+    session.stop.notify_waiters();
     for (_, h) in session.proxies.lock().unwrap().drain() {
         h.abort();
     }
@@ -312,5 +339,55 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_same_run_id_replaces_old_session() {
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+
+        // 首个同名 run_id 会话登录。
+        let (s1, c1) = duplex(8192);
+        let t1 = tokio::spawn(handle_control_login(
+            login_frame("rdup"),
+            s1,
+            state.clone(),
+            config.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr1, _cw1) = split(c1);
+        let mut cr1 = FramedRead::new(cr1, FrameCodec);
+        let _ = recv_msg(&mut cr1).await; // 消费 LoginResp，避免缓冲满
+
+        // 同名 run_id 的第二个会话登录 -> 应触发旧会话去重清理（§8.3）。
+        let (s2, c2) = duplex(8192);
+        let t2 = tokio::spawn(handle_control_login(
+            login_frame("rdup"),
+            s2,
+            state.clone(),
+            config.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr2, _cw2) = split(c2);
+        let mut cr2 = FramedRead::new(cr2, FrameCodec);
+        let resp2 = recv_msg(&mut cr2).await;
+        assert!(
+            matches!(resp2, Message::LoginResp(_)),
+            "second login must succeed"
+        );
+
+        // 旧会话应被 stop 通知退出（去重清理）。
+        let r = tokio::time::timeout(Duration::from_secs(3), t1).await;
+        assert!(
+            r.is_ok(),
+            "old control loop must stop on reconnect with same run_id"
+        );
+        r.unwrap().unwrap().unwrap();
+
+        // 新会话仍存活。
+        assert!(!t2.is_finished());
+        t2.abort();
     }
 }

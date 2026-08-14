@@ -29,6 +29,8 @@ pub struct ServerState {
     pub work_id: AtomicU64,
     /// work_id → 待处理用户连接。工作连接到达后消费。
     pub pending: Mutex<HashMap<u64, PendingWork>>,
+    /// run_id → 控制会话。重连时按 run_id 定位旧会话并清理（§8.3）。
+    pub sessions: Mutex<HashMap<String, Arc<crate::control::Session>>>,
 }
 
 impl ServerState {
@@ -36,6 +38,7 @@ impl ServerState {
         Arc::new(Self {
             work_id: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
         })
     }
 

@@ -49,10 +49,10 @@ where
         }
     });
 
-    // 登录（M1：token 不校验，可空）。
+    // 登录（M1：token 不校验，可空；run_id 来自状态以便重连复用，§6.6 / §8.3）。
     out_tx
         .send(Message::Login(Login {
-            run_id: uuid::Uuid::new_v4().to_string(),
+            run_id: state.run_id.clone(),
             token: config.client.token.clone(),
             version: PROTOCOL_VERSION,
         }))
@@ -81,6 +81,12 @@ where
                             Message::Heartbeat(h) => {
                                 out_tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
                             }
+                            Message::LoginResp(r) => {
+                                // 路由到连接阶段，供 run() 区分致命 / 可恢复失败（§8.1）。
+                                if let Some(tx) = state.login_tx.lock().unwrap().take() {
+                                    let _ = tx.send(r);
+                                }
+                            }
                             Message::Close(_) => break,
                             _ => {}
                         }
@@ -105,7 +111,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rfrp_common::protocol::msg::{Close, Heartbeat, Message, NewProxyResp, ReqWorkConn};
+    use rfrp_common::protocol::msg::{
+        Close, Heartbeat, LoginResp, Message, NewProxyResp, ReqWorkConn,
+    };
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -124,8 +132,10 @@ mod tests {
     fn client_state_with_resp(name: &str) -> (Arc<ClientState>, oneshot::Receiver<NewProxyResp>) {
         let state = Arc::new(ClientState {
             server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            run_id: String::new(),
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
         });
         let (otx, orx) = oneshot::channel();
         state.resps.lock().unwrap().insert(name.into(), otx);
@@ -135,8 +145,10 @@ mod tests {
     fn default_state() -> Arc<ClientState> {
         Arc::new(ClientState {
             server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            run_id: String::new(),
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
         })
     }
 
@@ -232,5 +244,47 @@ mod tests {
         let _ = recv_msg(&mut sr).await; // Login
         send_msg(&mut sw, Message::Close(Close { reason: None })).await;
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_resp_routed_to_state() {
+        // 校验 LoginResp 被路由到 state.login_tx，供 run() 区分致命/可恢复失败（§8.1）。
+        let (client_end, server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let state = Arc::new(ClientState {
+            server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            run_id: "rid".into(),
+            proxies: vec![],
+            resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
+        });
+        let (lotx, lorx) = oneshot::channel();
+        state.login_tx.lock().unwrap().replace(lotx);
+
+        let task = tokio::spawn(control_loop(client_end, rx, state, config));
+
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        let _ = recv_msg(&mut sr).await; // 客户端发出的 Login
+        send_msg(
+            &mut sw,
+            Message::LoginResp(LoginResp {
+                ok: false,
+                error: Some("auth failed".into()),
+                session_id: None,
+                work_conn_tls: None,
+            }),
+        )
+        .await;
+
+        let resp = tokio::time::timeout(Duration::from_secs(2), lorx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("auth failed"));
+        task.abort();
     }
 }

@@ -1318,7 +1318,7 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 | 子任务 | 内容 | 状态 |
 |----|----|----|
 | M2a | 控制连接心跳保活 + 控制循环分支单测 | 完成 |
-| M2b | 客户端断线检测 + 指数退避重连 + run_id 复用（服务端按 run_id 清理旧 Session 后恢复 Proxy） | 待做 |
+| M2b | 客户端断线检测 + 指数退避重连 + run_id 复用（服务端按 run_id 清理旧 Session 后恢复 Proxy） | 完成 |
 | M2c | 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充，work_id=0 语义） | 待做 |
 | M2d | 优雅退出（tokio signal -> 资源回收，在途连接 GRACEFUL_SHUTDOWN_TIMEOUT 强制关闭） | 待做 |
 
@@ -1327,4 +1327,11 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 控制循环泛型化（handle_control_login<S> / control_loop<S>，S: AsyncRead+AsyncWrite+Unpin+Send+'static）：既服务生产 TcpStream，也便于用内存双工流做单测。
 - 补齐控制循环分支单测（§17.12.1 缺口）：服务端 newproxy->resp / heartbeat->resp / close->退出 / heartbeat 超时断开 / 非 Login 首帧报错；客户端 NewProxyResp->oneshot 路由 / heartbeat->应答 / ReqWorkConn->派生任务且不退出 / close->退出。全部经 tokio::io::duplex 内存双工驱动，无需真实端口。
 
-**测试计数**：全量 53 -> 60（rfrps lib 7->10，rfrpc lib 1->5）。
+**M2b 完成内容**
+- 客户端长驻重连循环：`Client::run` 拆出 `connect_once`，按指数退避（RECONNECT_BACKOFF_INITIAL=1s 翻倍至 RECONNECT_BACKOFF_MAX=30s）在网络瞬断后重连；正常断开（Close）同样重连。
+- run_id 复用：首次生成 `uuid` 并持久化到 `run_id_file`（默认 `$HOME/.rfrp/run_id`，Unix 0600）；重启复用同一 run_id，服务端据此恢复代理（§6.6 / §8.3）。
+- 致命错误判定：`control_loop` 路由 `LoginResp` 到 `state.login_tx`；`connect_once` 据此区分——`auth failed` / `version mismatch` 视为致命，直接退出不重连；其它（端口占用等运行时拒绝 / 超时 / 网络错误）可恢复，重连。
+- 服务端 run_id 去重：`ServerState.sessions` 维护 `run_id -> Session` 注册表；同名 run_id 新登录触发 `cleanup` 清理旧会话（中止其代理监听、清理 pending、经 `Session.stop: Notify` 唤醒旧控制循环退出），再注册新会话。会话结束（正常或心跳超时）仅当注册表内仍为自身条目时才移除，避免误删重连后的新会话。
+- 新增单测：服务端「同名 run_id 重连替换旧会话」（旧控制循环被 stop 通知退出、新会话存活）；客户端 `LoginResp` 路由到 `login_tx`；`run_id` 持久化复用（临时文件）。
+
+**测试计数**：全量 60 -> 63（rfrps lib 10->11，rfrpc lib 5->7）。
