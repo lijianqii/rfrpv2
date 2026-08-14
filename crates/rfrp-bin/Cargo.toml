@@ -1,0 +1,20 @@
+[package]
+name = "rfrp-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rfrp"
+path = "src/main.rs"
+
+[dependencies]
+rfrp-common = { path = "../rfrp-common" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rfrps = { path = "../rfrps" }
+rfrpc = { path = "../rfrpc" }

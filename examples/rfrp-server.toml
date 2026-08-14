@@ -1,0 +1,39 @@
+# rfrp 服务端配置示例（DESIGN §9.1）
+# 部署时请修改 token、证书路径、allow_ports 等。
+
+[server]
+bind_addr = "127.0.0.1"           # 控制监听地址，默认 0.0.0.0
+bind_port = 7000                # 控制端口，默认 7000
+token = "shared-secret"          # 鉴权 token
+tls_enable = false                # 控制链路 TLS 总开关（M1 测试期可关，生产必须开）
+tls_cert = "./cert.pem"          # 控制链路证书
+tls_key  = "./key.pem"
+work_conn_tls = false             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+
+# TLS 分层说明（避免混淆）：
+#   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps<->rfrpc 控制连接
+#   2) 工作连接 TLS：work_conn_tls，加密 rfrps<->rfrpc 数据面工作连接（复用 tls_cert/tls_key 证书）
+#   3) HTTPS vhost TLS：vhost_tls_cert/vhost_tls_key，终止 rfrps<->外部用户的 HTTPS（与 1/2 独立）
+
+[dashboard]                      # 整段可选，省略则不启用 Dashboard
+addr = "0.0.0.0:7500"           # 独立 HTTP 服务，不走控制协议，与 bind_port 无关
+user = "admin"
+password = "changeme"            # 最小长度 6（见 §9.4 校验），生产环境务必更换强密码
+
+[proxy]
+# 允许客户端使用的公网端口范围
+allow_ports = "6000-6100,7001-7010"
+# vhost 监听（http/https 各自可选，省略即 None 不监听该类型，无隐式默认 80/443）
+# 注意：80/443 为特权端口（<1024），Linux 下需 root 运行或通过 setcap 授权：
+#   sudo setcap 'cap_net_bind_service=+ep' /path/to/rfrp
+# 非特权场景可改用 8080/8443 等高位端口
+vhost_http_port  = 80
+vhost_https_port = 443
+# HTTPS vhost 证书（可与控制链路证书不同）
+vhost_tls_cert = "./vhost-cert.pem"
+vhost_tls_key  = "./vhost-key.pem"
+
+[log]                            # 整段可选，默认 level=info、output=stderr、format=text
+level = "info"                   # trace|debug|info|warn|error
+output = "stderr"                # stderr 或 file:/path/to.log
+format = "text"                  # text|json

@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs / temp
+*.log
+*.out
+/tmp/
+
+# pi agent session dir
+.pi/

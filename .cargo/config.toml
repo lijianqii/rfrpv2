@@ -1,0 +1,11 @@
+# 交叉编译配置（DESIGN §3.3.2）。
+# 全部产物在 Debian 开发机上一次构建产出，无需 Windows 环境。
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# 静态链接 winpthread，产物在 Windows 上无需额外 DLL。
+rustflags = ["-C", "link-args=-static", "-C", "link-args=-lpthread"]

@@ -1,0 +1,21 @@
+[package]
+name = "rfrpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rfrp-common = { path = "../rfrp-common" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+rfrps = { path = "../rfrps" }
+rfrp-common = { path = "../rfrp-common" }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,19 @@
+[Unit]
+Description=rfrp client (Rust Fast Reverse Proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=rfrp
+Group=rfrp
+WorkingDirectory=/etc/rfrp
+ExecStart=/usr/local/bin/rfrp client -c /etc/rfrp/rfrp-client.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rfrp /var/log/rfrp
+
+[Install]
+WantedBy=multi-user.target

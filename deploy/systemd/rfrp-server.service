@@ -1,0 +1,21 @@
+[Unit]
+Description=rfrp server (Rust Fast Reverse Proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=rfrp
+Group=rfrp
+WorkingDirectory=/etc/rfrp
+ExecStart=/usr/local/bin/rfrp server -c /etc/rfrp/rfrp-server.toml
+Restart=on-failure
+RestartSec=5
+# run_id 建议指向持久化路径（见 DESIGN §6.2.1）
+# 若配置未指定，默认 ~/.rfrp/run_id（服务账户家目录）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rfrp /var/log/rfrp
+
+[Install]
+WantedBy=multi-user.target
