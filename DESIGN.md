@@ -1288,9 +1288,9 @@ $ cargo fmt --check           # FMT CLEAN
 
 - **清理**：删除未使用的 `frame::framed_split` 及其导入；`bridge` 泛型化为 `AsyncRead + AsyncWrite + Unpin`，可复用/可测（见 §13）。
 - **新增单测**：rfrps 6 项（注册拒绝 + work_id）、rfrpc 1 项（配置映射）、bridge 1 项（双向转发）、集成 2 项（并发用户、多代理）。
-- **工具链**：`.gitignore`、`rustfmt.toml`(max_width=100)、`Makefile`(`fmt`/`fmt-check`/`clippy`/`build`/`test`/`ci`)、`.github/workflows/ci.yml`。
-- **CI（§11）**：`fmt --check` + `clippy --all-targets -- -D warnings` + `build` + `test`，并加 musl / windows-gnu 交叉编译验证（三产物，§3.3.2）。
-- **质量门等价**：本地 `make ci` 与 CI 一致；`clippy` 零容忍警告。
+- **工具链**：`.gitignore`、`rustfmt.toml`(max_width=100)、`Makefile`(`fmt`/`fmt-check`/`clippy`/`build`/`test`/`ci`)。
+- **本地质量门（make ci）**：`fmt --check` + `clippy --all-targets -- -D warnings` + `build` + `test`；目标产物需满足 musl / windows-gnu 交叉编译验证（三产物，§3.3.2）。
+- **质量门**：`clippy` 零容忍警告；本地 `make ci` 覆盖格式检查 + Clippy 严格 + 构建 + 测试（不依赖 GitHub Workflow）。
 
 新增/调整文件：`rustfmt.toml`、`Makefile`、`.gitignore`、`.github/workflows/ci.yml`、`crates/rfrps/src/bridge.rs`（泛型 + 测试）、`crates/rfrpc/src/bridge.rs`（泛型）、`crates/rfrps/src/listener.rs`（单测）、`crates/rfrpc/src/client.rs`（单测）、`crates/rfrpc/tests/tcp_proxy.rs`（重构 + 2 集成测试）、`crates/rfrpc/tests/example_smoke.rs`（真实示例配置回归）、`crates/rfrp-common/tests/config_files.rs`（示例文件契约测试）、`crates/rfrp-common/src/config/{client,server}.rs`（deny_unknown_fields + 配置正/负例单测）、`crates/rfrp-common/src/protocol/frame.rs`（删 `framed_split`）。
 

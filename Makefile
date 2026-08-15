@@ -1,5 +1,4 @@
-# 常用开发任务（与 .github/workflows/ci.yml 保持一致）。
-# 用法：make <target>，默认 make ci
+# 常用开发任务。用法：make <target>，默认 make ci
 
 .PHONY: all fmt fmt-check clippy build check test ci clean
 
