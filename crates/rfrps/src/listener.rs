@@ -77,13 +77,18 @@ async fn proxy_accept_loop(
                 match accepted {
                     Ok((user, peer)) => {
                         // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
+                        // 桥接必须在独立任务中进行，不能在 accept 循环内 await，
+                        // 否则首个占用池连接的用户会话期间，后续用户连接无法被 accept（卡死，§8.2）。
                         let pooled = {
                             let mut pools = session.pools.lock().unwrap();
                             pools.get_mut(&proxy_name).and_then(|v| v.pop())
                         };
                         if let Some(work) = pooled {
                             tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
-                            let _ = bridge::bridge(user, work).await;
+                            tokio::spawn(async move {
+                                let _ = bridge::bridge(user, work).await;
+                            });
+                            // 立即请求补充预热连接（无需等待本次用户断开）。
                             if session
                                 .tx
                                 .send(Message::ReqWorkConn(ReqWorkConn {

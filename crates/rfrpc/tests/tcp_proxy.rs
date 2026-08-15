@@ -211,6 +211,41 @@ async fn tcp_proxy_pool_size_two() {
 }
 
 #[tokio::test]
+async fn tcp_proxy_concurrent_same_proxy_keep_open() {
+    // 多用户同时持有长连接时，首个命中预热池（pool_size=1）的连接若把桥接
+    // 放到 accept 循环内 await，会阻塞后续 accept，导致其余连接卡死（§8.2）。
+    // 本测试所有连接保持打开，验证并发可达（无超时即通过）。
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server().await;
+    let remote = free_port();
+    let cli = start_client(addr, vec![tcp_proxy("p1", echo_port, remote)]).await;
+    wait_ready().await;
+
+    let n = 5u16;
+    let mut users = Vec::new();
+    for i in 0..n {
+        let mut u = TcpStream::connect((addr.ip(), remote))
+            .await
+            .expect("connect to server remote_port");
+        u.write_all(format!("u{i}").as_bytes()).await.unwrap();
+        users.push(u);
+    }
+    let verify = async {
+        for (i, u) in users.iter_mut().enumerate() {
+            let mut buf = vec![0u8; format!("u{i}").len()];
+            u.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, format!("u{i}").as_bytes());
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), verify)
+        .await
+        .expect("all concurrent connections should be served");
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
 async fn tcp_proxy_rejects_unregistered_port() {
     let (srv, addr) = start_server().await;
     let unregistered = free_port();

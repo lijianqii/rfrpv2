@@ -1353,5 +1353,6 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 
 - 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 心跳误杀修复（§8.3 / 回归）：纠正 rfrps 心跳超时判定——此前用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在周期 tick 检查，因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 在首个周期即误判超时，误杀控制连接并触发重连去重、回收代理监听与在途工作连接（表现为代理端口 `Connection refused`、在途 SSH 会话 `closed by remote host`）。改为 ping/pong：`timeout(HEARTBEAT_TIMEOUT, pong.notified())` 等待**本次**心跳回应，未收到才断开。新增回归单测 `heartbeat_keeps_alive_when_client_responds`（客户端正常回应时控制任务保持存活）。
+- 代理 accept 循环阻塞修复（§8.2 / 回归）：命中预热池时，原实现在 `proxy_accept_loop` 内 `bridge::bridge(user, work).await` 内联等待，会阻塞整个 accept 循环——首个命中池（pool_size>0 时必然先命中）的长连接会话期间，后续用户连接无法被 accept（TCP 留在 backlog 无应用层处理），表现为“仅首个连接可用、其余全部卡住”。改为将桥接 `tokio::spawn` 到独立任务，accept 循环立即 `continue` 继续接客，并立即回 `ReqWorkConn{work_id=0}` 补充预热连接。新增回归单测 `tcp_proxy_concurrent_same_proxy_keep_open`（多用户长连接并发可达）。
 
-**测试计数**：全量 78 -> 96（较 M2d 边界补强 95 再 +1：服务端心跳 ping/pong 回归测试，修复“间隔>超时”误杀控制连接）。
+**测试计数**：全量 78 -> 97（较 M2d 边界补强 95 再 +2：服务端心跳 ping/pong 回归 + 代理并发长连接回归，分别修复误杀控制连接与 accept 循环阻塞）。
