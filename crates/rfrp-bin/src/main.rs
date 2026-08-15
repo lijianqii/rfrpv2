@@ -21,7 +21,9 @@ async fn main() -> ExitCode {
 
     match cli.command {
         // ---- server ----
-        Commands::Server { config, .. } => match config {
+        Commands::Server {
+            config, grace_secs, ..
+        } => match config {
             Some(path) => {
                 let cfg = match rfrp_common::config::load_server_config(&path) {
                     Ok(c) => c,
@@ -36,6 +38,11 @@ async fn main() -> ExitCode {
                         tracing::error!(error = %e, "failed to start server");
                         return ExitCode::FAILURE;
                     }
+                };
+                // 优雅退出宽限期可由 CLI 覆盖（运维可调，默认 30s，见 §14.4）。
+                let server = match grace_secs {
+                    Some(g) => server.with_grace(std::time::Duration::from_secs(g)),
+                    None => server,
                 };
                 tracing::info!(addr = %server.local_addr(), "rfrps listening");
                 match server.run().await {

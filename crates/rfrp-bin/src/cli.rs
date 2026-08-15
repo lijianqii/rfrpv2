@@ -45,6 +45,9 @@ pub enum Commands {
         /// 覆盖 `work_conn_tls`
         #[arg(long)]
         work_conn_tls: Option<bool>,
+        /// 优雅退出宽限期（秒），覆盖默认 30s（见 §14.4）
+        #[arg(long)]
+        grace_secs: Option<u64>,
     },
     /// 以客户端模式运行（主动连接服务端，暴露本地服务）
     Client {

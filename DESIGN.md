@@ -1079,6 +1079,7 @@ C:\rfrp\
 ### 14.4 混沌测试
 
 - rfrps/rfrpc 随机强杀（Linux `kill -9`；Windows 产物在 Windows 测试机上用 `taskkill /F` 手动验证），验证无端口泄漏、无僵尸会话。
+- 自动化混沌/集成测试已落地（见各 crate `tests/chaos.rs`、`tests/reconnect.rs`）：真实 `rfrp` 子进程收 SIGTERM/SIGINT 经信号 watcher 优雅退出（进程 0 退出）、`SIGKILL` 强杀终止、客户端 SIGTERM 停止重连；客户端断线重连并复用 run_id 恢复单/多代理；服务端优雅退出宽限期内保留在途连接、控制断开后回收代理监听。手工 `kill -9` / `tc netem` 仍作为发布前冒烟。
 - 弱网：Linux 用 `tc netem` 丢包/延迟；Windows 端用 Clumsy 工具模拟（手动）。
 - Linux 由开发机脚本执行，Windows 在发布前于测试机跑一轮冒烟。
 
@@ -1278,7 +1279,7 @@ $ cargo fmt --check           # FMT CLEAN
 - 控制循环分支（Heartbeat 响应、Close 清理、ReqWorkConn 派发、NewProxyResp 路由、LoginResp 路由、run_id 去重）**已在 M2a/M2b 补齐独立单测**（duplex 内存双工驱动，无需真实端口），§17.12.1 原缺口已关闭。
 - 协议层边界（`from_frame` 未知 msg_type / 非法 JSON、未知 `ProxyType`、版本不匹配拒绝）**已补齐**（M2 整理），使致命登录路径端到端可达。
 - 工作连接负路径：未知 proxy_name / 未知 work_id / work_id=0 无归属会话 / 首帧非 StartWorkConn 已有单测；**本地服务不可达**（客户端 `handle_work_conn` 回连失败）已有单测（`local_service_unreachable_closes_gracefully`，服务端可达、本地不可达时安全关闭工作连接）。剩余边界见下方「边界覆盖补强（M2d 后）」。
-- 超时/资源泄漏：待处理项清理已有单测覆盖（M2a 心跳超时）；优雅退出令牌机制与端到端退出已有单测（M2d：服务端/客户端 `control_loop_exits_on_shutdown` + 集成 `graceful_shutdown`）；真实 SIGTERM 信号路径与混沌测试留待 §14.4。
+- 超时/资源泄漏：待处理项清理已有单测覆盖（M2a 心跳超时）；优雅退出令牌机制与端到端退出已有单测（M2d：服务端/客户端 `control_loop_exits_on_shutdown` + 集成 `graceful_shutdown`）；真实 SIGTERM 信号路径与混沌测试已由 `rfrp-bin/tests/chaos.rs` + `rfrpc/tests/{chaos,reconnect}.rs` 覆盖（§14.4 / §17.13）。
 - 配置层「非法 TOML / 字段类型错误 / 未知字段」反例**已补齐**（见 §17.12.4）：配合 `deny_unknown_fields`，TOML 键拼写/重命名错误显式失败而非静默忽略。
 - 边界覆盖补强（M2d 后专项）：本轮针对每层边界补充单测——协议层 `read_one_frame` 版本不符 / payload 被截断报错、`from_frame` 合法 msg_type 但 JSON 形状不符报错；服务端控制循环正常登录（LoginResp ok + session_id 且入 registry）、NewProxy 拒绝经控制循环回 `NewProxyResp{ok=false}`、未知控制消息忽略且循环存活、畸形帧断开、EOF 断开；工作连接 work_id=0 无归属会话安全、首帧非 StartWorkConn 报错；监听层 pending 工作连接超时清理、Https 类型拒绝；客户端 `NewProxyResp{ok=false}` 路由、run_id 空文件 / 超长文件重新生成、版本不匹配致命登录（集成不重连）。全量 78 -> 95。
 - TLS/鉴权路径在 M1 按设计跳过，不在测试范围。
@@ -1354,5 +1355,6 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 心跳误杀修复（§8.3 / 回归）：纠正 rfrps 心跳超时判定——此前用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在周期 tick 检查，因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 在首个周期即误判超时，误杀控制连接并触发重连去重、回收代理监听与在途工作连接（表现为代理端口 `Connection refused`、在途 SSH 会话 `closed by remote host`）。改为 ping/pong：`timeout(HEARTBEAT_TIMEOUT, pong.notified())` 等待**本次**心跳回应，未收到才断开。新增回归单测 `heartbeat_keeps_alive_when_client_responds`（客户端正常回应时控制任务保持存活）。
 - 代理 accept 循环阻塞修复（§8.2 / 回归）：命中预热池时，原实现在 `proxy_accept_loop` 内 `bridge::bridge(user, work).await` 内联等待，会阻塞整个 accept 循环——首个命中池（pool_size>0 时必然先命中）的长连接会话期间，后续用户连接无法被 accept（TCP 留在 backlog 无应用层处理），表现为“仅首个连接可用、其余全部卡住”。改为将桥接 `tokio::spawn` 到独立任务，accept 循环立即 `continue` 继续接客，并立即回 `ReqWorkConn{work_id=0}` 补充预热连接。新增回归单测 `tcp_proxy_concurrent_same_proxy_keep_open`（多用户长连接并发可达）。
+- 混沌/集成测试补齐（§14.4）：新增 `rfrpc/tests/reconnect.rs`（客户端断线 → 重连 → 复用 run_id 恢复单/多代理，端到端覆盖 M2b）、`rfrpc/tests/chaos.rs`（优雅退出宽限期内保留在途用户连接；客户端控制断开后服务端回收代理监听）、`rfrp-bin/tests/chaos.rs`（真实 `rfrp` 子进程收 SIGTERM/SIGINT 经信号 watcher 优雅退出、`SIGKILL` 强杀终止、客户端 SIGTERM 停止重连，关闭“真实信号路径”缺口）。
 
-**测试计数**：全量 78 -> 97（较 M2d 边界补强 95 再 +2：服务端心跳 ping/pong 回归 + 代理并发长连接回归，分别修复误杀控制连接与 accept 循环阻塞）。
+**测试计数**：全量 97 -> 105（集成/混沌 +8：reconnect 2 + chaos(rfrpc) 2 + chaos(rfrp-bin) 4）。
