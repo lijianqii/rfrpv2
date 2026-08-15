@@ -1260,24 +1260,25 @@ $ cargo fmt --check           # FMT CLEAN
 
 #### 17.12.1 测试覆盖分析
 
-**现有覆盖（共 53 项）**
+**现有覆盖（共 71 项）**
 
 | 层 | 文件 | 数量 | 覆盖点 |
 |----|------|------|--------|
-| 协议/配置 | rfrp-common 单测 | 38 | 帧编解码、半包/截断/版本不匹配/超大帧、9 类消息 round-trip、LoginResp 条件序列化、端口范围解析、custom_domains 16/17 边界、dashboard 校验、token 常量时间比对；**配置解析**：server/client 示例文件完整结构断言、`[[proxy]]` 不被静默丢弃、非法 TOML / 字段类型错误 / 未知字段负路径 |
-| 服务端 | rfrps 单测 | 7 | `bridge` 双向转发（duplex）、`next_work_id` 单调、NewProxy 拒绝（非 TCP / 缺 remote_port / 端口不允许 / 重名 / 端口被占用）|
-| 客户端 | rfrpc 单测 | 1 | `new_proxy_from_config` 字段映射 |
-| 集成 | rfrpc/tests | 5 | 真实示例配置全链路（example_smoke）、小包/64KiB/多轮往返、20 并发用户、多代理、未注册端口立即关闭 |
+| 协议/配置 | rfrp-common 单测 | 42 | 帧编解码、半包/截断/版本不匹配/超大帧、`read_one_frame` 首帧截断报错、9 类消息 round-trip、`from_frame` 未知 msg_type / 非法 JSON payload 报错、`ProxyType` 未知变体反序列化报错、LoginResp 条件序列化、端口范围解析、custom_domains 16/17 边界、dashboard 校验、token 常量时间比对；**配置解析**：server/client 示例文件完整结构断言、`[[proxy]]` 不被静默丢弃、非法 TOML / 字段类型错误 / 未知字段负路径 |
+| 服务端 | rfrps 单测 | 13 | `bridge` 双向转发（duplex）、`next_work_id` 单调、NewProxy 拒绝（非 TCP / 缺 remote_port / 端口不允许 / 重名 / 端口被占用）、控制循环分支（newproxy→resp / heartbeat→resp / close→退出 / 心跳超时断开 / 非 Login 首帧报错 / 同名 run_id 重连替换旧会话 / 协议版本不匹配拒绝）、`handle_work_connection` 未知 work_id 安全关闭 |
+| 客户端 | rfrpc 单测 | 8 | `new_proxy_from_config` 字段映射、`run_id` 持久化复用、`control_loop` 分支（NewProxyResp 路由 / heartbeat 应答 / ReqWorkConn 派生且不退出 / close 退出 / LoginResp 路由）、`handle_work_conn` 未知 proxy 安全返回 |
+| 集成 | rfrpc/tests | 6 | 真实示例配置全链路（example_smoke）、小包/64KiB/多轮往返、20 并发用户、多代理、未注册端口立即关闭、致命登录失败（auth failed）不无限重连即退出 |
 | 集成 | rfrp-common/tests | 2 | `examples/rfrp-{server,client}.toml` 契约测试：断言解析后完整结构（含 `[[proxy]]` 数组、各段字段）|
 
-> 注：集成测试现覆盖 `rfrpc/tests`（5）与 `rfrp-common/tests`（2）。`example_smoke` 加载真实示例跑 server+client；`config_files` 直接断言示例文件解析结构，防止 serde 字段名/键不匹配导致**静默丢弃**（见 §17.12.3/§17.12.4）。
+> 注：集成测试现覆盖 `rfrpc/tests`（6）与 `rfrp-common/tests`（2）。`example_smoke` 加载真实示例跑 server+client；`config_files` 直接断言示例文件解析结构，防止 serde 字段名/键不匹配导致**静默丢弃**（见 §17.12.3/§17.12.4）。
 
-**缺口与风险**
+**缺口与风险（截至 M2）**
 
-- 控制循环内部分支（Heartbeat 响应、Close 清理、ReqWorkConn 派发、NewProxyResp 路由）仅靠集成 happy path 间接覆盖，缺独立单测；M2 引入心跳/重连后风险上升。
-- 工作连接负路径（本地服务不可达 → 关闭工作连接 → 用户侧断开，§8.2/§8.5）仅代码层面覆盖，无自动化断言（会触发 ~10s 待处理超时，不宜放进快速测试；建议 M2 引入可配超时后补专项测试）。
-- 超时/资源泄漏（待处理项清理、优雅退出）无专门测试；依赖 M2 的混沌测试（§14.4）。
-- 配置层「非法 TOML / 字段类型错误 / 未知字段」反例**已补齐**（见 §17.12.4）：`malformed_toml_errors` / `wrong_field_type_errors` / `unknown_field_errors` 正/负例，配合 `deny_unknown_fields` 严格反序列化，TOML 键拼写/重命名错误会显式失败而非静默忽略。
+- 控制循环分支（Heartbeat 响应、Close 清理、ReqWorkConn 派发、NewProxyResp 路由、LoginResp 路由、run_id 去重）**已在 M2a/M2b 补齐独立单测**（duplex 内存双工驱动，无需真实端口），§17.12.1 原缺口已关闭。
+- 协议层边界（`from_frame` 未知 msg_type / 非法 JSON、未知 `ProxyType`、版本不匹配拒绝）**已补齐**（M2 整理），使致命登录路径端到端可达。
+- 工作连接负路径：未知 proxy_name / 未知 work_id 已有单测；**本地服务不可达**仍仅集成 happy path 间接覆盖（直接断言需真实 server+本地监听，成本高；该路径逻辑已简单——`warn` 后关闭工作连接，§8.2/§8.5），后续可借 M2c 连接池专项测试覆盖。
+- 超时/资源泄漏（待处理项清理、优雅退出）无专门测试；依赖 M2d 的优雅退出 + 混沌测试（§14.4）。
+- 配置层「非法 TOML / 字段类型错误 / 未知字段」反例**已补齐**（见 §17.12.4）：配合 `deny_unknown_fields`，TOML 键拼写/重命名错误显式失败而非静默忽略。
 - TLS/鉴权路径在 M1 按设计跳过，不在测试范围。
 
 **结论**：M1 的 TCP 数据通路与关键拒绝路径已较充分；控制循环内部分支、工作连接负路径、资源清理是 M2 重点补强对象。
@@ -1334,4 +1335,6 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 服务端 run_id 去重：`ServerState.sessions` 维护 `run_id -> Session` 注册表；同名 run_id 新登录触发 `cleanup` 清理旧会话（中止其代理监听、清理 pending、经 `Session.stop: Notify` 唤醒旧控制循环退出），再注册新会话。会话结束（正常或心跳超时）仅当注册表内仍为自身条目时才移除，避免误删重连后的新会话。
 - 新增单测：服务端「同名 run_id 重连替换旧会话」（旧控制循环被 stop 通知退出、新会话存活）；客户端 `LoginResp` 路由到 `login_tx`；`run_id` 持久化复用（临时文件）。
 
-**测试计数**：全量 60 -> 63（rfrps lib 10->11，rfrpc lib 5->7）。
+- 服务端加固：`handle_control_login` 现校验协议版本，不匹配直接回 `LoginResp{ok=false, "version mismatch"}` 并结束会话（客户端据此判定致命、不重连，§6.6）——此前仅客户端侧声明该致命路径，现已端到端可达（`login_version_mismatch_rejected`）。
+
+**测试计数**：全量 63 -> 71（rfrp-common lib 38->42，rfrps lib 11->13，rfrpc lib 7->8，rfrpc 集成 5->6）。

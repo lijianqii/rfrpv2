@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use rfrp_common::config::ServerConfig;
+use rfrp_common::constants::PROTOCOL_VERSION;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
@@ -51,15 +52,32 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let login = Message::from_frame(&login_frame)?;
-    let run_id = match login {
-        Message::Login(l) => l.run_id,
+    let (run_id, version) = match login {
+        Message::Login(l) => (l.run_id, l.version),
         _ => {
             return Err(rfrp_common::Error::Protocol(
                 "first frame must be Login".into(),
             ))
         }
     };
-    // M1：token 校验跳过（见 DESIGN §12 M1）。run_id 仅用于日志关联。
+    // 协议版本校验：不匹配直接拒绝，且不建立会话（客户端据此判定致命、不重连，§6.6）。
+    if version != PROTOCOL_VERSION {
+        tracing::warn!(version, "login rejected: protocol version mismatch");
+        let mut w = FramedWrite::new(stream, FrameCodec);
+        let _ = w
+            .send(
+                Message::LoginResp(LoginResp {
+                    ok: false,
+                    error: Some("version mismatch".into()),
+                    session_id: None,
+                    work_conn_tls: None,
+                })
+                .to_frame()?,
+            )
+            .await;
+        return Ok(());
+    }
+    // M1/M2：token 校验跳过（见 DESIGN §12）。run_id 仅用于日志关联。
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<Message>(64);
@@ -389,5 +407,39 @@ mod tests {
         // 新会话仍存活。
         assert!(!t2.is_finished());
         t2.abort();
+    }
+
+    #[tokio::test]
+    async fn login_version_mismatch_rejected() {
+        // 协议版本不匹配：服务端回 LoginResp{ok=false, "version mismatch"} 并直接结束（§6.6）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let bad = Message::Login(Login {
+            run_id: "x".into(),
+            token: String::new(),
+            version: PROTOCOL_VERSION + 1,
+        })
+        .to_frame()
+        .unwrap();
+        let task = tokio::spawn(handle_control_login(
+            bad,
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, _cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        match recv_msg(&mut cr).await {
+            Message::LoginResp(r) => {
+                assert!(!r.ok);
+                assert_eq!(r.error.as_deref(), Some("version mismatch"));
+            }
+            other => panic!("expected LoginResp, got {other:?}"),
+        }
+        // 控制任务应直接结束（未建立会话）。
+        task.await.unwrap().unwrap();
     }
 }

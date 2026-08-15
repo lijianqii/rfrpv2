@@ -60,3 +60,29 @@ pub async fn handle_work_conn(
     let _ = bridge::bridge(work_stream, local).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn unknown_proxy_returns_ok() {
+        // 未知 proxy_name：不应连接、不应 panic，直接 Ok 返回（§8.2 负路径）。
+        let state = Arc::new(ClientState {
+            server_addr: "127.0.0.1:9".parse().unwrap(),
+            run_id: "r".into(),
+            proxies: vec![],
+            resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
+        });
+        let req = ReqWorkConn {
+            proxy_name: "nope".into(),
+            work_id: 1,
+        };
+        assert!(handle_work_conn(req, state, ClientConfig::default())
+            .await
+            .is_ok());
+    }
+}

@@ -260,4 +260,25 @@ mod tests {
         }));
         roundtrip(Message::Close(Close { reason: None }));
     }
+
+    #[test]
+    fn from_frame_unknown_msg_type_errors() {
+        let f = crate::protocol::frame::Frame::new(PROTOCOL_VERSION, 0x7f, b"{}".to_vec());
+        assert!(Message::from_frame(&f).is_err());
+    }
+
+    #[test]
+    fn from_frame_invalid_json_payload_errors() {
+        let f = crate::protocol::frame::Frame::new(
+            PROTOCOL_VERSION,
+            MSG_HEARTBEAT,
+            b"not-json".to_vec(),
+        );
+        assert!(Message::from_frame(&f).is_err());
+    }
+
+    #[test]
+    fn proxy_type_unknown_variant_errors() {
+        assert!(serde_json::from_str::<ProxyType>(r#""ftp""#).is_err());
+    }
 }

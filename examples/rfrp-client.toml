@@ -24,8 +24,8 @@ type = "http"
 local_ip = "127.0.0.1"
 local_port = 8080
 custom_domains = ["dev.example.com"]
-# M1 会拒绝此 http 代理（见文件头说明），M4 才支持；
-# 若想 M1 跑通，可改为 type="tcp" 并指向一个本地在跑的服务。
+# 当前版本（M2，仅 TCP）会拒绝此 http 代理，M4 才支持；
+# 若想 M2 跑通，可改为 type="tcp" 并指向一个本地在跑的服务。
 
 [log]                            # 整段可选，默认 level=info、output=stderr、format=text
 level = "info"

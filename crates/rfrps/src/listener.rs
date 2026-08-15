@@ -23,9 +23,9 @@ pub async fn register_proxy(
     config: &ServerConfig,
 ) -> Result<()> {
     if np.r#type != ProxyType::Tcp {
-        // M1 仅 TCP；其余类型在 M4 实现。
+        // M2 仅 TCP；其余类型在 M4 实现。
         return Err(rfrp_common::Error::Config(
-            "only tcp proxy supported in M1".into(),
+            "only tcp proxy supported".into(),
         ));
     }
     let remote_port = np

@@ -209,4 +209,15 @@ mod tests {
     fn msg_type_const_valid() {
         assert_eq!(MSG_LOGIN, 0x01);
     }
+
+    #[tokio::test]
+    async fn read_one_frame_truncated_errors() {
+        // 客户端连接后立即关闭：首帧头被截断，read_one_frame 应报错（§6.1）。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        drop(client);
+        let (server, _peer) = listener.accept().await.unwrap();
+        assert!(read_one_frame(server).await.is_err());
+    }
 }
