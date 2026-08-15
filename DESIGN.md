@@ -658,8 +658,9 @@ User → rfrps:remote_port  (Listener 接收)
 ### 8.3 心跳与重连
 
 - 心跳由**独立定时器驱动**，每 30s 固定发一次 `Heartbeat`，与业务消息流并行，**不依赖"控制连接空闲"**——即使持续有 NewProxy/ReqWorkConn 在传，心跳仍按 30s 周期发送。
-- rfrps 与 rfrpc 均主动发送心跳，对端必须回 `HeartbeatResp`（`ts` 原样回传）。
-- 发出 Heartbeat 后等待 HeartbeatResp，**10s 未收到 Resp 则判定断开**（触发清理与重连）。
+- **首版由 rfrps 主动发起心跳**（rfrps → rfrpc 方向）：rfrps 每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat`，随后在 `HEARTBEAT_TIMEOUT`(10s) 内等待对端 `HeartbeatResp`；超时未收到则判定对端已死，直接断开 TCP 并清理 Session（ping/pong 语义）。rfrpc 维持对 `Heartbeat` 的 `HeartbeatResp` 应答。
+  - **实现要点（修复项）**：超时判定必须绑定"本次 Heartbeat 的回应"，而非"距上次收到 Resp 的间隔"。若用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在每次周期 tick 检查，会因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 而在首个周期即误判超时——误杀控制连接 → rfrpc 重连（复用 run_id）→ rfrps 去重清理旧 Session → 中止代理监听（代理端口 `Connection refused`）、回收在用工作连接（在途 SSH 等会话 `closed by remote host`）。改用 `Notify`：发送后 `timeout(HEARTBEAT_TIMEOUT, pong.notified())`，仅当该次心跳未收到回应立即断开。
+- （rfrpc → rfrps 主动心跳方向在 M2 未实现；rfrpc 侧通过 TCP EOF 感知服务端断连并触发重连。若后续需要双向主动心跳，对端需对等应答，语义同上。）
 - 断开后 rfrpc 按指数退避重连（1s → 2s → 4s → … → 30s 上限）。**此为全局唯一重连退避策略**（常量见 §7.1 `RECONNECT_BACKOFF_INITIAL` / `RECONNECT_BACKOFF_MAX`），§8.1 网络错误重连与 §8.5 rfrpc 离线后恢复均复用本策略。
 - 重连复用 `run_id`，rfrps 恢复原 Proxy 监听（若端口仍可用，冲突处理见 6.6）。
 
@@ -1350,4 +1351,7 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 新增测试：服务端/客户端各 `control_loop_exits_on_shutdown` 单测（令牌取消 -> 控制循环退出）；集成 `rfrps/tests/graceful_shutdown.rs::server_run_returns_after_shutdown_token`（run 在令牌取消后返回）；`rfrpc/tests/graceful_shutdown.rs`（client_run_exits_on_shutdown_without_infinite_reconnect + server_and_client_exit_cleanly_on_shutdown 端到端二者均干净退出）。
 
-**测试计数**：全量 78 -> 95（净 +17：rfrp_common 42->45、rfrpc lib 9->13、rfrps lib 15->24、rfrpc 集成 +1；新增边界单测 14 项 + 集成 +3）。
+- 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
+- 心跳误杀修复（§8.3 / 回归）：纠正 rfrps 心跳超时判定——此前用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在周期 tick 检查，因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 在首个周期即误判超时，误杀控制连接并触发重连去重、回收代理监听与在途工作连接（表现为代理端口 `Connection refused`、在途 SSH 会话 `closed by remote host`）。改为 ping/pong：`timeout(HEARTBEAT_TIMEOUT, pong.notified())` 等待**本次**心跳回应，未收到才断开。新增回归单测 `heartbeat_keeps_alive_when_client_responds`（客户端正常回应时控制任务保持存活）。
+
+**测试计数**：全量 78 -> 96（较 M2d 边界补强 95 再 +1：服务端心跳 ping/pong 回归测试，修复“间隔>超时”误杀控制连接）。

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use rfrp_common::config::ServerConfig;
@@ -136,11 +136,13 @@ where
     .ok();
     tracing::info!(session = %session_id, "control connection established");
 
-    // 心跳：周期性发送 Heartbeat，超时未收到 Resp 则通知断开（§8.3）。
-    let last_resp = Arc::new(Mutex::new(Instant::now()));
+    // 心跳（§8.3）：周期性发送 Heartbeat，等待对端在 HEARTBEAT_TIMEOUT 内回应；
+    // 超时未收到 HeartbeatResp 则通知断开。采用“每次发送后等待回应”的 ping/pong
+    // 语义，避免“心跳间隔 > 超时阈值”时误判断连（客户端仅在收到 Heartbeat 时回应）。
     let disconnect = Arc::new(Notify::new());
+    let pong = Arc::new(Notify::new());
     let hb_tx = tx.clone();
-    let hb_last = last_resp.clone();
+    let hb_pong = pong.clone();
     let hb_disconnect = disconnect.clone();
     let session_id_hb = session_id.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -148,16 +150,20 @@ where
         iv.tick().await; // 消耗首次立即 tick，避免一建立就连发
         loop {
             iv.tick().await;
-            if hb_last.lock().unwrap().elapsed() > heartbeat_timeout {
-                tracing::warn!(session = %session_id_hb, "heartbeat timeout, disconnecting");
-                hb_disconnect.notify_one();
-                break;
-            }
             if hb_tx
                 .send(Message::Heartbeat(Heartbeat { ts: now_ms() }))
                 .await
                 .is_err()
             {
+                break;
+            }
+            // 等待对端心跳回应；超时则判定断连（§8.3）。
+            if tokio::time::timeout(heartbeat_timeout, hb_pong.notified())
+                .await
+                .is_err()
+            {
+                tracing::warn!(session = %session_id_hb, "heartbeat timeout, disconnecting");
+                hb_disconnect.notify_one();
                 break;
             }
         }
@@ -186,11 +192,11 @@ where
                                 .ok();
                             }
                             Message::Heartbeat(h) => {
-                                *last_resp.lock().unwrap() = Instant::now();
                                 tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
                             }
                             Message::HeartbeatResp(_) => {
-                                *last_resp.lock().unwrap() = Instant::now();
+                                // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
+                                pong.notify_one();
                             }
                             Message::Close(_) => break,
                             _ => {}
@@ -353,6 +359,42 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(3), task).await;
         assert!(res.is_ok(), "control task must end on heartbeat timeout");
         res.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_alive_when_client_responds() {
+        // 客户端正常回应心跳时，服务端不应误判超时断开（§8.3 心跳修复）。
+        // 此前“间隔(30s) > 超时(10s)”会导致首个心跳周期即误杀控制连接，
+        // 进而触发重连去重、回收代理监听与在途工作连接。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("hbAlive"),
+            server_end,
+            state,
+            config,
+            Duration::from_millis(30), // interval
+            Duration::from_millis(60), // timeout
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        // 消费 LoginResp，并对每个 Heartbeat 回应 HeartbeatResp。
+        let _ = recv_msg(&mut cr).await;
+        let responder = tokio::spawn(async move {
+            while let Message::Heartbeat(h) = recv_msg(&mut cr).await {
+                send_msg(&mut cw, Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await;
+            }
+        });
+        // 等待超过数个心跳周期，控制任务应仍存活（未被误杀）。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "control task must stay alive while client responds to heartbeats"
+        );
+        task.abort();
+        responder.abort();
     }
 
     #[tokio::test]
