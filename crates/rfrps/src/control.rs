@@ -483,4 +483,162 @@ mod tests {
         assert!(r.is_ok(), "control loop must exit on shutdown token");
         r.unwrap().unwrap().unwrap();
     }
+
+    #[tokio::test]
+    async fn login_ok_returns_session_id_and_registers() {
+        // 正常登录：LoginResp{ok=true, session_id=Some}，且会话写入 registry（§8.1）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rOk"),
+            server_end,
+            state.clone(),
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        match recv_msg(&mut cr).await {
+            Message::LoginResp(r) => {
+                assert!(r.ok);
+                assert!(r.session_id.is_some());
+            }
+            other => panic!("expected LoginResp, got {other:?}"),
+        }
+        assert!(state.sessions.lock().unwrap().contains_key("rOk"));
+        send_msg(&mut cw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn newproxy_rejection_routed_to_resp() {
+        // NewProxy 被拒（端口不在允许范围）应经控制循环回 NewProxyResp{ok=false}（§8.1）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let mut config = ServerConfig::default();
+        config.proxy.allow_ports = "5000-5001".into();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rRej"),
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+        send_msg(
+            &mut cw,
+            Message::NewProxy(NewProxy {
+                proxy_name: "p".into(),
+                r#type: ProxyType::Tcp,
+                remote_port: Some(18080),
+                custom_domains: None,
+            }),
+        )
+        .await;
+        match recv_msg(&mut cr).await {
+            Message::NewProxyResp(r) => {
+                assert_eq!(r.proxy_name, "p");
+                assert!(!r.ok);
+                assert!(r.error.is_some());
+            }
+            other => panic!("expected NewProxyResp, got {other:?}"),
+        }
+        send_msg(&mut cw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_control_msg_ignored_keeps_loop_alive() {
+        // 控制循环不处理 StartWorkConn：忽略后循环仍存活（§8.2 控制/工作连接分离）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rIgn"),
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+        send_msg(
+            &mut cw,
+            Message::StartWorkConn(StartWorkConn {
+                proxy_name: "p".into(),
+                work_id: 5,
+            }),
+        )
+        .await;
+        // 随后 Heartbeat 仍应得到 HeartbeatResp，证明循环未退出。
+        send_msg(&mut cw, Message::Heartbeat(Heartbeat { ts: 1 })).await;
+        match recv_msg(&mut cr).await {
+            Message::HeartbeatResp(h) => assert_eq!(h.ts, 1),
+            other => panic!("expected HeartbeatResp, got {other:?}"),
+        }
+        send_msg(&mut cw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_breaks_control_loop() {
+        // 版本不符的帧导致解码错误：控制循环应断开（Ok 返回，§6.1）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rBad"),
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+        cw.send(Frame::new(0x02, MSG_HEARTBEAT, b"{}".to_vec()))
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(3), task).await;
+        assert!(r.is_ok(), "control loop must break on malformed frame");
+        r.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_closes_control_loop() {
+        // 客户端两端关闭 -> 服务端读到 EOF -> 控制循环断开（Ok 返回）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rEof"),
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let cw = FramedWrite::new(cw, FrameCodec);
+        assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+        // 关闭客户端两端（模拟断开）-> 服务端读到 EOF -> 控制循环断开。
+        drop(cr);
+        drop(cw);
+        let r = tokio::time::timeout(Duration::from_secs(3), task).await;
+        assert!(r.is_ok(), "control loop must break on EOF");
+        r.unwrap().unwrap().unwrap();
+    }
 }

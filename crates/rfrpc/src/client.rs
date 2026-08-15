@@ -301,6 +301,7 @@ pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {
 mod tests {
     use super::*;
     use rfrp_common::config::{ClientConfig, ClientProxy, ClientSection};
+    use rfrp_common::constants::MAX_RUN_ID_LEN;
     use rfrp_common::protocol::msg::{NewProxy, ProxyType};
 
     #[test]
@@ -341,5 +342,32 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn run_id_empty_file_regenerates() {
+        // 文件存在但内容为空/空白：应重新生成非空 run_id（§6.6）。
+        let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("run_id");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "   \n").unwrap();
+        let rid = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+        assert!(!rid.trim().is_empty());
+        assert_ne!(rid, "   \n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_id_too_long_regenerates() {
+        // 文件内容超过 MAX_RUN_ID_LEN：应重新生成合规 run_id（§6.6）。
+        let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("run_id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = "x".repeat(MAX_RUN_ID_LEN + 1);
+        std::fs::write(&path, &long).unwrap();
+        let rid = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+        assert_ne!(rid, long);
+        assert!(rid.len() <= MAX_RUN_ID_LEN);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

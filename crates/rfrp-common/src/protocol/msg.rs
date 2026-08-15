@@ -281,4 +281,11 @@ mod tests {
     fn proxy_type_unknown_variant_errors() {
         assert!(serde_json::from_str::<ProxyType>(r#""ftp""#).is_err());
     }
+
+    #[test]
+    fn from_frame_wrong_shape_payload_errors() {
+        // 合法 msg_type，但 payload JSON 缺必填字段（结构体形状不匹配）-> 反序列化错误。
+        let f = Frame::new(PROTOCOL_VERSION, MSG_HEARTBEAT, b"{}".to_vec());
+        assert!(Message::from_frame(&f).is_err());
+    }
 }

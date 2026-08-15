@@ -64,8 +64,11 @@ pub async fn handle_work_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rfrp_common::config::ClientProxy;
+    use rfrp_common::protocol::msg::ProxyType;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn unknown_proxy_returns_ok() {
@@ -79,6 +82,35 @@ mod tests {
         });
         let req = ReqWorkConn {
             proxy_name: "nope".into(),
+            work_id: 1,
+        };
+        assert!(handle_work_conn(req, state, ClientConfig::default())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_service_unreachable_closes_gracefully() {
+        // 服务端可达，但本地服务不可达：仍应 Ok 返回（关闭工作连接），不 panic（§8.2/§8.5）。
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let state = Arc::new(ClientState {
+            server_addr,
+            run_id: "r".into(),
+            proxies: vec![ClientProxy {
+                name: "web".into(),
+                r#type: ProxyType::Tcp,
+                local_ip: "127.0.0.1".into(),
+                local_port: 1, // 无人监听
+                remote_port: Some(8080),
+                custom_domains: None,
+                pool_size: 0,
+            }],
+            resps: Mutex::new(HashMap::new()),
+            login_tx: Mutex::new(None),
+        });
+        let req = ReqWorkConn {
+            proxy_name: "web".into(),
             work_id: 1,
         };
         assert!(handle_work_conn(req, state, ClientConfig::default())

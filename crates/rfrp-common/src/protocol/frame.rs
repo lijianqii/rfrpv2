@@ -220,4 +220,32 @@ mod tests {
         let (server, _peer) = listener.accept().await.unwrap();
         assert!(read_one_frame(server).await.is_err());
     }
+
+    #[tokio::test]
+    async fn read_one_frame_truncated_payload_errors() {
+        // 头声明 payload 长度，但连接提前关闭（payload 被截断）：read_one_frame 应报错（§6.1）。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // 头：version + msg_type + length=5，但只发 2 字节 payload 即关闭。
+        let header = [PROTOCOL_VERSION, 0x01, 0x00, 0x00, 0x00, 0x05];
+        client.write_all(&header).await.unwrap();
+        client.write_all(b"ab").await.unwrap();
+        drop(client);
+        let (server, _peer) = listener.accept().await.unwrap();
+        assert!(read_one_frame(server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_one_frame_version_mismatch_errors() {
+        // 首帧版本不符：read_one_frame 应报错（§6.1 / §6.6）。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let header = [0x02, 0x01, 0x00, 0x00, 0x00, 0x00]; // 版本 0x02 不符
+        client.write_all(&header).await.unwrap();
+        drop(client);
+        let (server, _peer) = listener.accept().await.unwrap();
+        assert!(read_one_frame(server).await.is_err());
+    }
 }

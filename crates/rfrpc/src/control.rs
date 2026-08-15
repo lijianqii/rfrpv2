@@ -349,4 +349,41 @@ mod tests {
         assert_eq!(resp.error.as_deref(), Some("auth failed"));
         task.abort();
     }
+
+    #[tokio::test]
+    async fn newproxy_resp_err_routed_to_oneshot() {
+        // NewProxyResp{ok=false} 也应路由到注册时的 oneshot（§8.1 失败路径）。
+        let (client_end, server_end) = duplex(8192);
+        let (state, orx) = client_state_with_resp("ssh");
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            state,
+            config,
+            CancellationToken::new(),
+        ));
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        assert!(matches!(recv_msg(&mut sr).await, Message::Login(_)));
+        send_msg(
+            &mut sw,
+            Message::NewProxyResp(NewProxyResp {
+                proxy_name: "ssh".into(),
+                ok: false,
+                error: Some("port occupied".into()),
+            }),
+        )
+        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(2), orx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("port occupied"));
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
 }

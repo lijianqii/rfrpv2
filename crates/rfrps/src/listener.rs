@@ -158,10 +158,12 @@ fn spawn_pending_timeout(work_id: u64, state: Arc<ServerState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::PendingWork;
     use crate::work::handle_work_connection;
     use rfrp_common::config::{LogSection, ProxySection, ServerConfig, ServerSection};
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::Notify;
@@ -337,5 +339,42 @@ mod tests {
             .map(|v| v.len())
             .unwrap_or(0);
         assert_eq!(pooled, 1);
+    }
+
+    #[tokio::test]
+    async fn register_rejects_https_proxy() {
+        // M2 仅 TCP：Https 类型也应被拒（与 Udp 同属 `!= Tcp` 分支）。
+        let state = ServerState::new();
+        let session = test_session();
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "p".into(),
+            r#type: ProxyType::Https,
+            remote_port: Some(18080),
+            custom_domains: Some(vec!["a.example.com".into()]),
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_work_conn_cleaned_after_timeout() {
+        // 待处理工作连接在 WORK_CONN_TIMEOUT_RFRPS 内未被消费，应被清理（§8.5）。
+        let state = ServerState::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (user, _peer) = listener.accept().await.unwrap();
+        state.pending.lock().unwrap().insert(
+            42,
+            PendingWork {
+                proxy_name: "ssh".into(),
+                session_id: "s".into(),
+                user: Some(user),
+            },
+        );
+        spawn_pending_timeout(42, state.clone());
+        // 超时后 pending 项被移除（用户侧连接被关闭）。
+        tokio::time::sleep(Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS + 2)).await;
+        assert!(!state.pending.lock().unwrap().contains_key(&42));
     }
 }

@@ -76,16 +76,16 @@ async fn server_and_client_exit_cleanly_on_shutdown() {
     // 等待客户端建立控制连接。
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 触发服务端优雅退出。
+    // 同时触发服务端与客户端的退出信号：服务端控制循环退出（关闭客户端控制连接），
+    // 客户端收到信号后停止重连并干净退出（而非无限重连）。
     sd.cancel();
+    client_sd.cancel();
     let sres = timeout(Duration::from_secs(5), server_task).await;
     assert!(
         sres.is_ok(),
         "server.run() must return after shutdown signal"
     );
 
-    // 服务端退出后，取消客户端令牌，客户端也应干净退出（而非无限重连）。
-    client_sd.cancel();
     let cres = timeout(Duration::from_secs(5), client_task).await;
     assert!(
         cres.is_ok(),

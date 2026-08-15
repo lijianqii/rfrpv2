@@ -1276,9 +1276,10 @@ $ cargo fmt --check           # FMT CLEAN
 
 - 控制循环分支（Heartbeat 响应、Close 清理、ReqWorkConn 派发、NewProxyResp 路由、LoginResp 路由、run_id 去重）**已在 M2a/M2b 补齐独立单测**（duplex 内存双工驱动，无需真实端口），§17.12.1 原缺口已关闭。
 - 协议层边界（`from_frame` 未知 msg_type / 非法 JSON、未知 `ProxyType`、版本不匹配拒绝）**已补齐**（M2 整理），使致命登录路径端到端可达。
-- 工作连接负路径：未知 proxy_name / 未知 work_id 已有单测；**本地服务不可达**仍仅集成 happy path 间接覆盖（直接断言需真实 server+本地监听，成本高；该路径逻辑已简单——`warn` 后关闭工作连接，§8.2/§8.5），后续可借 M2c 连接池专项测试覆盖。
+- 工作连接负路径：未知 proxy_name / 未知 work_id / work_id=0 无归属会话 / 首帧非 StartWorkConn 已有单测；**本地服务不可达**（客户端 `handle_work_conn` 回连失败）已有单测（`local_service_unreachable_closes_gracefully`，服务端可达、本地不可达时安全关闭工作连接）。剩余边界见下方「边界覆盖补强（M2d 后）」。
 - 超时/资源泄漏：待处理项清理已有单测覆盖（M2a 心跳超时）；优雅退出令牌机制与端到端退出已有单测（M2d：服务端/客户端 `control_loop_exits_on_shutdown` + 集成 `graceful_shutdown`）；真实 SIGTERM 信号路径与混沌测试留待 §14.4。
 - 配置层「非法 TOML / 字段类型错误 / 未知字段」反例**已补齐**（见 §17.12.4）：配合 `deny_unknown_fields`，TOML 键拼写/重命名错误显式失败而非静默忽略。
+- 边界覆盖补强（M2d 后专项）：本轮针对每层边界补充单测——协议层 `read_one_frame` 版本不符 / payload 被截断报错、`from_frame` 合法 msg_type 但 JSON 形状不符报错；服务端控制循环正常登录（LoginResp ok + session_id 且入 registry）、NewProxy 拒绝经控制循环回 `NewProxyResp{ok=false}`、未知控制消息忽略且循环存活、畸形帧断开、EOF 断开；工作连接 work_id=0 无归属会话安全、首帧非 StartWorkConn 报错；监听层 pending 工作连接超时清理、Https 类型拒绝；客户端 `NewProxyResp{ok=false}` 路由、run_id 空文件 / 超长文件重新生成、版本不匹配致命登录（集成不重连）。全量 78 -> 95。
 - TLS/鉴权路径在 M1 按设计跳过，不在测试范围。
 
 **结论**：M1 的 TCP 数据通路与关键拒绝路径已较充分；控制循环内部分支、工作连接负路径、资源清理是 M2 重点补强对象。
@@ -1349,4 +1350,4 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 新增测试：服务端/客户端各 `control_loop_exits_on_shutdown` 单测（令牌取消 -> 控制循环退出）；集成 `rfrps/tests/graceful_shutdown.rs::server_run_returns_after_shutdown_token`（run 在令牌取消后返回）；`rfrpc/tests/graceful_shutdown.rs`（client_run_exits_on_shutdown_without_infinite_reconnect + server_and_client_exit_cleanly_on_shutdown 端到端二者均干净退出）。
 
-**测试计数**：全量 73 -> 78（rfrpc lib 8->9，rfrps lib 14->15，新增集成 rfrpc/tests/graceful_shutdown.rs 2、rfrps/tests/graceful_shutdown.rs 1）。
+**测试计数**：全量 78 -> 95（净 +17：rfrp_common 42->45、rfrpc lib 9->13、rfrps lib 15->24、rfrpc 集成 +1；新增边界单测 14 项 + 集成 +3）。

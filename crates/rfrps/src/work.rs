@@ -88,6 +88,7 @@ fn find_session_by_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rfrp_common::constants::PROTOCOL_VERSION;
     use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
@@ -105,5 +106,40 @@ mod tests {
         let _client = TcpStream::connect(addr).await.unwrap();
         let (server, _peer) = listener.accept().await.unwrap();
         assert!(handle_work_connection(frame, server, state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pooled_work_conn_no_session_is_safe() {
+        // work_id=0 但没有任何会话拥有该 proxy：应 Ok 返回（§8.2 负路径）。
+        let state = ServerState::new(); // sessions 为空
+        let frame = Message::StartWorkConn(StartWorkConn {
+            proxy_name: "ghost".into(),
+            work_id: WORK_ID_POOL_RESERVED,
+        })
+        .to_frame()
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+        assert!(handle_work_connection(frame, server, state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_startworkconn_frame_errors() {
+        // 工作连接首帧不是 StartWorkConn（此处用 Login 模拟）：应报错（§8.2）。
+        let state = ServerState::new();
+        let frame = Message::Login(Login {
+            run_id: "x".into(),
+            token: "".into(),
+            version: PROTOCOL_VERSION,
+        })
+        .to_frame()
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+        assert!(handle_work_connection(frame, server, state).await.is_err());
     }
 }
