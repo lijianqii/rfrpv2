@@ -19,6 +19,7 @@ use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::now_ms;
 use tokio::io::split;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -37,6 +38,8 @@ pub struct Session {
     pub proxies: Mutex<HashMap<String, JoinHandle<()>>>,
     /// 断开 / 重连通知（§8.3）：清理旧会话或正常断开时唤醒控制循环退出。
     pub stop: Arc<Notify>,
+    /// 预热工作连接池（proxy_name -> 空闲服务端侧工作流），按 §8.2 命中用户连接。
+    pub pools: Mutex<HashMap<String, Vec<TcpStream>>>,
 }
 
 /// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
@@ -87,6 +90,7 @@ where
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
         stop: Arc::new(Notify::new()),
+        pools: Mutex::new(HashMap::new()),
     });
 
     // 重连去重（§8.3）：同一 run_id 的旧会话先清理再接受新登录。
@@ -227,6 +231,12 @@ fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
     for (_, h) in session.proxies.lock().unwrap().drain() {
         h.abort();
+    }
+    // 关闭并丢弃所有预热的工作连接池（§8.2）。
+    for (_, mut v) in session.pools.lock().unwrap().drain() {
+        for _s in v.drain(..) {
+            // 丢弃 TcpStream 即关闭连接。
+        }
     }
     state
         .pending

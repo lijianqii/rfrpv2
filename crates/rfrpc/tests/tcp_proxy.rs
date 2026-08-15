@@ -185,6 +185,32 @@ async fn tcp_proxy_multiple_proxies() {
 }
 
 #[tokio::test]
+async fn tcp_proxy_pool_size_two() {
+    // 工作连接池预热（pool_size=2）：多次往返命中预热池并被服务端补充（§8.2）。
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server().await;
+    let remote = free_port();
+    let proxy = ClientProxy {
+        name: "p1".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: echo_port,
+        remote_port: Some(remote),
+        custom_domains: None,
+        pool_size: 2,
+    };
+    let cli = start_client(addr, vec![proxy]).await;
+    wait_ready().await;
+
+    for i in 0..3 {
+        expect_echo(remote, addr, format!("pool-{i}").as_bytes()).await;
+    }
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
 async fn tcp_proxy_rejects_unregistered_port() {
     let (srv, addr) = start_server().await;
     let unregistered = free_port();

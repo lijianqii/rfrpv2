@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use rfrp_common::constants::WORK_ID_POOL_RESERVED;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::Frame;
 use rfrp_common::protocol::msg::*;
@@ -28,6 +29,25 @@ pub async fn handle_work_connection(
         }
     };
 
+    // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
+    if work_id == WORK_ID_POOL_RESERVED {
+        match find_session_by_proxy(&state, &proxy_name) {
+            Some(s) => {
+                s.pools
+                    .lock()
+                    .unwrap()
+                    .entry(proxy_name.clone())
+                    .or_default()
+                    .push(stream);
+                tracing::debug!(%proxy_name, "work connection pooled");
+            }
+            None => {
+                tracing::warn!(%proxy_name, "no session owns proxy for pooled work connection");
+            }
+        }
+        return Ok(());
+    }
+
     let pending = state.pending.lock().unwrap().remove(&work_id);
     let pending = match pending {
         Some(p) => p,
@@ -49,6 +69,20 @@ pub async fn handle_work_connection(
     // stream 已越过 StartWorkConn 首帧，剩余为透传字节；直接桥接。
     let _ = bridge::bridge(user, stream).await;
     Ok(())
+}
+
+/// 按 proxy_name 查找其所属控制会话（用于把预热工作连接归入对应池，§8.2）。
+fn find_session_by_proxy(
+    state: &ServerState,
+    proxy_name: &str,
+) -> Option<Arc<crate::control::Session>> {
+    let sessions = state.sessions.lock().unwrap();
+    for s in sessions.values() {
+        if s.proxies.lock().unwrap().contains_key(proxy_name) {
+            return Some(s.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

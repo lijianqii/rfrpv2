@@ -1265,7 +1265,7 @@ $ cargo fmt --check           # FMT CLEAN
 | 层 | 文件 | 数量 | 覆盖点 |
 |----|------|------|--------|
 | 协议/配置 | rfrp-common 单测 | 42 | 帧编解码、半包/截断/版本不匹配/超大帧、`read_one_frame` 首帧截断报错、9 类消息 round-trip、`from_frame` 未知 msg_type / 非法 JSON payload 报错、`ProxyType` 未知变体反序列化报错、LoginResp 条件序列化、端口范围解析、custom_domains 16/17 边界、dashboard 校验、token 常量时间比对；**配置解析**：server/client 示例文件完整结构断言、`[[proxy]]` 不被静默丢弃、非法 TOML / 字段类型错误 / 未知字段负路径 |
-| 服务端 | rfrps 单测 | 13 | `bridge` 双向转发（duplex）、`next_work_id` 单调、NewProxy 拒绝（非 TCP / 缺 remote_port / 端口不允许 / 重名 / 端口被占用）、控制循环分支（newproxy→resp / heartbeat→resp / close→退出 / 心跳超时断开 / 非 Login 首帧报错 / 同名 run_id 重连替换旧会话 / 协议版本不匹配拒绝）、`handle_work_connection` 未知 work_id 安全关闭 |
+| 服务端 | rfrps 单测 | 13 | `bridge` 双向转发（duplex）、`next_work_id` 单调、NewProxy 拒绝（非 TCP / 缺 remote_port / 端口不允许 / 重名 / 端口被占用）、控制循环分支（newproxy→resp / heartbeat→resp / close→退出 / 心跳超时断开 / 非 Login 首帧报错 / 同名 run_id 重连替换旧会话 / 协议版本不匹配拒绝）、`handle_work_connection` 未知 work_id 安全关闭、工作连接池预热（work_id=0 入池 / 池命中桥接+补充） |
 | 客户端 | rfrpc 单测 | 8 | `new_proxy_from_config` 字段映射、`run_id` 持久化复用、`control_loop` 分支（NewProxyResp 路由 / heartbeat 应答 / ReqWorkConn 派生且不退出 / close 退出 / LoginResp 路由）、`handle_work_conn` 未知 proxy 安全返回 |
 | 集成 | rfrpc/tests | 6 | 真实示例配置全链路（example_smoke）、小包/64KiB/多轮往返、20 并发用户、多代理、未注册端口立即关闭、致命登录失败（auth failed）不无限重连即退出 |
 | 集成 | rfrp-common/tests | 2 | `examples/rfrp-{server,client}.toml` 契约测试：断言解析后完整结构（含 `[[proxy]]` 数组、各段字段）|
@@ -1320,7 +1320,7 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 |----|----|----|
 | M2a | 控制连接心跳保活 + 控制循环分支单测 | 完成 |
 | M2b | 客户端断线检测 + 指数退避重连 + run_id 复用（服务端按 run_id 清理旧 Session 后恢复 Proxy） | 完成 |
-| M2c | 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充，work_id=0 语义） | 待做 |
+| M2c | 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充，work_id=0 语义） | 完成 |
 | M2d | 优雅退出（tokio signal -> 资源回收，在途连接 GRACEFUL_SHUTDOWN_TIMEOUT 强制关闭） | 待做 |
 
 **M2a 完成内容**
@@ -1337,4 +1337,10 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 
 - 服务端加固：`handle_control_login` 现校验协议版本，不匹配直接回 `LoginResp{ok=false, "version mismatch"}` 并结束会话（客户端据此判定致命、不重连，§6.6）——此前仅客户端侧声明该致命路径，现已端到端可达（`login_version_mismatch_rejected`）。
 
-**测试计数**：全量 63 -> 71（rfrp-common lib 38->42，rfrps lib 11->13，rfrpc lib 7->8，rfrpc 集成 5->6）。
+**M2c 完成内容**
+- 工作连接池预热（§8.2）：客户端注册代理后按 `pool_size`（>0）预建 N 条工作连接（StartWorkConn{work_id=0}），服务端归入 `Session.pools[proxy_name]` 空闲池；用户连接优先命中池直接桥接，并回 `ReqWorkConn{work_id=0}` 触发客户端补充。
+- `handle_work_connection` 增加 `work_id==0` 分支（预热池连接入池，不查 pending）；`proxy_accept_loop` 增加池命中路径（命中即桥接+补充，未命中退回按需 work_id≥1）。
+- `Session` 增加 `pools` 字段，断开/重连清理时一并关闭池内连接；`handle_work_connection` 经 `find_session_by_proxy` 按 proxy_name 定位所属会话池。
+- 新增单测：服务端 `work_id=0` 预热连接入池（`pooled_work_connection_registered`）；集成 `tcp_proxy_pool_size_two` 多次往返命中预热池并被补充。
+
+**测试计数**：全量 71 -> 73（rfrps lib 13->14，rfrpc 集成 6->7）。

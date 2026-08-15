@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 
+use crate::bridge;
 use crate::control::Session;
 use crate::server::{PendingWork, ServerState};
 
@@ -73,6 +74,27 @@ async fn proxy_accept_loop(
     loop {
         match listener.accept().await {
             Ok((user, peer)) => {
+                // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
+                let pooled = {
+                    let mut pools = session.pools.lock().unwrap();
+                    pools.get_mut(&proxy_name).and_then(|v| v.pop())
+                };
+                if let Some(work) = pooled {
+                    tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
+                    let _ = bridge::bridge(user, work).await;
+                    if session
+                        .tx
+                        .send(Message::ReqWorkConn(ReqWorkConn {
+                            proxy_name: proxy_name.clone(),
+                            work_id: WORK_ID_POOL_RESERVED,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        // 控制连接已断，忽略补充请求。
+                    }
+                    continue;
+                }
                 let work_id = state.next_work_id();
                 tracing::debug!(%proxy_name, work_id, %peer, "user connected");
                 {
@@ -128,9 +150,11 @@ fn spawn_pending_timeout(work_id: u64, state: Arc<ServerState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::handle_work_connection;
     use rfrp_common::config::{LogSection, ProxySection, ServerConfig, ServerSection};
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::Notify;
 
@@ -163,6 +187,7 @@ mod tests {
             tx,
             proxies: Mutex::new(HashMap::new()),
             stop: Arc::new(Notify::new()),
+            pools: Mutex::new(HashMap::new()),
         })
     }
 
@@ -261,5 +286,48 @@ mod tests {
         };
         // occupied 持有该端口直至 drop，注册应失败（内部错误）。
         assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pooled_work_connection_registered() {
+        // work_id=0 的工作连接应归入会话池，供用户连接命中（§8.2）。
+        let state = ServerState::new();
+        let session = test_session();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.run_id.clone(), session.clone());
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "ssh".into(),
+            r#type: ProxyType::Tcp,
+            remote_port: Some(free_port()),
+            custom_domains: None,
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+        let frame = Message::StartWorkConn(StartWorkConn {
+            proxy_name: "ssh".into(),
+            work_id: WORK_ID_POOL_RESERVED,
+        })
+        .to_frame()
+        .unwrap();
+        assert!(handle_work_connection(frame, server, state.clone())
+            .await
+            .is_ok());
+
+        let pooled = session
+            .pools
+            .lock()
+            .unwrap()
+            .get("ssh")
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(pooled, 1);
     }
 }

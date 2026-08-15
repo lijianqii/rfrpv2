@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
-use rfrp_common::constants::{MAX_RUN_ID_LEN, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX};
+use rfrp_common::constants::{
+    MAX_RUN_ID_LEN, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
+};
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
 use tokio::net::TcpStream;
@@ -133,6 +135,7 @@ impl Client {
         }
 
         tracing::info!(count = state.proxies.len(), "registering proxies");
+        let mut preheat = Vec::new();
         for p in &state.proxies {
             let (otx, orx) = oneshot::channel();
             state.resps.lock().unwrap().insert(p.name.clone(), otx);
@@ -144,6 +147,9 @@ impl Client {
                 Ok(Ok(resp)) => {
                     if resp.ok {
                         tracing::info!(proxy = %p.name, "proxy registered");
+                        if p.pool_size > 0 {
+                            preheat.push(p.clone());
+                        }
                     } else {
                         tracing::warn!(proxy = %p.name, error = ?resp.error, "proxy registration rejected");
                     }
@@ -152,6 +158,21 @@ impl Client {
                     tracing::warn!(proxy = %p.name, "registration response channel dropped")
                 }
                 Err(_) => tracing::warn!(proxy = %p.name, "registration response timeout"),
+            }
+        }
+
+        // 工作连接池预热（pool_size>0，§8.2）：按池大小预建工作连接，命中后由服务端补充。
+        for p in &preheat {
+            for _ in 0..p.pool_size {
+                let req = ReqWorkConn {
+                    proxy_name: p.name.clone(),
+                    work_id: WORK_ID_POOL_RESERVED,
+                };
+                let st = state.clone();
+                let cfg = self.config.clone();
+                tokio::spawn(async move {
+                    let _ = crate::workconn::handle_work_conn(req, st, cfg).await;
+                });
             }
         }
 
