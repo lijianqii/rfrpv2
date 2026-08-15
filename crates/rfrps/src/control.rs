@@ -208,6 +208,10 @@ where
                 tracing::info!(session = %session_id, "control connection stopped (replaced or shutdown)");
                 break;
             }
+            _ = state.shutdown.cancelled() => {
+                tracing::info!(session = %session_id, "control connection stopped by shutdown");
+                break;
+            }
         }
     }
 
@@ -451,5 +455,32 @@ mod tests {
         }
         // 控制任务应直接结束（未建立会话）。
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_loop_exits_on_shutdown() {
+        // 退出令牌被取消时，控制循环应立即退出（§14.4）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let shutdown = state.shutdown.clone();
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rsd"),
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        // 消费 LoginResp，确认已登录且未退出。
+        let (cr, _cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let _ = recv_msg(&mut cr).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        shutdown.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(3), task).await;
+        assert!(r.is_ok(), "control loop must exit on shutdown token");
+        r.unwrap().unwrap().unwrap();
     }
 }

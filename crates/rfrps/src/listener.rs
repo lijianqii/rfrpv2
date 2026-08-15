@@ -72,61 +72,69 @@ async fn proxy_accept_loop(
     state: Arc<ServerState>,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((user, peer)) => {
-                // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
-                let pooled = {
-                    let mut pools = session.pools.lock().unwrap();
-                    pools.get_mut(&proxy_name).and_then(|v| v.pop())
-                };
-                if let Some(work) = pooled {
-                    tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
-                    let _ = bridge::bridge(user, work).await;
-                    if session
-                        .tx
-                        .send(Message::ReqWorkConn(ReqWorkConn {
-                            proxy_name: proxy_name.clone(),
-                            work_id: WORK_ID_POOL_RESERVED,
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        // 控制连接已断，忽略补充请求。
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((user, peer)) => {
+                        // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
+                        let pooled = {
+                            let mut pools = session.pools.lock().unwrap();
+                            pools.get_mut(&proxy_name).and_then(|v| v.pop())
+                        };
+                        if let Some(work) = pooled {
+                            tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
+                            let _ = bridge::bridge(user, work).await;
+                            if session
+                                .tx
+                                .send(Message::ReqWorkConn(ReqWorkConn {
+                                    proxy_name: proxy_name.clone(),
+                                    work_id: WORK_ID_POOL_RESERVED,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                // 控制连接已断，忽略补充请求。
+                            }
+                            continue;
+                        }
+                        let work_id = state.next_work_id();
+                        tracing::debug!(%proxy_name, work_id, %peer, "user connected");
+                        {
+                            let mut p = state.pending.lock().unwrap();
+                            p.insert(
+                                work_id,
+                                PendingWork {
+                                    proxy_name: proxy_name.clone(),
+                                    session_id: session.session_id.clone(),
+                                    user: Some(user),
+                                },
+                            );
+                        }
+                        // 经控制连接请求客户端建立工作连接。
+                        if session
+                            .tx
+                            .send(Message::ReqWorkConn(ReqWorkConn {
+                                proxy_name: proxy_name.clone(),
+                                work_id,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            // 控制连接已断，清理待处理项。
+                            state.pending.lock().unwrap().remove(&work_id);
+                            continue;
+                        }
+                        // 超时兜底：用户连接长时间等不到工作连接则关闭（见 DESIGN §8.5）。
+                        spawn_pending_timeout(work_id, state.clone());
                     }
-                    continue;
+                    Err(e) => {
+                        tracing::warn!("proxy listener accept error: {e}");
+                        break;
+                    }
                 }
-                let work_id = state.next_work_id();
-                tracing::debug!(%proxy_name, work_id, %peer, "user connected");
-                {
-                    let mut p = state.pending.lock().unwrap();
-                    p.insert(
-                        work_id,
-                        PendingWork {
-                            proxy_name: proxy_name.clone(),
-                            session_id: session.session_id.clone(),
-                            user: Some(user),
-                        },
-                    );
-                }
-                // 经控制连接请求客户端建立工作连接。
-                if session
-                    .tx
-                    .send(Message::ReqWorkConn(ReqWorkConn {
-                        proxy_name: proxy_name.clone(),
-                        work_id,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // 控制连接已断，清理待处理项。
-                    state.pending.lock().unwrap().remove(&work_id);
-                    continue;
-                }
-                // 超时兜底：用户连接长时间等不到工作连接则关闭（见 DESIGN §8.5）。
-                spawn_pending_timeout(work_id, state.clone());
             }
-            Err(e) => {
-                tracing::warn!("proxy listener accept error: {e}");
+            _ = state.shutdown.cancelled() => {
+                tracing::info!(%proxy_name, "shutdown requested, closing proxy listener");
                 break;
             }
         }

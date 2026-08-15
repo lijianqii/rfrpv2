@@ -15,6 +15,7 @@ use rfrp_common::protocol::msg::*;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::control;
 
@@ -41,24 +42,45 @@ enum ConnectOutcome {
 /// rfrpc 客户端实例。
 pub struct Client {
     config: ClientConfig,
+    /// 优雅退出令牌：信号或外部触发后停止重连并退出（§14.4）。
+    shutdown: CancellationToken,
 }
 
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    /// 返回可被外部触发的退出令牌（终止信号处理器与测试共用）。
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// 长驻运行：连接 → 注册 → 控制循环；断开后按指数退避重连（§8.3）。
     /// 仅当收到致命 Login 失败（鉴权 / 版本不兼容）时返回错误退出。
     pub async fn run(self) -> AnyResult<()> {
         let run_id = self.load_or_create_run_id();
+        let shutdown = self.shutdown.clone();
+        // 监听 OS 终止信号，触发统一退出令牌。
+        let sig = spawn_client_signal_watcher(shutdown.clone());
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
         loop {
-            match self.connect_once(&run_id).await {
+            if shutdown.is_cancelled() {
+                tracing::info!("shutdown requested, exiting client");
+                break;
+            }
+            match self.connect_once(&run_id, &shutdown).await {
                 Ok(ConnectOutcome::Fatal(reason)) => {
+                    sig.abort();
                     return Err(anyhow::anyhow!("login fatal: {reason}"));
                 }
                 Ok(ConnectOutcome::Reconnect) => {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
                     tracing::info!(
                         backoff_secs = backoff.as_secs(),
                         "control closed, reconnecting"
@@ -67,16 +89,25 @@ impl Client {
                     backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
                 }
                 Err(e) => {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
                     tracing::warn!(error = %e, "transient error, reconnecting");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
                 }
             }
         }
+        sig.abort();
+        Ok(())
     }
 
     /// 单次连接：建连、登录、注册代理、长驻控制循环直到断开。
-    async fn connect_once(&self, run_id: &str) -> AnyResult<ConnectOutcome> {
+    async fn connect_once(
+        &self,
+        run_id: &str,
+        shutdown: &CancellationToken,
+    ) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
         let stream = match TcpStream::connect(server_addr).await {
             Ok(s) => s,
@@ -103,6 +134,7 @@ impl Client {
             rx,
             state.clone(),
             self.config.clone(),
+            shutdown.clone(),
         ));
 
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
@@ -223,6 +255,37 @@ fn set_file_mode_0600(path: &std::path::Path) {
 }
 #[cfg(not(unix))]
 fn set_file_mode_0600(_path: &std::path::Path) {}
+
+/// 监听 OS 终止信号（Ctrl+C / SIGTERM），触发统一的退出令牌。
+fn spawn_client_signal_watcher(shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("install SIGTERM handler failed: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown.cancel();
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown.cancel();
+    })
+}
 
 /// 由配置条目构造 `NewProxy` 控制消息。
 pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {

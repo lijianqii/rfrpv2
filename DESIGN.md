@@ -875,7 +875,7 @@ CLI 参数 > 配置文件 > 默认值。
 - [ ] 心跳保活 + 断线指数退避重连
 - [ ] 重连后 Proxy 恢复（run_id 复用，端口冲突按 6.6 处理）
 - [ ] 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充流程 work_id=0 语义，pool_size=0 纯按需模式），降低首包延迟
-- [ ] 优雅退出（信号触发资源回收，在途连接 30s 超时强制关闭，无端口泄漏）
+- [x] 优雅退出（信号触发资源回收，在途连接 30s 超时强制关闭，无端口泄漏）
 - [ ] 工作连接 TLS（可配置，服务端优先）
 - [ ] Dashboard：客户端/代理列表、连接数、流量统计
 - [ ] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
@@ -915,7 +915,7 @@ CLI 参数 > 配置文件 > 默认值。
 
 - **工作连接池预热**：工作连接池是 **per-Proxy** 的（每个 `proxy_name` 独立维护一个池，不跨 Proxy 共享）。每个 Proxy 维持 `pool_size` 个空闲工作连接（默认 1，可配）。rfrpc 在 NewProxy 成功后立即预建；rfrps 每收到一个外部用户连接，若对应 Proxy 的池非空则取一个并要求 rfrpc 补充一个（发 `ReqWorkConn{work_id=0}`，见 8.2）；池空时退化为按需建立。对 HTTP/HTTPS 类型同样生效（rfrps 命中 vhost 后向对应 Proxy 的池请求工作连接，池不跨域名共享）。
 - **重连后 NewProxy 顺序**：rfrpc 重连 Login 成功后，按配置文件中 `[[proxy]]` 的声明顺序**串行**发送 NewProxy，逐个等待 NewProxyResp。串行便于错误定位与端口冲突逐条处理；并行优化留待后续版本。
-- **优雅退出在途连接处理**：rfrps 收到退出信号后，停止接受新用户连接与新 rfrpc 登录，向所有 rfrpc 发送 `Close{reason:"server shutdown"}`；已在途的用户连接等待完成或超时 **30s** 后强制关闭。rfrpc 收到 Close 后主动断开并触发重连。
+- **优雅退出在途连接处理（M2d）**：rfrps 收到退出信号（SIGTERM/SIGINT）后，经统一 `shutdown` 令牌（`tokio_util::sync::CancellationToken`）停止 accept 与新 rfrpc 登录；所有长连接任务（控制循环 `handle_control_login`、代理监听 `proxy_accept_loop`）监听同一令牌，取消即干净退出（底层 TCP 关闭等效于发送 `Close`）。已在途的用户桥接（短任务）在 `GRACEFUL_SHUTDOWN_TIMEOUT`（默认 30s，测试可覆盖）宽限期内自然结束，超时后随进程退出强制关闭，无端口/资源泄漏。rfrpc 收到控制连接 EOF 后由重连机制处理；若 rfrpc 自身收到退出信号，则停止重连、干净退出（不陷入无限重连）。令牌取消封装为 `Server::shutdown_token()` / `Client::shutdown_token()`，便于测试模拟信号。
 
 ### 阶段 3：安全（M3）
 - TLS 控制链路（rustls）
@@ -1124,7 +1124,7 @@ C:\rfrp\
 |--------|------|------|
 | **M0** | 地基：workspace + rfrp-common + rfrp-bin 占位 | ✅ **已完成**（2026-08-14） |
 | **M1** | TCP 跑通：rfrps/rfrpc 控制+监听+桥接 | ✅ **已完成**（2026-08-14） |
-| M2 | 健壮性：心跳/重连/run_id/优雅退出/连接池 | ⬜ 未开始 |
+| M2 | 健壮性：心跳/重连/run_id/优雅退出/连接池 | ✅ 完成 |
 | M3 | 安全：TLS 控制链路 + 工作连接 TLS + token 鉴权 | ⬜ 未开始 |
 | M4 | UDP / HTTP / HTTPS（vhost） | ⬜ 未开始 |
 | M5 | Dashboard 与可观测（指标/结构化日志） | ⬜ 未开始 |
@@ -1277,7 +1277,7 @@ $ cargo fmt --check           # FMT CLEAN
 - 控制循环分支（Heartbeat 响应、Close 清理、ReqWorkConn 派发、NewProxyResp 路由、LoginResp 路由、run_id 去重）**已在 M2a/M2b 补齐独立单测**（duplex 内存双工驱动，无需真实端口），§17.12.1 原缺口已关闭。
 - 协议层边界（`from_frame` 未知 msg_type / 非法 JSON、未知 `ProxyType`、版本不匹配拒绝）**已补齐**（M2 整理），使致命登录路径端到端可达。
 - 工作连接负路径：未知 proxy_name / 未知 work_id 已有单测；**本地服务不可达**仍仅集成 happy path 间接覆盖（直接断言需真实 server+本地监听，成本高；该路径逻辑已简单——`warn` 后关闭工作连接，§8.2/§8.5），后续可借 M2c 连接池专项测试覆盖。
-- 超时/资源泄漏（待处理项清理、优雅退出）无专门测试；依赖 M2d 的优雅退出 + 混沌测试（§14.4）。
+- 超时/资源泄漏：待处理项清理已有单测覆盖（M2a 心跳超时）；优雅退出令牌机制与端到端退出已有单测（M2d：服务端/客户端 `control_loop_exits_on_shutdown` + 集成 `graceful_shutdown`）；真实 SIGTERM 信号路径与混沌测试留待 §14.4。
 - 配置层「非法 TOML / 字段类型错误 / 未知字段」反例**已补齐**（见 §17.12.4）：配合 `deny_unknown_fields`，TOML 键拼写/重命名错误显式失败而非静默忽略。
 - TLS/鉴权路径在 M1 按设计跳过，不在测试范围。
 
@@ -1312,7 +1312,7 @@ M1 启动「无输出」的根因是**配置解析静默丢弃 `[[proxy]]`**，�
 - **修复**：`crates/rfrp-common/src/config/client.rs` 给 `proxies` 字段加 `#[serde(rename = "proxy")]`，与 `[[proxy]]` 对齐；并加固单测断言 `proxies.len()==2`，`example_smoke` 同时断言。
 - **附带可观测性增强**（直接缓解「无输出」困惑）：控制/工作连接建立与代理注册/拒绝均补 `INFO/WARN` 日志（`connected to server` / `control connection established` / `registering proxies` / `received NewProxy` / `proxy registered (tcp)` / `proxy registered` / `proxy registration rejected`）。
 
-#### 17.13 M2 推进（健壮性，进行中）
+#### 17.13 M2 推进（健壮性，已完成）
 
 M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、优雅退出、工作连接池预热（§12 / §8.3 / §14.4）。为控制步幅与回归风险，拆分为可独立测试的子任务：
 
@@ -1321,7 +1321,7 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 | M2a | 控制连接心跳保活 + 控制循环分支单测 | 完成 |
 | M2b | 客户端断线检测 + 指数退避重连 + run_id 复用（服务端按 run_id 清理旧 Session 后恢复 Proxy） | 完成 |
 | M2c | 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充，work_id=0 语义） | 完成 |
-| M2d | 优雅退出（tokio signal -> 资源回收，在途连接 GRACEFUL_SHUTDOWN_TIMEOUT 强制关闭） | 待做 |
+| M2d | 优雅退出（tokio signal -> 资源回收，在途连接 GRACEFUL_SHUTDOWN_TIMEOUT 强制关闭） | 完成 |
 
 **M2a 完成内容**
 - 服务端控制连接主动发送 Heartbeat（每 HEARTBEAT_INTERVAL=30s），并通过 Notify + last_resp 时间戳实现超时断开（HEARTBEAT_TIMEOUT=10s 内未收到 HeartbeatResp 即清理 Session 并中止所有代理监听）。客户端维持对 Heartbeat 的 HeartbeatResp 应答（§8.3 服务端->客户端方向已生效；客户端->服务端主动心跳与重连在 M2b 补齐）。
@@ -1343,4 +1343,10 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - `Session` 增加 `pools` 字段，断开/重连清理时一并关闭池内连接；`handle_work_connection` 经 `find_session_by_proxy` 按 proxy_name 定位所属会话池。
 - 新增单测：服务端 `work_id=0` 预热连接入池（`pooled_work_connection_registered`）；集成 `tcp_proxy_pool_size_two` 多次往返命中预热池并被补充。
 
-**测试计数**：全量 71 -> 73（rfrps lib 13->14，rfrpc 集成 6->7）。
+**M2d 完成内容**
+- 优雅退出（§14.4 / §12.2）：`ServerState` 增加 `shutdown: CancellationToken`；`Server::run` 在 accept 循环中经 `tokio::select!` 监听该令牌，收到信号（Ctrl+C / SIGTERM，由 `spawn_signal_watcher` 触发）即停止接收新连接；随后在宽限期（默认 `GRACEFUL_SHUTDOWN_TIMEOUT=30s`，测试经 `Server::with_grace` 覆盖）内等待在途连接自然结束，超时后返回。长连接任务（控制循环 `handle_control_login`、代理监听 `proxy_accept_loop`）均监听同一令牌，取消即干净退出（底层 TCP 关闭等效于发送 `Close`），并由 `cleanup` 中止代理监听、清理 pending 与预热池。
+- 客户端侧 `Client` 增加 `shutdown` 令牌；`Client::run` 在重连循环顶部检查令牌，`connect_once` 将令牌透传 `control_loop`（控制循环监听令牌即退出，`ctrl.await` 随之结束、run 干净退出）。收到 Ctrl+C / SIGTERM 时停止重连并退出，而非无限重连；仅致命 Login 失败仍按原路径返回错误。
+- 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
+- 新增测试：服务端/客户端各 `control_loop_exits_on_shutdown` 单测（令牌取消 -> 控制循环退出）；集成 `rfrps/tests/graceful_shutdown.rs::server_run_returns_after_shutdown_token`（run 在令牌取消后返回）；`rfrpc/tests/graceful_shutdown.rs`（client_run_exits_on_shutdown_without_infinite_reconnect + server_and_client_exit_cleanly_on_shutdown 端到端二者均干净退出）。
+
+**测试计数**：全量 73 -> 78（rfrpc lib 8->9，rfrps lib 14->15，新增集成 rfrpc/tests/graceful_shutdown.rs 2、rfrps/tests/graceful_shutdown.rs 1）。

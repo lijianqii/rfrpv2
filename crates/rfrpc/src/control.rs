@@ -13,6 +13,7 @@ use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use tokio::io::split;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::ClientState;
 use crate::workconn;
@@ -22,6 +23,7 @@ pub async fn control_loop<S>(
     mut rx: mpsc::Receiver<Message>,
     state: Arc<ClientState>,
     config: ClientConfig,
+    shutdown: CancellationToken,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -101,6 +103,10 @@ where
                     None => break,
                 }
             }
+            _ = shutdown.cancelled() => {
+                tracing::info!("shutdown requested, exiting control loop");
+                break;
+            }
         }
     }
 
@@ -120,6 +126,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{duplex, AsyncRead, AsyncWrite};
     use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
 
     async fn send_msg<W: AsyncWrite + Unpin>(w: &mut FramedWrite<W, FrameCodec>, m: Message) {
         w.send(m.to_frame().unwrap()).await.unwrap();
@@ -158,7 +165,13 @@ mod tests {
         let (state, orx) = client_state_with_resp("ssh");
         let (_tx, rx) = mpsc::channel::<Message>(64);
         let config = ClientConfig::default();
-        let task = tokio::spawn(control_loop(client_end, rx, state, config));
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            state,
+            config,
+            CancellationToken::new(),
+        ));
 
         let (sr, sw) = split(server_end);
         let mut sr = FramedRead::new(sr, FrameCodec);
@@ -188,7 +201,13 @@ mod tests {
         let (client_end, server_end) = duplex(8192);
         let (_tx, rx) = mpsc::channel::<Message>(64);
         let config = ClientConfig::default();
-        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            default_state(),
+            config,
+            CancellationToken::new(),
+        ));
 
         let (sr, sw) = split(server_end);
         let mut sr = FramedRead::new(sr, FrameCodec);
@@ -208,7 +227,13 @@ mod tests {
         let (client_end, server_end) = duplex(8192);
         let (_tx, rx) = mpsc::channel::<Message>(64);
         let config = ClientConfig::default();
-        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            default_state(),
+            config,
+            CancellationToken::new(),
+        ));
 
         let (sr, sw) = split(server_end);
         let mut sr = FramedRead::new(sr, FrameCodec);
@@ -236,7 +261,13 @@ mod tests {
         let (client_end, server_end) = duplex(8192);
         let (_tx, rx) = mpsc::channel::<Message>(64);
         let config = ClientConfig::default();
-        let task = tokio::spawn(control_loop(client_end, rx, default_state(), config));
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            default_state(),
+            config,
+            CancellationToken::new(),
+        ));
 
         let (sr, sw) = split(server_end);
         let mut sr = FramedRead::new(sr, FrameCodec);
@@ -244,6 +275,31 @@ mod tests {
         let _ = recv_msg(&mut sr).await; // Login
         send_msg(&mut sw, Message::Close(Close { reason: None })).await;
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_loop_exits_on_shutdown() {
+        // 退出令牌被取消时，控制循环应立即退出（§14.4）。
+        let (client_end, _server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            default_state(),
+            config,
+            shutdown.clone(),
+        ));
+        // 未取消前应持续存活。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -262,7 +318,13 @@ mod tests {
         let (lotx, lorx) = oneshot::channel();
         state.login_tx.lock().unwrap().replace(lotx);
 
-        let task = tokio::spawn(control_loop(client_end, rx, state, config));
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            state,
+            config,
+            CancellationToken::new(),
+        ));
 
         let (sr, sw) = split(server_end);
         let mut sr = FramedRead::new(sr, FrameCodec);
