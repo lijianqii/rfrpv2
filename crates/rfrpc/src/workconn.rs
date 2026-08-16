@@ -86,8 +86,9 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     // 首帧之后为透传字节，取回原始流（明文或 TLS）。
     let work_stream = framed.into_inner();
 
-    tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, "bridging work <-> local");
+    tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "work connection established");
     let _ = bridge(work_stream, local).await;
+    tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, "work bridge finished");
     Ok(())
 }
 

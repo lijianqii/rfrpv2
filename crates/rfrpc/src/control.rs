@@ -90,6 +90,7 @@ where
                                 });
                             }
                             Message::Heartbeat(h) => {
+                                tracing::debug!(ts = h.ts, "heartbeat received; responding");
                                 out_tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
                             }
                             Message::LoginResp(r) => {
@@ -98,18 +99,27 @@ where
                                     let _ = tx.send(r);
                                 }
                             }
-                            Message::Close(_) => break,
+                            Message::Close(c) => {
+                                tracing::info!(reason = ?c.reason, "control connection closed by server");
+                                break;
+                            }
                             _ => {}
                         }
                     }
                     Some(Err(e)) => { tracing::warn!("control frame error: {e}"); break; }
-                    None => break,
+                    None => {
+                        tracing::info!("control connection closed by peer (EOF)");
+                        break;
+                    }
                 }
             }
             out = rx.recv() => {
                 match out {
                     Some(m) => { out_tx.send(m).await.ok(); }
-                    None => break,
+                    None => {
+                        tracing::info!("control outbound channel closed");
+                        break;
+                    }
                 }
             }
             _ = shutdown.cancelled() => {

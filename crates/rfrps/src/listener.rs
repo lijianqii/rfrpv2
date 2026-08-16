@@ -85,8 +85,10 @@ async fn proxy_accept_loop(
                         };
                         if let Some(work) = pooled {
                             tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
+                            let pname = proxy_name.clone();
                             tokio::spawn(async move {
                                 let _ = bridge(user, work).await;
+                                tracing::debug!(proxy = %pname, "pooled work bridge finished");
                             });
                             // 立即请求补充预热连接（无需等待本次用户断开）。
                             if session

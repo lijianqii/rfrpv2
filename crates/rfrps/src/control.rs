@@ -183,8 +183,10 @@ where
         iv.tick().await; // 消耗首次立即 tick，避免一建立就连发
         loop {
             iv.tick().await;
+            let ts = now_ms();
+            tracing::debug!(session = %session_id_hb, ts, "heartbeat sent");
             if hb_tx
-                .send(Message::Heartbeat(Heartbeat { ts: now_ms() }))
+                .send(Message::Heartbeat(Heartbeat { ts }))
                 .await
                 .is_err()
             {
@@ -225,18 +227,26 @@ where
                                 .ok();
                             }
                             Message::Heartbeat(h) => {
+                                tracing::debug!(session = %session_id, ts = h.ts, "heartbeat received");
                                 tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
                             }
                             Message::HeartbeatResp(_) => {
+                                tracing::debug!(session = %session_id, "heartbeat response received");
                                 // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
                                 pong.notify_one();
                             }
-                            Message::Close(_) => break,
+                            Message::Close(c) => {
+                                tracing::info!(session = %session_id, reason = ?c.reason, "control connection closed by client");
+                                break;
+                            }
                             _ => {}
                         }
                     }
                     Some(Err(e)) => { tracing::warn!("control frame error: {e}"); break; }
-                    None => break,
+                    None => {
+                        tracing::info!(session = %session_id, "control connection closed by peer (EOF)");
+                        break;
+                    }
                 }
             }
             _ = disconnect.notified() => {

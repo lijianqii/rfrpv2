@@ -27,6 +27,7 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig> {
     resolve_opt_path(&mut cfg.proxy.vhost_tls_cert, base);
     resolve_opt_path(&mut cfg.proxy.vhost_tls_key, base);
     cfg.validate()?;
+    tracing::debug!(path = %path.display(), "server config loaded");
     Ok(cfg)
 }
 
@@ -38,6 +39,7 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.client.tls_ca, base);
     cfg.validate()?;
+    tracing::debug!(path = %path.display(), "client config loaded");
     Ok(cfg)
 }
 
@@ -48,13 +50,13 @@ fn resolve_opt_path(value: &mut Option<String>, base: &Path) {
         if path.is_relative() {
             let joined = base.join(path);
             // 文件存在时规范化，去掉路径中的 `..`；不存在时保留 joined 用于后续报错。
-            *value = Some(
-                joined
-                    .canonicalize()
-                    .unwrap_or(joined)
-                    .to_string_lossy()
-                    .to_string(),
-            );
+            let resolved = joined
+                .canonicalize()
+                .unwrap_or(joined)
+                .to_string_lossy()
+                .to_string();
+            tracing::debug!(original = %p, resolved = %resolved, "resolved relative config path");
+            *value = Some(resolved);
         }
     }
 }

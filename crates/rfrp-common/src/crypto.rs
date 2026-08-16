@@ -94,6 +94,7 @@ impl ServerTls {
     pub fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
         ensure_crypto_provider();
         let config = load_server_tls(cert_path, key_path)?;
+        tracing::debug!(cert = %cert_path.display(), "server TLS config loaded");
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
         })
@@ -133,6 +134,7 @@ impl ClientTls {
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        tracing::debug!(server_name = ?server_name, "client TLS config loaded");
 
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),

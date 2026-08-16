@@ -77,11 +77,14 @@ impl Client {
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
+        let mut attempt: u32 = 0;
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("shutdown requested, exiting client");
                 break;
             }
+            attempt += 1;
+            tracing::debug!(attempt, "connection attempt");
             match self.connect_once(&run_id, &shutdown).await {
                 Ok(ConnectOutcome::Fatal(reason)) => {
                     sig.abort();
@@ -92,9 +95,11 @@ impl Client {
                         break;
                     }
                     if connected {
+                        attempt = 0;
                         backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
                     }
                     tracing::info!(
+                        attempt,
                         backoff_secs = backoff.as_secs(),
                         "control closed, reconnecting"
                     );
@@ -107,7 +112,7 @@ impl Client {
                     if shutdown.is_cancelled() {
                         break;
                     }
-                    tracing::warn!(error = %e, "transient error, reconnecting");
+                    tracing::warn!(attempt, error = %e, "transient error, reconnecting");
                     if !wait_for_reconnect(backoff, &shutdown).await {
                         break;
                     }
