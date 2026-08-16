@@ -1,7 +1,7 @@
 //! 平台差异封装。任何平台相关的路径/信号/行为都集中在此模块，
 //! 上层代码一律使用 tokio 抽象，不直接调用平台特定 API。
 //!
-//! 当前 M0 仅提供 run_id 默认路径解析；信号等待（SIGTERM/Ctrl-C）将在 M2 接入。
+//! 当前提供 run_id 默认路径解析；信号处理由 rfrps / rfrpc 内部实现。
 
 /// 返回用户主目录（Linux `$HOME` / Windows `%USERPROFILE%`）。
 pub fn home_dir() -> Option<std::path::PathBuf> {

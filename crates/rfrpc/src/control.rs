@@ -51,7 +51,7 @@ where
         }
     });
 
-    // 登录（M1：token 不校验，可空；run_id 来自状态以便重连复用，§6.6 / §8.3）。
+    // 登录（token 由服务端在 M3 校验；run_id 来自状态以便重连复用，§6.6 / §8.3）。
     out_tx
         .send(Message::Login(Login {
             run_id: state.run_id.clone(),

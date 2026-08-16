@@ -19,6 +19,7 @@ use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::now_ms;
+use rfrp_common::util::stream::BoxedStream;
 use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -40,7 +41,7 @@ pub struct Session {
     pub stop: Arc<Notify>,
     /// 预热工作连接池（proxy_name -> 空闲服务端侧工作流），按 §8.2 命中用户连接。
     /// 使用类型擦除以同时支持明文与 TLS 工作连接。
-    pub pools: Mutex<HashMap<String, Vec<rfrp_common::util::stream::BoxedStream>>>,
+    pub pools: Mutex<HashMap<String, Vec<BoxedStream>>>,
 }
 
 /// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
@@ -514,6 +515,43 @@ mod tests {
         }
         // 控制任务应直接结束（未建立会话）。
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_failure_rejects_without_echo() {
+        // M3：token 错误时返回 LoginResp{ok=false, error=None}，不建立会话（DESIGN §10.2）。
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let mut config = ServerConfig::default();
+        config.server.token = "secret".into();
+
+        let bad = Message::Login(Login {
+            run_id: "rAuth".into(),
+            token: "wrong".into(),
+            version: PROTOCOL_VERSION,
+        })
+        .to_frame()
+        .unwrap();
+        let task = tokio::spawn(handle_control_login(
+            bad,
+            server_end,
+            state.clone(),
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, _cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        match recv_msg(&mut cr).await {
+            Message::LoginResp(r) => {
+                assert!(!r.ok);
+                assert!(r.error.is_none(), "auth failure must not echo reason");
+                assert!(r.session_id.is_none());
+            }
+            other => panic!("expected LoginResp, got {other:?}"),
+        }
+        task.await.unwrap().unwrap();
+        assert!(!state.sessions.lock().unwrap().contains_key("rAuth"));
     }
 
     #[tokio::test]

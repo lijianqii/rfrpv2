@@ -1,4 +1,4 @@
-//! 代理公网监听（服务端侧，M1 仅 TCP）。
+//! 代理公网监听（服务端侧，当前仅 TCP；UDP/HTTP/HTTPS 在 M4 扩展）。
 //!
 //! 注册成功后为每个 `remote_port` 起一个 accept 循环：每来一个用户连接，
 //! 分配 work_id、登记待处理项、向客户端发 `ReqWorkConn`（见 DESIGN §8.2）。
@@ -24,7 +24,7 @@ pub async fn register_proxy(
     config: &ServerConfig,
 ) -> Result<()> {
     if np.r#type != ProxyType::Tcp {
-        // M2 仅 TCP；其余类型在 M4 实现。
+        // 当前仅 TCP；其余类型在 M4 实现。
         return Err(rfrp_common::Error::Config(
             "only tcp proxy supported".into(),
         ));
@@ -348,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_rejects_https_proxy() {
-        // M2 仅 TCP：Https 类型也应被拒（与 Udp 同属 `!= Tcp` 分支）。
+        // 当前仅 TCP：Https 类型也应被拒（与 Udp 同属 `!= Tcp` 分支）。
         let state = ServerState::new();
         let session = test_session();
         let cfg = test_config("");

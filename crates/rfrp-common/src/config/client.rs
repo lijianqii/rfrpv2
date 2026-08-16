@@ -276,6 +276,38 @@ mod tests {
     }
 
     #[test]
+    fn work_conn_tls_requires_server_name() {
+        // M3：work_conn_tls=true 时即使 tls_enable=false 也需要 tls_server_name。
+        let cfg = ClientConfig {
+            client: ClientSection {
+                server_addr: "s.example.com".into(),
+                server_port: 7000,
+                token: "x".into(),
+                work_conn_tls: true,
+                tls_server_name: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_token_rejected() {
+        let cfg = ClientConfig {
+            client: ClientSection {
+                server_addr: "s.example.com".into(),
+                server_port: 7000,
+                token: "".into(),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn duplicate_names_fails() {
         let cfg = ClientConfig {
             client: ClientSection {

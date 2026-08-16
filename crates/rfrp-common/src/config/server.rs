@@ -297,6 +297,33 @@ mod tests {
     }
 
     #[test]
+    fn work_conn_tls_requires_certs() {
+        // M3：work_conn_tls=true 时即使 tls_enable=false 也必须提供证书/私钥。
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                work_conn_tls: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_token_rejected() {
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "".into(),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn dashboard_validate_rules() {
         let d = DashboardSection {
             addr: "0.0.0.0:7500".into(),

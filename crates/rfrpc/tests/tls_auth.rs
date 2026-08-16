@@ -176,6 +176,52 @@ async fn wrong_token_is_fatal() {
 }
 
 #[tokio::test]
+async fn tls_control_only_work_plaintext() {
+    // 控制链路 TLS，但服务端/客户端都允许工作连接明文：验证同一端口混合识别。
+    init_logging();
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(true, false, "secret")).await;
+    let remote = free_port();
+    let cli = start_client(client_config(
+        addr,
+        true,
+        false,
+        "secret",
+        vec![tcp_proxy("ssh", echo_port, remote)],
+    ))
+    .await;
+    wait_ready().await;
+
+    expect_echo(remote, addr, b"control-tls-work-plain").await;
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn work_conn_tls_upgrades_when_server_prefers_tls() {
+    // 客户端配置 work_conn_tls=false，但服务端偏好 true；rfrpc 应升级为 TLS 工作连接。
+    init_logging();
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(false, true, "secret")).await;
+    let remote = free_port();
+    let cli = start_client(client_config(
+        addr,
+        false,
+        false,
+        "secret",
+        vec![tcp_proxy("ssh", echo_port, remote)],
+    ))
+    .await;
+    wait_ready().await;
+
+    expect_echo(remote, addr, b"work-upgrade-ok").await;
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
 async fn work_conn_tls_follows_server_preference() {
     init_logging();
     // 客户端希望 work_conn_tls=true，但服务端偏好 false；rfrpc 应降级为明文工作连接。

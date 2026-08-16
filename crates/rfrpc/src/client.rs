@@ -124,7 +124,12 @@ impl Client {
         shutdown: &CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
-        let tls = if self.config.client.tls_enable || self.config.client.work_conn_tls {
+        // 只要配置了 tls_server_name 就构建 TLS 客户端，以便服务端在 LoginResp 中要求
+        // 工作连接升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
+        let tls = if self.config.client.tls_enable
+            || self.config.client.work_conn_tls
+            || self.config.client.tls_server_name.is_some()
+        {
             Some(ClientTls::new(&self.config.client)?)
         } else {
             None
