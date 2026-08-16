@@ -9,16 +9,19 @@ use rfrp_common::constants::WORK_ID_POOL_RESERVED;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::Frame;
 use rfrp_common::protocol::msg::*;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::bridge;
 use crate::server::ServerState;
 
-pub async fn handle_work_connection(
+pub async fn handle_work_connection<S>(
     start_frame: Frame,
-    stream: TcpStream,
+    stream: S,
     state: Arc<ServerState>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let msg = Message::from_frame(&start_frame)?;
     let (proxy_name, work_id) = match msg {
         Message::StartWorkConn(s) => (s.proxy_name, s.work_id),
@@ -38,7 +41,7 @@ pub async fn handle_work_connection(
                     .unwrap()
                     .entry(proxy_name.clone())
                     .or_default()
-                    .push(stream);
+                    .push(Box::new(stream));
                 tracing::debug!(%proxy_name, "work connection pooled");
             }
             None => {

@@ -13,8 +13,7 @@
 use crate::constants::{FRAME_HEADER_LEN, FRAME_MAX_PAYLOAD, PROTOCOL_VERSION};
 use crate::error::{protocol, Error, Result};
 use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::codec::{Decoder, Encoder};
 
 pub use tokio_util::codec::{Framed, FramedRead, FramedWrite};
@@ -97,11 +96,14 @@ impl Encoder<Frame> for FrameCodec {
     }
 }
 
-/// 从一条 `TcpStream` 上读取恰好一个帧，返回 `(Frame, 剩余 TcpStream)`。
+/// 从一条异步字节流上读取恰好一个帧，返回 `(Frame, 剩余流)`。
 ///
 /// 用于服务端在 accept 后区分控制连接（首帧 Login）与工作连接（首帧 StartWorkConn），
 /// 而不丢失首帧之后的原始字节（工作连接首帧后即透传）。
-pub async fn read_one_frame(mut stream: TcpStream) -> Result<(Frame, TcpStream)> {
+pub async fn read_one_frame<S>(mut stream: S) -> Result<(Frame, S)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut header = [0u8; FRAME_HEADER_LEN];
     stream.read_exact(&mut header).await?;
     let version = header[0];
@@ -127,7 +129,7 @@ mod tests {
     use super::*;
     use crate::protocol::msg::{Login, Message, MSG_LOGIN};
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn roundtrip(f: Frame) -> Frame {
         let mut buf = BytesMut::new();

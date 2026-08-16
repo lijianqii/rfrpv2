@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
+use rfrp_common::util::stream::BoxedStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
@@ -59,17 +61,34 @@ pub struct Server {
     state: Arc<ServerState>,
     /// 优雅退出宽限期：停止接收后等待在途连接结束的最长时间（§14.4）。
     grace: Duration,
+    /// 控制/工作连接 TLS acceptor（按配置按需加载）。
+    tls: Option<ServerTls>,
 }
 
 impl Server {
     /// 绑定 `config.server.bind_addr:bind_port`。`bind_port=0` 由 OS 分配。
     pub async fn new(config: ServerConfig) -> Result<Self> {
         let listener = TcpListener::bind(config.server.bind_socket_addr()?).await?;
+        let tls = if config.server.tls_enable || config.server.work_conn_tls {
+            let cert = config.server.tls_cert.as_deref().ok_or_else(|| {
+                rfrp_common::Error::Config("tls_cert is required when TLS is enabled".into())
+            })?;
+            let key = config.server.tls_key.as_deref().ok_or_else(|| {
+                rfrp_common::Error::Config("tls_key is required when TLS is enabled".into())
+            })?;
+            Some(ServerTls::new(
+                std::path::Path::new(cert),
+                std::path::Path::new(key),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             listener,
             state: ServerState::new(),
             grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
+            tls,
         })
     }
 
@@ -94,6 +113,7 @@ impl Server {
     /// 在 grace 宽限期内让在途连接自然结束，超时后由任务取消/进程退出强制关闭（§14.4）。
     pub async fn run(self) -> Result<()> {
         let shutdown = self.state.shutdown.clone();
+        let tls = self.tls.clone();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
         loop {
@@ -103,9 +123,10 @@ impl Server {
                         Ok((stream, peer)) => {
                             let state = self.state.clone();
                             let config = self.config.clone();
+                            let tls = tls.clone();
                             tracing::debug!(%peer, "accepted connection");
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, state, config).await {
+                                if let Err(e) = handle_connection(stream, state, config, tls).await {
                                     tracing::warn!("connection error: {e}");
                                 }
                             });
@@ -130,14 +151,54 @@ impl Server {
 }
 
 /// 读取首帧，按类型分派到控制连接或工作连接处理。
+///
+/// 同一 `bind_port` 上可能混有 TLS 与明文连接（取决于 `tls_enable` / `work_conn_tls`），
+/// 因此先 peek 首字节：TLS 握手记录以 `0x16` 开头，普通 rfrp 帧以协议版本 `0x01` 开头。
 async fn handle_connection(
     stream: TcpStream,
     state: Arc<ServerState>,
     config: ServerConfig,
+    tls: Option<ServerTls>,
 ) -> Result<()> {
-    let (frame, stream) = read_one_frame(stream).await?;
+    let mut first = [0u8; 1];
+    let n = stream.peek(&mut first).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let looks_like_tls = first[0] == 0x16;
+
+    let maybe_tls = if let Some(tls) = tls {
+        if looks_like_tls {
+            MaybeTls::Tls(Box::new(tls.accept(stream).await?))
+        } else {
+            MaybeTls::Plain(stream)
+        }
+    } else {
+        MaybeTls::Plain(stream)
+    };
+    let is_tls = matches!(&maybe_tls, MaybeTls::Tls(_));
+
+    let (frame, stream) = match maybe_tls {
+        MaybeTls::Plain(s) => {
+            let (f, s) = read_one_frame(s).await?;
+            (f, Box::new(s) as BoxedStream)
+        }
+        MaybeTls::Tls(s) => {
+            let (f, s) = read_one_frame(s).await?;
+            (f, Box::new(*s) as BoxedStream)
+        }
+    };
+
     match frame.msg_type {
         MSG_LOGIN => {
+            if config.server.tls_enable && !is_tls {
+                tracing::warn!("plaintext login rejected: tls_enable=true");
+                return Ok(());
+            }
+            if !config.server.tls_enable && is_tls {
+                tracing::warn!("TLS login rejected: tls_enable=false");
+                return Ok(());
+            }
             control::handle_control_login(
                 frame,
                 stream,
@@ -148,12 +209,24 @@ async fn handle_connection(
             )
             .await
         }
-        MSG_START_WORK_CONN => work::handle_work_connection(frame, stream, state).await,
+        MSG_START_WORK_CONN => {
+            if config.server.work_conn_tls && !is_tls {
+                tracing::warn!("plaintext work connection rejected: work_conn_tls=true");
+                return Ok(());
+            }
+            work::handle_work_connection(frame, stream, state).await
+        }
         other => {
             tracing::warn!("unexpected first frame msg_type={other:#x}, closing");
             Ok(())
         }
     }
+}
+
+/// 服务端 accept 后可能是明文 TCP 或 TLS 流。
+enum MaybeTls {
+    Plain(TcpStream),
+    Tls(Box<ServerTlsStream<TcpStream>>),
 }
 
 /// 监听 OS 终止信号（Ctrl+C / SIGTERM），触发统一的退出令牌。

@@ -1,5 +1,6 @@
 //! 通用工具模块。
 pub mod platform;
+pub mod stream;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

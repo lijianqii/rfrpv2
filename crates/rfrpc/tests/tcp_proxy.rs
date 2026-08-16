@@ -70,6 +70,7 @@ async fn start_client(server_addr: SocketAddr, proxies: Vec<ClientProxy>) -> Joi
             token: "".into(),
             tls_enable: false,
             tls_server_name: None,
+            tls_ca: None,
             work_conn_tls: false,
             run_id_file: None,
         },

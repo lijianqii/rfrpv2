@@ -181,10 +181,15 @@ impl ServerConfig {
                 self.server.bind_port
             )));
         }
-        if self.server.tls_enable
+        if self.server.token.is_empty() {
+            return Err(config("server token must not be empty"));
+        }
+        if (self.server.tls_enable || self.server.work_conn_tls)
             && (self.server.tls_cert.is_none() || self.server.tls_key.is_none())
         {
-            return Err(config("tls_enable=true requires both tls_cert and tls_key"));
+            return Err(config(
+                "tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key",
+            ));
         }
         // allow_ports 格式必须可解析。
         let _ = self.proxy.parse_allow_ports()?;
@@ -268,11 +273,19 @@ mod tests {
 
     #[test]
     fn server_validate_basic() {
-        let cfg = ServerConfig::default();
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
 
         let cfg = ServerConfig {
             server: ServerSection {
+                token: "x".into(),
                 tls_enable: true,
                 tls_cert: None,
                 tls_key: None,
@@ -315,6 +328,7 @@ mod tests {
             bind_addr = "127.0.0.1"
             bind_port = 7000
             token = "secret"
+            work_conn_tls = false
 
             [dashboard]
             addr = "0.0.0.0:7500"

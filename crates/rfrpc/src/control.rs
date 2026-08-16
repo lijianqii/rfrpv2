@@ -75,9 +75,8 @@ where
                             }
                             Message::ReqWorkConn(r) => {
                                 let st = state.clone();
-                                let cfg = config.clone();
                                 tokio::spawn(async move {
-                                    let _ = workconn::handle_work_conn(r, st, cfg).await;
+                                    let _ = workconn::handle_work_conn(r, st).await;
                                 });
                             }
                             Message::Heartbeat(h) => {
@@ -143,6 +142,8 @@ mod tests {
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls: None,
+            work_conn_tls: Mutex::new(false),
         });
         let (otx, orx) = oneshot::channel();
         state.resps.lock().unwrap().insert(name.into(), otx);
@@ -156,6 +157,8 @@ mod tests {
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls: None,
+            work_conn_tls: Mutex::new(false),
         })
     }
 
@@ -314,6 +317,8 @@ mod tests {
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls: None,
+            work_conn_tls: Mutex::new(false),
         });
         let (lotx, lorx) = oneshot::channel();
         state.login_tx.lock().unwrap().replace(lotx);

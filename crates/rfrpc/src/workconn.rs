@@ -6,21 +6,17 @@
 use std::sync::Arc;
 
 use futures::SinkExt;
-use rfrp_common::config::ClientConfig;
-use rfrp_common::error::Result;
+use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::FrameCodec;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::stream::BoxedStream;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::bridge;
 use crate::client::ClientState;
 
-pub async fn handle_work_conn(
-    req: ReqWorkConn,
-    state: Arc<ClientState>,
-    _config: ClientConfig,
-) -> Result<()> {
+pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Result<()> {
     let proxy = state.proxies.iter().find(|p| p.name == req.proxy_name);
     let proxy = match proxy {
         Some(p) => p,
@@ -30,8 +26,17 @@ pub async fn handle_work_conn(
         }
     };
 
-    // 工作连接到服务端（M1 不加密）。
+    // 工作连接到服务端；根据 LoginResp 下发的偏好决定是否 TLS（DESIGN §6.5）。
     let work = TcpStream::connect(state.server_addr).await?;
+    let use_tls = *state.work_conn_tls.lock().unwrap();
+    let work: BoxedStream = if use_tls {
+        let tls = state.tls.as_ref().ok_or_else(|| {
+            Error::Other("work_conn_tls enabled but client TLS not initialized".into())
+        })?;
+        Box::new(tls.connect(work).await?)
+    } else {
+        Box::new(work)
+    };
     let mut framed = Framed::new(work, FrameCodec);
     framed
         .send(
@@ -42,7 +47,7 @@ pub async fn handle_work_conn(
             .to_frame()?,
         )
         .await?;
-    // 首帧之后为透传字节，取回原始 TcpStream。
+    // 首帧之后为透传字节，取回原始流（明文或 TLS）。
     let work_stream = framed.into_inner();
 
     // 回连本地服务。
@@ -79,14 +84,14 @@ mod tests {
             proxies: vec![],
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls: None,
+            work_conn_tls: Mutex::new(false),
         });
         let req = ReqWorkConn {
             proxy_name: "nope".into(),
             work_id: 1,
         };
-        assert!(handle_work_conn(req, state, ClientConfig::default())
-            .await
-            .is_ok());
+        assert!(handle_work_conn(req, state).await.is_ok());
     }
 
     #[tokio::test]
@@ -108,13 +113,13 @@ mod tests {
             }],
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls: None,
+            work_conn_tls: Mutex::new(false),
         });
         let req = ReqWorkConn {
             proxy_name: "web".into(),
             work_id: 1,
         };
-        assert!(handle_work_conn(req, state, ClientConfig::default())
-            .await
-            .is_ok());
+        assert!(handle_work_conn(req, state).await.is_ok());
     }
 }

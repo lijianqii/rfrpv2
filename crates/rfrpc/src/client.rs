@@ -10,9 +10,11 @@ use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
     MAX_RUN_ID_LEN, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
+use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::platform::default_run_id_path;
+use rfrp_common::util::stream::BoxedStream;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
@@ -30,6 +32,10 @@ pub struct ClientState {
     pub resps: Mutex<HashMap<String, oneshot::Sender<NewProxyResp>>>,
     /// Login 结果一次性回传通道（连接时 await，用于区分致命/可恢复失败）。
     pub login_tx: Mutex<Option<oneshot::Sender<LoginResp>>>,
+    /// 客户端 TLS 配置（控制链路和工作连接共用；仅任一 TLS 开启时存在）。
+    pub tls: Option<ClientTls>,
+    /// 工作连接实际是否使用 TLS（由服务端 LoginResp 偏好覆盖，DESIGN §6.5）。
+    pub work_conn_tls: Mutex<bool>,
 }
 
 /// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
@@ -118,6 +124,11 @@ impl Client {
         shutdown: &CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
+        let tls = if self.config.client.tls_enable || self.config.client.work_conn_tls {
+            Some(ClientTls::new(&self.config.client)?)
+        } else {
+            None
+        };
         let stream = match TcpStream::connect(server_addr).await {
             Ok(s) => s,
             Err(e) => {
@@ -127,12 +138,22 @@ impl Client {
         };
         tracing::info!(server = %server_addr, "connected to server");
 
+        // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
+        let stream: BoxedStream = if self.config.client.tls_enable {
+            let tls = tls.as_ref().expect("tls built above");
+            Box::new(tls.connect(stream).await?)
+        } else {
+            Box::new(stream)
+        };
+
         let state = Arc::new(ClientState {
             server_addr,
             run_id: run_id.to_string(),
             proxies: self.config.proxies.clone(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
+            tls,
+            work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
         let (login_otx, login_orx) = oneshot::channel();
@@ -149,13 +170,19 @@ impl Client {
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
         match tokio::time::timeout(Duration::from_secs(10), login_orx).await {
             Ok(Ok(resp)) => {
+                if resp.ok {
+                    *state.work_conn_tls.lock().unwrap() = resp
+                        .work_conn_tls
+                        .unwrap_or(self.config.client.work_conn_tls);
+                }
                 if !resp.ok {
-                    let reason = resp
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "login rejected".into());
+                    let reason = resp.error.clone().unwrap_or_else(|| "auth failed".into());
                     let lower = reason.to_lowercase();
-                    if lower.contains("version mismatch") || lower.contains("auth failed") {
+                    // 服务端对鉴权失败不回显 error（DESIGN §10.2）；此时按致命错误处理，不重连。
+                    if resp.error.is_none()
+                        || lower.contains("version mismatch")
+                        || lower.contains("auth failed")
+                    {
                         tracing::error!(error = %reason, "login fatal; not reconnecting");
                         let _ = ctrl.await;
                         return Ok(ConnectOutcome::Fatal(reason));
@@ -210,9 +237,8 @@ impl Client {
                     work_id: WORK_ID_POOL_RESERVED,
                 };
                 let st = state.clone();
-                let cfg = self.config.clone();
                 tokio::spawn(async move {
-                    let _ = crate::workconn::handle_work_conn(req, st, cfg).await;
+                    let _ = crate::workconn::handle_work_conn(req, st).await;
                 });
             }
         }

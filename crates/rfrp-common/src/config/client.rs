@@ -28,6 +28,9 @@ pub struct ClientSection {
     pub tls_enable: bool,
     #[serde(default)]
     pub tls_server_name: Option<String>,
+    /// 可选 CA 证书路径；用于自签证书场景。缺省时使用系统/webpki 内置根证书。
+    #[serde(default)]
+    pub tls_ca: Option<String>,
     #[serde(default = "default_true")]
     pub work_conn_tls: bool,
     #[serde(default)]
@@ -151,7 +154,10 @@ impl ClientConfig {
         if self.client.server_port == 0 {
             return Err(config("server_port must be > 0"));
         }
-        if self.client.tls_enable
+        if self.client.token.is_empty() {
+            return Err(config("client token must not be empty"));
+        }
+        if (self.client.tls_enable || self.client.work_conn_tls)
             && self
                 .client
                 .tls_server_name
@@ -159,7 +165,9 @@ impl ClientConfig {
                 .map(|s| s.is_empty())
                 .unwrap_or(true)
         {
-            return Err(config("tls_server_name required when tls_enable=true"));
+            return Err(config(
+                "tls_server_name required when tls_enable or work_conn_tls is true",
+            ));
         }
 
         let mut names = std::collections::HashSet::new();
@@ -306,6 +314,8 @@ mod tests {
             [client]
             server_addr = "s.example.com"
             server_port = 7000
+            token = "secret"
+            work_conn_tls = false
 
             [[proxy]]
             name = "ssh"

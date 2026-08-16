@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use rfrp_common::auth::verify_token;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::PROTOCOL_VERSION;
 use rfrp_common::error::Result;
@@ -19,7 +20,6 @@ use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::now_ms;
 use tokio::io::split;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -39,7 +39,8 @@ pub struct Session {
     /// 断开 / 重连通知（§8.3）：清理旧会话或正常断开时唤醒控制循环退出。
     pub stop: Arc<Notify>,
     /// 预热工作连接池（proxy_name -> 空闲服务端侧工作流），按 §8.2 命中用户连接。
-    pub pools: Mutex<HashMap<String, Vec<TcpStream>>>,
+    /// 使用类型擦除以同时支持明文与 TLS 工作连接。
+    pub pools: Mutex<HashMap<String, Vec<rfrp_common::util::stream::BoxedStream>>>,
 }
 
 /// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
@@ -55,8 +56,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let login = Message::from_frame(&login_frame)?;
-    let (run_id, version) = match login {
-        Message::Login(l) => (l.run_id, l.version),
+    let (run_id, version, token) = match login {
+        Message::Login(l) => (l.run_id, l.version, l.token),
         _ => {
             return Err(rfrp_common::Error::Protocol(
                 "first frame must be Login".into(),
@@ -80,7 +81,23 @@ where
             .await;
         return Ok(());
     }
-    // M1/M2：token 校验跳过（见 DESIGN §12）。run_id 仅用于日志关联。
+    // M3：token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
+    if !verify_token(&config.server.token, &token) {
+        tracing::warn!(run_id = %run_id, "login rejected: token mismatch");
+        let mut w = FramedWrite::new(stream, FrameCodec);
+        let _ = w
+            .send(
+                Message::LoginResp(LoginResp {
+                    ok: false,
+                    error: None,
+                    session_id: None,
+                    work_conn_tls: None,
+                })
+                .to_frame()?,
+            )
+            .await;
+        return Ok(());
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<Message>(64);
@@ -125,12 +142,12 @@ where
         }
     });
 
-    // 登录响应（M1：work_conn_tls=false，无 TLS）。
+    // 登录响应：下发服务端 work_conn_tls 偏好（DESIGN §6.5）。
     tx.send(Message::LoginResp(LoginResp {
         ok: true,
         error: None,
         session_id: Some(session_id.clone()),
-        work_conn_tls: Some(false),
+        work_conn_tls: Some(config.server.work_conn_tls),
     }))
     .await
     .ok();

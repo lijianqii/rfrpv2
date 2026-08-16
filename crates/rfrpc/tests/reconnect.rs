@@ -127,6 +127,7 @@ async fn start_client(
             token: "".into(),
             tls_enable: false,
             tls_server_name: None,
+            tls_ca: None,
             work_conn_tls: false,
             run_id_file: Some(run_id_file.to_string_lossy().to_string()),
         },

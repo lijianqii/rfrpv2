@@ -7,6 +7,7 @@ server_port = 7000
 token = "shared-secret"
 tls_enable = false
 tls_server_name = "your.server.com"
+# tls_ca = "./ca.pem"            # 可选；自签证书场景指定 CA/服务端证书，缺省使用系统/webpki 根证书
 work_conn_tls = false              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
 

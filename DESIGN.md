@@ -779,6 +779,7 @@ server_port = 7000
 token = "shared-secret"
 tls_enable = true
 tls_server_name = "your.server.com"
+tls_ca = "./ca.pem"               # 可选；自签证书场景指定 CA/服务端证书，缺省使用系统/webpki 根证书
 work_conn_tls = true              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
 
@@ -867,8 +868,8 @@ CLI 参数 > 配置文件 > 默认值。
 
 ## 11. 功能特性清单（首版验收）
 
-- [ ] `rfrp server` 监听控制端口，接受多客户端登录
-- [ ] Token 鉴权 + TLS 控制链路
+- [x] `rfrp server` 监听控制端口，接受多客户端登录
+- [x] Token 鉴权 + TLS 控制链路
 - [ ] TCP 代理：外部端口 → 本地 TCP 服务
 - [ ] UDP 代理：外部 UDP 端口 → 本地 UDP 服务
 - [ ] HTTP 代理：基于 Host 的 vhost 路由
@@ -877,7 +878,7 @@ CLI 参数 > 配置文件 > 默认值。
 - [ ] 重连后 Proxy 恢复（run_id 复用，端口冲突按 6.6 处理）
 - [ ] 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充流程 work_id=0 语义，pool_size=0 纯按需模式），降低首包延迟
 - [x] 优雅退出（信号触发资源回收，在途连接 30s 超时强制关闭，无端口泄漏）
-- [ ] 工作连接 TLS（可配置，服务端优先）
+- [x] 工作连接 TLS（可配置，服务端优先）
 - [ ] Dashboard：客户端/代理列表、连接数、流量统计
 - [ ] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
 - [ ] 配置文件 + CLI 参数双入口：CLI 参数覆盖配置同名字段，`-c` 与字段参数可组合（见 7.3、9.3）
@@ -1127,7 +1128,7 @@ C:\rfrp\
 | **M0** | 地基：workspace + rfrp-common + rfrp-bin 占位 | ✅ **已完成**（2026-08-14） |
 | **M1** | TCP 跑通：rfrps/rfrpc 控制+监听+桥接 | ✅ **已完成**（2026-08-14） |
 | M2 | 健壮性：心跳/重连/run_id/优雅退出/连接池 | ✅ 完成 |
-| M3 | 安全：TLS 控制链路 + 工作连接 TLS + token 鉴权 | ⬜ 未开始 |
+| M3 | 安全：TLS 控制链路 + 工作连接 TLS + token 鉴权 | ✅ **已完成** |
 | M4 | UDP / HTTP / HTTPS（vhost） | ⬜ 未开始 |
 | M5 | Dashboard 与可观测（指标/结构化日志） | ⬜ 未开始 |
 | M6 | 打磨与发布（交叉编译三产物/打包/文档） | ⬜ 未开始 |
@@ -1371,5 +1372,22 @@ M2 主功能完成后，针对收尾阶段做了一轮代码质量与测试稳�
 - **信号处理更稳健**：Unix 下同时显式注册 SIGINT/SIGTERM（不再依赖 `tokio::signal::ctrl_c()` 在 `select!` 内才创建 future），并输出 `OS signal handler installed` 日志；`rfrp-bin/tests/chaos.rs` 改为等待该日志后再发信号，消除固定 sleep 导致的偶发失败。
 - **消除重复实现**：客户端 run_id 默认路径改用 `rfrp_common::util::platform::default_run_id_path`，删除本地重复实现。
 - **新增测试**：`resolve_run_id_path` 对 `None`/空串/自定义路径的行为；`wait_for_reconnect` 在 shutdown 取消后立即返回；真实子进程 SIGTERM/SIGINT 混沌测试在并行/高负载下更稳定。
+
+当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。
+
+---
+
+### 17.15 M3 完成（安全：TLS + token 鉴权）
+
+M3 主功能已完成，交付内容如下：
+
+- **TLS 控制链路**：`rfrp-common::crypto` 新增 `ServerTls` / `ClientTls` 封装；服务端按 `tls_enable` 决定控制连接是否 TLS，客户端在 `tls_enable=true` 时先 TLS 握手再发送 Login。
+- **工作连接 TLS**：服务端在 `LoginResp` 下发 `work_conn_tls` 偏好；客户端根据该偏好覆盖自身运行期配置，按需对工作连接做 TLS/明文（DESIGN §6.5 决策表）。
+- **同一 `bind_port` 混合 TLS/明文识别**：服务端 peek 首字节（TLS 握手记录 `0x16` vs rfrp 帧版本 `0x01`），再决定是否 TLS 握手；控制/工作连接按各自开关校验。
+- **Token 鉴权**：服务端登录时使用 `auth::verify_token` 常量时间比对；鉴权失败不回显原因，直接返回 `LoginResp{ok=false, error=None}` 并关闭连接；客户端将 `ok=false + error=None` 视为致命鉴权失败，不重连。
+- **配置校验**：`tls_enable=true` 或 `work_conn_tls=true` 时服务端必须配置证书/私钥；客户端任一 TLS 开启时必须配置 `tls_server_name`；token 非空。
+- **新增配置字段**：客户端增加可选 `tls_ca`，用于自签证书/指定 CA 场景；缺省使用 webpki 内置根证书。
+- **测试**：新增 `crates/rfrpc/tests/tls_auth.rs`，覆盖 TLS 控制+工作全链路、错误 token 致命退出、服务端偏好导致的工作连接降级。
+- **测试证书**：新增 `crates/rfrpc/tests/certs/` 下自签测试证书（仅用于测试）。
 
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。
