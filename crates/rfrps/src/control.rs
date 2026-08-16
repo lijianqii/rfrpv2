@@ -20,7 +20,7 @@ use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::now_ms;
 use rfrp_common::util::stream::BoxedStream;
-use tokio::io::split;
+use tokio::io::{split, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -125,18 +125,33 @@ where
     let mut reader = FramedRead::new(read_half, FrameCodec);
     let mut writer = FramedWrite::new(write_half, FrameCodec);
 
-    // 写任务：消费出站控制消息。
+    // 写任务：消费出站控制消息；服务端退出或会话被替换时尽量发送 TLS close_notify。
+    let shutdown_writer = state.shutdown.clone();
+    let stop_writer = session.stop.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg.to_frame() {
-                Ok(frame) => {
-                    if let Err(e) = writer.send(frame).await {
-                        tracing::warn!("control write error: {e}");
-                        break;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    match msg.to_frame() {
+                        Ok(frame) => {
+                            if let Err(e) = writer.send(frame).await {
+                                tracing::warn!("control write error: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("control encode error: {e}");
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("control encode error: {e}");
+                _ = shutdown_writer.cancelled() => {
+                    let _ = writer.get_mut().shutdown().await;
+                    break;
+                }
+                _ = stop_writer.notified() => {
+                    let _ = writer.get_mut().shutdown().await;
                     break;
                 }
             }

@@ -11,7 +11,7 @@ use rfrp_common::constants::PROTOCOL_VERSION;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
-use tokio::io::split;
+use tokio::io::{split, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -32,19 +32,29 @@ where
     let mut reader = FramedRead::new(read_half, FrameCodec);
     let mut writer = FramedWrite::new(write_half, FrameCodec);
 
-    // 写任务：消费出站控制消息。
+    // 写任务：消费出站控制消息；收到退出信号时尽量发送 TLS close_notify。
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+    let shutdown_writer = shutdown.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            match msg.to_frame() {
-                Ok(frame) => {
-                    if let Err(e) = writer.send(frame).await {
-                        tracing::warn!("control write error: {e}");
-                        break;
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    match msg.to_frame() {
+                        Ok(frame) => {
+                            if let Err(e) = writer.send(frame).await {
+                                tracing::warn!("control write error: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("control encode error: {e}");
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("control encode error: {e}");
+                _ = shutdown_writer.cancelled() => {
+                    let _ = writer.get_mut().shutdown().await;
                     break;
                 }
             }

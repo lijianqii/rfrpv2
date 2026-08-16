@@ -2,12 +2,12 @@
 # 部署时请修改 token、证书路径、allow_ports 等。
 
 [server]
-bind_addr = "127.0.0.1"           # 控制监听地址，默认 0.0.0.0
+bind_addr = "0.0.0.0"           # 控制监听地址，默认 0.0.0.0
 bind_port = 7000                # 控制端口，默认 7000
 token = "shared-secret"          # 鉴权 token
 tls_enable = true                 # 控制链路 TLS 总开关（M3 起默认开启）
-tls_cert = "./cert.pem"          # 控制链路证书（已随示例生成）
-tls_key  = "./key.pem"
+tls_cert = "/home/harrison/workspace/rust/rfrpv2/examples/cert.pem"          # 控制链路证书（已随示例生成）
+tls_key  = "/home/harrison/workspace/rust/rfrpv2/examples/key.pem"
 work_conn_tls = true              # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
 
 # TLS 分层说明（避免混淆）：
@@ -30,8 +30,8 @@ allow_ports = "6000-6100,7001-7010"
 vhost_http_port  = 80
 vhost_https_port = 443
 # HTTPS vhost 证书（可与控制链路证书不同）
-vhost_tls_cert = "./vhost-cert.pem"
-vhost_tls_key  = "./vhost-key.pem"
+vhost_tls_cert = "/home/harrison/workspace/rust/rfrpv2/examples/vhost-cert.pem"
+vhost_tls_key  = "/home/harrison/workspace/rust/rfrpv2/examples/vhost-key.pem"
 
 [log]                            # 整段可选，默认 level=info、output=stderr、format=text
 level = "info"                   # trace|debug|info|warn|error
