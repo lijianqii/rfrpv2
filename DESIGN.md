@@ -1352,9 +1352,24 @@ M2 = 阶段 2：心跳保活、断线重连（指数退避）、run_id 复用、
 - 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 新增测试：服务端/客户端各 `control_loop_exits_on_shutdown` 单测（令牌取消 -> 控制循环退出）；集成 `rfrps/tests/graceful_shutdown.rs::server_run_returns_after_shutdown_token`（run 在令牌取消后返回）；`rfrpc/tests/graceful_shutdown.rs`（client_run_exits_on_shutdown_without_infinite_reconnect + server_and_client_exit_cleanly_on_shutdown 端到端二者均干净退出）。
 
-- 令牌可被外部/测试触发：`Server::shutdown_token()` / `Client::shutdown_token()` 返回共享令牌 clone；集成测试直接 `cancel()` 模拟信号，无需真实 OS 信号。
 - 心跳误杀修复（§8.3 / 回归）：纠正 rfrps 心跳超时判定——此前用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在周期 tick 检查，因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 在首个周期即误判超时，误杀控制连接并触发重连去重、回收代理监听与在途工作连接（表现为代理端口 `Connection refused`、在途 SSH 会话 `closed by remote host`）。改为 ping/pong：`timeout(HEARTBEAT_TIMEOUT, pong.notified())` 等待**本次**心跳回应，未收到才断开。新增回归单测 `heartbeat_keeps_alive_when_client_responds`（客户端正常回应时控制任务保持存活）。
 - 代理 accept 循环阻塞修复（§8.2 / 回归）：命中预热池时，原实现在 `proxy_accept_loop` 内 `bridge::bridge(user, work).await` 内联等待，会阻塞整个 accept 循环——首个命中池（pool_size>0 时必然先命中）的长连接会话期间，后续用户连接无法被 accept（TCP 留在 backlog 无应用层处理），表现为“仅首个连接可用、其余全部卡住”。改为将桥接 `tokio::spawn` 到独立任务，accept 循环立即 `continue` 继续接客，并立即回 `ReqWorkConn{work_id=0}` 补充预热连接。新增回归单测 `tcp_proxy_concurrent_same_proxy_keep_open`（多用户长连接并发可达）。
 - 混沌/集成测试补齐（§14.4）：新增 `rfrpc/tests/reconnect.rs`（客户端断线 → 重连 → 复用 run_id 恢复单/多代理，端到端覆盖 M2b）、`rfrpc/tests/chaos.rs`（优雅退出宽限期内保留在途用户连接；客户端控制断开后服务端回收代理监听）、`rfrp-bin/tests/chaos.rs`（真实 `rfrp` 子进程收 SIGTERM/SIGINT 经信号 watcher 优雅退出、`SIGKILL` 强杀终止、客户端 SIGTERM 停止重连，关闭“真实信号路径”缺口）。
 
 **测试计数**：全量 97 -> 105（集成/混沌 +8：reconnect 2 + chaos(rfrpc) 2 + chaos(rfrp-bin) 4）。
+
+---
+
+### 17.14 M2 收尾（代码质量与测试覆盖优化）
+
+M2 主功能完成后，针对收尾阶段做了一轮代码质量与测试稳定性优化：
+
+- **修复 `run_id_file = ""` 未按默认路径处理**（DESIGN §9.2）：此前 `Some("")` 会变成空路径，导致无法持久化 run_id 并产生 `failed to persist run_id` 警告；现统一经 `resolve_run_id_path` 解析，空字符串/空白串等价于 `None`，使用 `~/.rfrp/run_id`。
+- **客户端退避 sleep 可被退出信号中断**：`Client::run` 中的重连等待改为 `wait_for_reconnect`（`tokio::select!` + `CancellationToken`），避免 SIGTERM 落在 30s 退避期间时客户端延迟退出。
+- **退避计时器在健康连接断开后重置**：`ConnectOutcome::Reconnect` 增加 `connected` 标记；若本次已成功建立过控制会话，则重连退避从 `RECONNECT_BACKOFF_INITIAL` 重新开始，避免用历史大退避惩罚健康长连接后的正常断线。
+- **日志默认输出显式改为 stderr**：`logging.rs` 显式 `with_writer(std::io::stderr)`，与 DESIGN §9.1 一致，避免 tracing-subscriber 默认写到 stdout。
+- **信号处理更稳健**：Unix 下同时显式注册 SIGINT/SIGTERM（不再依赖 `tokio::signal::ctrl_c()` 在 `select!` 内才创建 future），并输出 `OS signal handler installed` 日志；`rfrp-bin/tests/chaos.rs` 改为等待该日志后再发信号，消除固定 sleep 导致的偶发失败。
+- **消除重复实现**：客户端 run_id 默认路径改用 `rfrp_common::util::platform::default_run_id_path`，删除本地重复实现。
+- **新增测试**：`resolve_run_id_path` 对 `None`/空串/自定义路径的行为；`wait_for_reconnect` 在 shutdown 取消后立即返回；真实子进程 SIGTERM/SIGINT 混沌测试在并行/高负载下更稳定。
+
+当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。

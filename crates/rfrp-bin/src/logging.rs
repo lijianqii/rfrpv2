@@ -14,6 +14,10 @@ pub fn init_logging(level_override: Option<&str>) {
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
-    // M0 仅 stderr 文本输出；file/json 输出在 M5 完善。
-    let _ = fmt().with_env_filter(filter).try_init();
+    // M2 及之前仅 stderr 文本输出；file/json 输出在 M5 完善。
+    // 显式指定 stderr，避免 tracing-subscriber 默认写到 stdout 与 DESIGN §9.1 不符。
+    let _ = fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
 }

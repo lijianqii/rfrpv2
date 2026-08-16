@@ -166,6 +166,15 @@ fn spawn_signal_watcher(shutdown: CancellationToken) -> tokio::task::JoinHandle<
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("install SIGINT handler failed: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown.cancel();
+                    return;
+                }
+            };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -175,13 +184,15 @@ fn spawn_signal_watcher(shutdown: CancellationToken) -> tokio::task::JoinHandle<
                     return;
                 }
             };
+            tracing::info!("OS signal handler installed (SIGINT/SIGTERM)");
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
             }
         }
         #[cfg(not(unix))]
         {
+            tracing::info!("OS signal handler installed (Ctrl-C)");
             let _ = tokio::signal::ctrl_c().await;
         }
         shutdown.cancel();

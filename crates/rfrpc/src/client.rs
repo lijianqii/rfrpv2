@@ -12,6 +12,7 @@ use rfrp_common::constants::{
 };
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::platform::default_run_id_path;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
@@ -33,8 +34,9 @@ pub struct ClientState {
 
 /// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
 enum ConnectOutcome {
-    /// 正常断开或瞬断，应重连。
-    Reconnect,
+    /// 需要重连。`connected` 表示本次是否已经成功建立过控制会话；
+    /// 若为 `true`，退避计时器应重置，避免用历史大退避惩罚一次健康的长连接。
+    Reconnect { connected: bool },
     /// 致命错误（鉴权 / 版本不兼容），不应重连。
     Fatal(String),
 }
@@ -77,15 +79,20 @@ impl Client {
                     sig.abort();
                     return Err(anyhow::anyhow!("login fatal: {reason}"));
                 }
-                Ok(ConnectOutcome::Reconnect) => {
+                Ok(ConnectOutcome::Reconnect { connected }) => {
                     if shutdown.is_cancelled() {
                         break;
+                    }
+                    if connected {
+                        backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
                     }
                     tracing::info!(
                         backoff_secs = backoff.as_secs(),
                         "control closed, reconnecting"
                     );
-                    tokio::time::sleep(backoff).await;
+                    if !wait_for_reconnect(backoff, &shutdown).await {
+                        break;
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
                 }
                 Err(e) => {
@@ -93,7 +100,9 @@ impl Client {
                         break;
                     }
                     tracing::warn!(error = %e, "transient error, reconnecting");
-                    tokio::time::sleep(backoff).await;
+                    if !wait_for_reconnect(backoff, &shutdown).await {
+                        break;
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(RECONNECT_BACKOFF_MAX));
                 }
             }
@@ -153,16 +162,16 @@ impl Client {
                     }
                     tracing::warn!(error = ?resp.error, "login rejected; reconnecting");
                     let _ = ctrl.await;
-                    return Ok(ConnectOutcome::Reconnect);
+                    return Ok(ConnectOutcome::Reconnect { connected: false });
                 }
             }
             Ok(Err(_)) => {
                 tracing::warn!("login response channel dropped; reconnecting");
-                return Ok(ConnectOutcome::Reconnect);
+                return Ok(ConnectOutcome::Reconnect { connected: false });
             }
             Err(_) => {
                 tracing::warn!("login response timeout; reconnecting");
-                return Ok(ConnectOutcome::Reconnect);
+                return Ok(ConnectOutcome::Reconnect { connected: false });
             }
         }
 
@@ -209,15 +218,12 @@ impl Client {
         }
 
         let _ = ctrl.await;
-        Ok(ConnectOutcome::Reconnect)
+        Ok(ConnectOutcome::Reconnect { connected: true })
     }
 
     /// 生成或复用 run_id 并持久化（§6.6 / §8.3 重连身份）。
     fn load_or_create_run_id(&self) -> String {
-        let path = match &self.config.client.run_id_file {
-            Some(p) => PathBuf::from(p),
-            None => default_run_id_path(),
-        };
+        let path = resolve_run_id_path(&self.config.client.run_id_file);
         if let Ok(s) = std::fs::read_to_string(&path) {
             let s = s.trim().to_string();
             if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN {
@@ -239,12 +245,22 @@ impl Client {
     }
 }
 
-/// 默认 run_id 持久化路径：`$HOME/.rfrp/run_id`（Windows 用 `$USERPROFILE`）。
-fn default_run_id_path() -> PathBuf {
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join(".rfrp").join("run_id")
+/// 解析配置中的 `run_id_file`。
+///
+/// 按 DESIGN §9.2，空字符串表示使用默认路径 `~/.rfrp/run_id`。
+fn resolve_run_id_path(run_id_file: &Option<String>) -> PathBuf {
+    match run_id_file {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => default_run_id_path(),
+    }
+}
+
+/// 等待下次重连；若期间收到退出信号则返回 `false`。
+async fn wait_for_reconnect(backoff: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => true,
+        _ = shutdown.cancelled() => false,
+    }
 }
 
 /// Unix 下将 run_id 文件权限设为 0600；其他平台静默跳过（§6.6）。
@@ -265,6 +281,15 @@ fn spawn_client_signal_watcher(shutdown: CancellationToken) -> tokio::task::Join
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("install SIGINT handler failed: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown.cancel();
+                    return;
+                }
+            };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -274,13 +299,15 @@ fn spawn_client_signal_watcher(shutdown: CancellationToken) -> tokio::task::Join
                     return;
                 }
             };
+            tracing::info!("OS signal handler installed (SIGINT/SIGTERM)");
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
             }
         }
         #[cfg(not(unix))]
         {
+            tracing::info!("OS signal handler installed (Ctrl-C)");
             let _ = tokio::signal::ctrl_c().await;
         }
         shutdown.cancel();
@@ -369,5 +396,47 @@ mod tests {
         assert_ne!(rid, long);
         assert!(rid.len() <= MAX_RUN_ID_LEN);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_id_empty_string_uses_default_path() {
+        // DESIGN §9.2：`run_id_file = ""` 应等价于未配置，使用默认 `~/.rfrp/run_id`。
+        let none = resolve_run_id_path(&None);
+        let empty = resolve_run_id_path(&Some(String::new()));
+        let blank = resolve_run_id_path(&Some("   ".to_string()));
+        assert_eq!(empty, none);
+        assert_eq!(blank, none);
+
+        let custom = resolve_run_id_path(&Some("/tmp/custom-run-id".to_string()));
+        assert_eq!(custom, PathBuf::from("/tmp/custom-run-id"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_delay_is_interruptible_by_shutdown() {
+        // 若退出信号落在退避 sleep 期间，wait_for_reconnect 应立即返回 false，
+        // 避免客户端在 30s 退避期间无法及时退出（§8.3 / §14.4）。
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            wait_for_reconnect(
+                Duration::from_secs(RECONNECT_BACKOFF_MAX),
+                &shutdown_for_task,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+
+        let ok = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("wait_for_reconnect must return promptly after shutdown")
+            .unwrap();
+        assert!(!ok, "shutdown during backoff should abort the wait");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "should not wait out the full backoff after shutdown"
+        );
     }
 }

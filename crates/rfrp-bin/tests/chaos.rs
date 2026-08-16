@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rfrp");
@@ -94,9 +95,24 @@ async fn sigterm_triggers_graceful_exit() {
     let cfg = write_server_config(port);
     let mut child = Command::new(BIN)
         .args(["server", "-c", cfg.to_str().unwrap(), "--grace-secs", "1"])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn rfrp server");
-    wait_listening(port).await;
+    let stderr = child.stderr.take().expect("server stderr must be piped");
+    let mut lines = BufReader::new(stderr).lines();
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(line) = lines.next_line().await.expect("read server stderr") {
+            if line.contains("OS signal handler installed") {
+                return;
+            }
+        }
+        panic!("server stderr closed before signal handler was installed");
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "server should install signal handler before SIGTERM"
+    );
 
     send_signal(child.id().expect("pid"), libc::SIGTERM);
 
@@ -116,9 +132,24 @@ async fn sigint_triggers_graceful_exit() {
     let cfg = write_server_config(port);
     let mut child = Command::new(BIN)
         .args(["server", "-c", cfg.to_str().unwrap(), "--grace-secs", "1"])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn rfrp server");
-    wait_listening(port).await;
+    let stderr = child.stderr.take().expect("server stderr must be piped");
+    let mut lines = BufReader::new(stderr).lines();
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(line) = lines.next_line().await.expect("read server stderr") {
+            if line.contains("OS signal handler installed") {
+                return;
+            }
+        }
+        panic!("server stderr closed before signal handler was installed");
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "server should install signal handler before SIGINT"
+    );
 
     send_signal(child.id().expect("pid"), libc::SIGINT);
 
@@ -157,13 +188,29 @@ async fn sigkill_forces_termination() {
 #[tokio::test]
 async fn client_sigterm_stops_reconnect_loop() {
     // 客户端连不上服务端时持续重连；收到 SIGTERM 应停止重连并干净退出。
+    // 不用固定 sleep，而是等待子进程日志出现“OS signal handler installed”，
+    // 确保 tokio 信号处理器已经注册后再发 SIGTERM，避免高负载下信号未就绪导致误杀。
     let cfg = write_client_config(9); // 端口 9 无人监听
     let mut child = Command::new(BIN)
         .args(["client", "-c", cfg.to_str().unwrap()])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn rfrp client");
-    // 给一点时间进入重连循环。
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stderr = child.stderr.take().expect("client stderr must be piped");
+    let mut lines = BufReader::new(stderr).lines();
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(line) = lines.next_line().await.expect("read client stderr") {
+            if line.contains("OS signal handler installed") {
+                return;
+            }
+        }
+        panic!("client stderr closed before signal handler was installed");
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "client should install signal handler before SIGTERM"
+    );
 
     send_signal(child.id().expect("pid"), libc::SIGTERM);
 
