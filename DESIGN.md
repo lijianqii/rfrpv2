@@ -880,8 +880,8 @@ CLI 参数 > 配置文件 > 默认值。
 - [x] 优雅退出（信号触发资源回收，在途连接 30s 超时强制关闭，无端口泄漏）
 - [x] 工作连接 TLS（可配置，服务端优先）
 - [ ] Dashboard：客户端/代理列表、连接数、流量统计
-- [ ] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
-- [ ] 配置文件 + CLI 参数双入口：CLI 参数覆盖配置同名字段，`-c` 与字段参数可组合（见 7.3、9.3）
+- [x] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
+- [x] 配置文件 + CLI 参数双入口：CLI 参数覆盖配置同名字段，`-c` 与字段参数可组合（见 7.3、9.3）
 - [ ] 单二进制 CLI：`rfrp server` / `rfrp client`
 - [ ] Linux (gnu/musl) + Windows (MinGW-w64) 双平台构建与产物
 
@@ -1391,3 +1391,72 @@ M3 主功能已完成，交付内容如下：
 - **测试证书**：新增 `crates/rfrpc/tests/certs/` 下自签测试证书（仅用于测试）。
 
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。
+
+---
+
+### 17.16 代码质量与工程化优化
+
+在 M3 完成后，针对代码质量、运行健壮性和工程化做了一轮集中优化：
+
+- **公共工具抽取**：
+  - `rfrp-common::util::bridge`：统一双向桥接实现，删除 `rfrpc` / `rfrps` 重复的 `bridge.rs`。
+  - `rfrp-common::util::signal`：统一 SIGINT/SIGTERM/Ctrl-C 信号处理。
+- **配置校验增强**：
+  - 证书/私钥文件存在性校验（服务端 `tls_cert` / `tls_key` / vhost 证书，客户端 `tls_ca`）。
+  - `custom_domains` 增加域名格式校验。
+  - `run_id` 读取后校验 UUID 格式，非法则重新生成。
+  - 配置文件中的相对证书路径会基于配置文件所在目录解析。
+- **超时与健壮性**：
+  - 新增 `LOGIN_TIMEOUT` / `NEW_PROXY_TIMEOUT` / `FIRST_FRAME_TIMEOUT` 常量。
+  - 客户端工作连接建立、TLS 握手、本地回连增加 `WORK_CONN_TIMEOUT_RFRPC` 超时。
+  - 服务端首帧读取增加超时，避免空闲连接悬挂。
+  - 服务端优雅退出改为跟踪 accept 派生的连接任务：无在途任务时立即返回，有在途任务时等待或超时。
+- **工作连接池修复**：
+  - 客户端先回连本地服务成功后再发送 `StartWorkConn`，避免本地失败时服务端把“死连接”放入预热池。
+  - 代理监听改为跟随服务端 `bind_addr`，不再写死 `0.0.0.0`。
+- **CLI / 日志**：
+  - 实现 CLI 参数覆盖配置（`--bind` / `--server` / `--token` / `--tls-enable` / `--work-conn-tls`）。
+  - 日志支持 stderr 与 `file:/path` 输出，支持 text/json 格式。
+- **构建依赖**：
+  - `tokio-rustls` 收敛为 ring-only，移除 `aws-lc-rs` 依赖，减少编译与体积。
+- **工程化**：
+  - 新增 `README.md`、`rust-toolchain.toml`。
+  - 集成测试工具抽到 `rfrpc/tests/common`，并用就绪轮询替代部分固定 sleep。
+  - CI workflow 按用户要求暂不添加；M6 发布内容后续处理。
+
+---
+
+### 17.17 TLS 优雅关闭
+
+修复客户端 `Ctrl-C` 时服务端打印 `peer closed connection without sending TLS close_notify` 的问题：
+
+- 客户端/服务端控制连接写任务在退出前调用底层 TLS `shutdown()`，发送 `close_notify`。
+- 触发点包括：
+  - 客户端收到退出信号
+  - 服务端收到退出信号
+  - 会话被同 `run_id` 新连接替换
+- 正常优雅退出不再产生 `unexpected EOF` 日志；异常强杀仍会由 rustls 报错，属预期行为。
+
+---
+
+### 17.18 关键路径日志增强
+
+按排障优先级补充以下日志：
+
+- **工作连接生命周期**：
+  - 客户端：`work connection established` / `work bridge finished`
+  - 服务端：`work connection established` / `work bridge finished`
+- **控制连接关闭原因**：
+  - 客户端：server close / peer EOF / outbound channel closed
+  - 服务端：client close / peer EOF
+- **心跳收发**：`heartbeat sent` / `heartbeat received` / `heartbeat response received`
+- **配置与 TLS 加载**：配置加载完成、相对路径解析、TLS 配置加载
+- **重连次数**：`connection attempt` / `control closed, reconnecting` / `transient error, reconnecting`
+
+日志级别策略：
+- `error`：致命错误
+- `warn`：可恢复异常
+- `info`：生命周期事件
+- `debug`：高频排障信息（心跳、桥接、连接分类）
+
+当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、关键测试均通过。
