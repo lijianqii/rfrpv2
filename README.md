@@ -53,3 +53,7 @@ crates/
 ```bash
 cargo test --all
 ```
+
+## License
+
+[MIT](LICENSE)
