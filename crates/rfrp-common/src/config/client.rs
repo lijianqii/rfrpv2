@@ -5,6 +5,7 @@ use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
 use serde::Deserialize;
 use std::net::IpAddr;
+use std::path::Path;
 
 fn default_local_ip() -> String {
     "127.0.0.1".to_string()
@@ -14,6 +15,20 @@ fn default_true() -> bool {
 }
 fn default_pool_size() -> u32 {
     1
+}
+
+/// 简单的域名格式校验（字母/数字/连字符，标签长度限制）。
+fn is_valid_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 /// `[client]` 连接服务端与鉴权。
@@ -105,7 +120,7 @@ impl ClientProxy {
                     )));
                 }
                 for dom in d {
-                    if dom.is_empty() || dom.len() > MAX_DOMAIN_LEN {
+                    if !is_valid_domain(dom) {
                         return Err(config(format!("invalid domain: {dom}")));
                     }
                 }
@@ -168,6 +183,13 @@ impl ClientConfig {
             return Err(config(
                 "tls_server_name required when tls_enable or work_conn_tls is true",
             ));
+        }
+        if let Some(ca) = &self.client.tls_ca {
+            if !Path::new(ca).is_file() {
+                return Err(config(format!(
+                    "tls_ca file not found or not readable: {ca}"
+                )));
+            }
         }
 
         let mut names = std::collections::HashSet::new();
@@ -290,6 +312,36 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tls_ca_file_missing_rejected() {
+        let cfg = ClientConfig {
+            client: ClientSection {
+                server_addr: "s.example.com".into(),
+                server_port: 7000,
+                token: "x".into(),
+                work_conn_tls: false,
+                tls_ca: Some("./definitely-missing-ca.pem".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_domain_rejected() {
+        let p = ClientProxy {
+            name: "web".into(),
+            r#type: ProxyType::Http,
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            remote_port: None,
+            custom_domains: Some(vec!["-bad.example.com".into()]),
+            pool_size: 1,
+        };
+        assert!(p.validate().is_err());
     }
 
     #[test]

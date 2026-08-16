@@ -8,12 +8,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
-    MAX_RUN_ID_LEN, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
+    LOGIN_TIMEOUT, MAX_RUN_ID_LEN, NEW_PROXY_TIMEOUT, RECONNECT_BACKOFF_INITIAL,
+    RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::platform::default_run_id_path;
+use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -73,7 +75,7 @@ impl Client {
         let run_id = self.load_or_create_run_id();
         let shutdown = self.shutdown.clone();
         // 监听 OS 终止信号，触发统一退出令牌。
-        let sig = spawn_client_signal_watcher(shutdown.clone());
+        let sig = spawn_signal_watcher(shutdown.clone());
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
         loop {
             if shutdown.is_cancelled() {
@@ -173,7 +175,7 @@ impl Client {
         ));
 
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
-        match tokio::time::timeout(Duration::from_secs(10), login_orx).await {
+        match tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT), login_orx).await {
             Ok(Ok(resp)) => {
                 if resp.ok {
                     *state.work_conn_tls.lock().unwrap() = resp
@@ -216,7 +218,7 @@ impl Client {
             if tx.send(Message::NewProxy(np)).await.is_err() {
                 anyhow::bail!("control connection closed during proxy registration");
             }
-            match tokio::time::timeout(Duration::from_secs(10), orx).await {
+            match tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx).await {
                 Ok(Ok(resp)) => {
                     if resp.ok {
                         tracing::info!(proxy = %p.name, "proxy registered");
@@ -257,7 +259,7 @@ impl Client {
         let path = resolve_run_id_path(&self.config.client.run_id_file);
         if let Ok(s) = std::fs::read_to_string(&path) {
             let s = s.trim().to_string();
-            if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN {
+            if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN && uuid::Uuid::parse_str(&s).is_ok() {
                 return s;
             }
         }
@@ -302,48 +304,6 @@ fn set_file_mode_0600(path: &std::path::Path) {
 }
 #[cfg(not(unix))]
 fn set_file_mode_0600(_path: &std::path::Path) {}
-
-/// 监听 OS 终止信号（Ctrl+C / SIGTERM），触发统一的退出令牌。
-fn spawn_client_signal_watcher(shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if shutdown.is_cancelled() {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("install SIGINT handler failed: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown.cancel();
-                    return;
-                }
-            };
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("install SIGTERM handler failed: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown.cancel();
-                    return;
-                }
-            };
-            tracing::info!("OS signal handler installed (SIGINT/SIGTERM)");
-            tokio::select! {
-                _ = sigint.recv() => {}
-                _ = sigterm.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tracing::info!("OS signal handler installed (Ctrl-C)");
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        shutdown.cancel();
-    })
-}
 
 /// 由配置条目构造 `NewProxy` 控制消息。
 pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {
@@ -426,6 +386,18 @@ mod tests {
         let rid = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
         assert_ne!(rid, long);
         assert!(rid.len() <= MAX_RUN_ID_LEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_id_non_uuid_regenerates() {
+        // 文件内容不是合法 UUID 时，应重新生成（DESIGN §6.2.1）。
+        let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("run_id");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "not-a-uuid").unwrap();
+        let rid = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+        assert!(uuid::Uuid::parse_str(&rid).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

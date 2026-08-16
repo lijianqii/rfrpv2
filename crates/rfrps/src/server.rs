@@ -7,13 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
-use rfrp_common::constants::{GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+use rfrp_common::constants::{
+    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+};
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
+use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::control;
@@ -114,6 +119,7 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let shutdown = self.state.shutdown.clone();
         let tls = self.tls.clone();
+        let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
         loop {
@@ -125,7 +131,7 @@ impl Server {
                             let config = self.config.clone();
                             let tls = tls.clone();
                             tracing::debug!(%peer, "accepted connection");
-                            tokio::spawn(async move {
+                            tasks.spawn(async move {
                                 if let Err(e) = handle_connection(stream, state, config, tls).await {
                                     tracing::warn!("connection error: {e}");
                                 }
@@ -143,8 +149,20 @@ impl Server {
                 }
             }
         }
-        // 优雅期：让在途连接自然结束；超时后返回，由取消令牌与进程退出强制清理。
-        tokio::time::sleep(self.grace).await;
+        // 优雅期：等待在途连接任务自然结束；无在途任务时立即返回，超时后强制返回。
+        let deadline = Instant::now() + self.grace;
+        while !tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if tokio::time::timeout(remaining, tasks.join_next())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
         sig.abort();
         Ok(())
     }
@@ -180,12 +198,18 @@ async fn handle_connection(
 
     let (frame, stream) = match maybe_tls {
         MaybeTls::Plain(s) => {
-            let (f, s) = read_one_frame(s).await?;
+            let (f, s) =
+                tokio::time::timeout(Duration::from_secs(FIRST_FRAME_TIMEOUT), read_one_frame(s))
+                    .await
+                    .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
             (f, Box::new(s) as BoxedStream)
         }
         MaybeTls::Tls(s) => {
-            let (f, s) = read_one_frame(s).await?;
-            (f, Box::new(*s) as BoxedStream)
+            let (f, s) =
+                tokio::time::timeout(Duration::from_secs(FIRST_FRAME_TIMEOUT), read_one_frame(*s))
+                    .await
+                    .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
+            (f, Box::new(s) as BoxedStream)
         }
     };
 
@@ -227,47 +251,4 @@ async fn handle_connection(
 enum MaybeTls {
     Plain(TcpStream),
     Tls(Box<ServerTlsStream<TcpStream>>),
-}
-
-/// 监听 OS 终止信号（Ctrl+C / SIGTERM），触发统一的退出令牌。
-/// 仅当令牌未被取消时才等待信号，避免重复触发。
-fn spawn_signal_watcher(shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if shutdown.is_cancelled() {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("install SIGINT handler failed: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown.cancel();
-                    return;
-                }
-            };
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("install SIGTERM handler failed: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown.cancel();
-                    return;
-                }
-            };
-            tracing::info!("OS signal handler installed (SIGINT/SIGTERM)");
-            tokio::select! {
-                _ = sigint.recv() => {}
-                _ = sigterm.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tracing::info!("OS signal handler installed (Ctrl-C)");
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        shutdown.cancel();
-    })
 }

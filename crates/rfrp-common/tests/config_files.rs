@@ -26,7 +26,14 @@ fn client_example_parses_with_proxies() {
     assert_eq!(cfg.client.token, "shared-secret");
     assert!(cfg.client.tls_enable);
     assert_eq!(cfg.client.tls_server_name, Some("localhost".to_string()));
-    assert_eq!(cfg.client.tls_ca, Some("./ca.pem".to_string()));
+    assert!(
+        cfg.client
+            .tls_ca
+            .as_deref()
+            .map(|p| p.ends_with("examples/ca.pem"))
+            .unwrap_or(false),
+        "tls_ca should resolve relative to the example config dir"
+    );
     assert!(cfg.client.work_conn_tls);
 
     // 关键回归：[[proxy]] 必须被解析为 proxies，不能静默丢弃。
@@ -53,11 +60,22 @@ fn server_example_parses_with_sections() {
     assert_eq!(cfg.proxy.allow_ports, "6000-6100,7001-7010");
     assert_eq!(cfg.proxy.vhost_http_port, Some(80));
     assert_eq!(cfg.proxy.vhost_https_port, Some(443));
-    assert_eq!(
-        cfg.proxy.vhost_tls_cert,
-        Some("./vhost-cert.pem".to_string())
+    assert!(
+        cfg.proxy
+            .vhost_tls_cert
+            .as_deref()
+            .map(|p| p.ends_with("examples/vhost-cert.pem"))
+            .unwrap_or(false),
+        "vhost_tls_cert should resolve relative to the example config dir"
     );
-    assert_eq!(cfg.proxy.vhost_tls_key, Some("./vhost-key.pem".to_string()));
+    assert!(
+        cfg.proxy
+            .vhost_tls_key
+            .as_deref()
+            .map(|p| p.ends_with("examples/vhost-key.pem"))
+            .unwrap_or(false),
+        "vhost_tls_key should resolve relative to the example config dir"
+    );
 
     // [dashboard] 段（整段可选，此处存在）
     let dash = cfg.dashboard.expect("dashboard section present");

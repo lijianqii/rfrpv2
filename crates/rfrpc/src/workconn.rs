@@ -6,14 +6,16 @@
 use std::sync::Arc;
 
 use futures::SinkExt;
+use rfrp_common::constants::WORK_CONN_TIMEOUT_RFRPC;
 use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::FrameCodec;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::stream::BoxedStream;
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
 
-use crate::bridge;
 use crate::client::ClientState;
 
 pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Result<()> {
@@ -27,17 +29,51 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     };
 
     // 工作连接到服务端；根据 LoginResp 下发的偏好决定是否 TLS（DESIGN §6.5）。
-    let work = TcpStream::connect(state.server_addr).await?;
+    // 本地总截止时间由 WORK_CONN_TIMEOUT_RFRPC 控制，避免悬挂。
+    let work = timeout(
+        Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
+        TcpStream::connect(state.server_addr),
+    )
+    .await
+    .map_err(|_| Error::Other("work connection connect timeout".into()))??;
     let use_tls = *state.work_conn_tls.lock().unwrap();
     let work: BoxedStream = if use_tls {
         let tls = state.tls.as_ref().ok_or_else(|| {
             Error::Other("work_conn_tls enabled but client TLS not initialized".into())
         })?;
-        Box::new(tls.connect(work).await?)
+        let tls_work = timeout(
+            Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
+            tls.connect(work),
+        )
+        .await
+        .map_err(|_| Error::Other("work connection TLS handshake timeout".into()))??;
+        Box::new(tls_work)
     } else {
         Box::new(work)
     };
     let mut framed = Framed::new(work, FrameCodec);
+
+    // 先回连本地服务，成功后再发 StartWorkConn。这样本地连接失败时不会让服务端把
+    // 这条工作连接放入预热池，避免池中出现“死连接”（DESIGN §8.2 预建场景）。
+    let local_addr = format!("{}:{}", proxy.local_ip, proxy.local_port);
+    let local = match timeout(
+        Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
+        TcpStream::connect(&local_addr),
+    )
+    .await
+    {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            // 本地连不上：直接关闭工作连接（TCP FIN），服务端不会入池。
+            tracing::warn!(proxy = %req.proxy_name, error = %e, "local connect failed; closing work connection");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::warn!(proxy = %req.proxy_name, "local connect timeout; closing work connection");
+            return Ok(());
+        }
+    };
+
     framed
         .send(
             Message::StartWorkConn(StartWorkConn {
@@ -50,19 +86,8 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     // 首帧之后为透传字节，取回原始流（明文或 TLS）。
     let work_stream = framed.into_inner();
 
-    // 回连本地服务。
-    let local_addr = format!("{}:{}", proxy.local_ip, proxy.local_port);
-    let local = match TcpStream::connect(&local_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            // 本地连不上：关闭工作连接（TCP FIN），服务端用户侧同步断开（见 DESIGN §8.2/§8.5）。
-            tracing::warn!(proxy = %req.proxy_name, error = %e, "local connect failed; closing work connection");
-            return Ok(());
-        }
-    };
-
     tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, "bridging work <-> local");
-    let _ = bridge::bridge(work_stream, local).await;
+    let _ = bridge(work_stream, local).await;
     Ok(())
 }
 

@@ -9,9 +9,9 @@ use rfrp_common::constants::WORK_ID_POOL_RESERVED;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::Frame;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::bridge::bridge;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::bridge;
 use crate::server::ServerState;
 
 pub async fn handle_work_connection<S>(
@@ -70,7 +70,7 @@ where
 
     tracing::debug!(%proxy_name, work_id, "bridging work connection");
     // stream 已越过 StartWorkConn 首帧，剩余为透传字节；直接桥接。
-    let _ = bridge::bridge(user, stream).await;
+    let _ = bridge(user, stream).await;
     Ok(())
 }
 

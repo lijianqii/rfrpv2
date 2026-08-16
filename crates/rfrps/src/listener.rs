@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use rfrp_common::config::ServerConfig;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::bridge::bridge;
 use rfrp_common::{constants::*, error::Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 
-use crate::bridge;
 use crate::control::Session;
 use crate::server::{PendingWork, ServerState};
 
@@ -42,7 +42,7 @@ pub async fn register_proxy(
         }
     }
 
-    let listener = TcpListener::bind(("0.0.0.0", remote_port)).await;
+    let listener = TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await;
     let listener = match listener {
         Ok(l) => l,
         // 端口占用/权限问题不回显具体原因（见 DESIGN §8.5）。
@@ -86,7 +86,7 @@ async fn proxy_accept_loop(
                         if let Some(work) = pooled {
                             tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
                             tokio::spawn(async move {
-                                let _ = bridge::bridge(user, work).await;
+                                let _ = bridge(user, work).await;
                             });
                             // 立即请求补充预热连接（无需等待本次用户断开）。
                             if session

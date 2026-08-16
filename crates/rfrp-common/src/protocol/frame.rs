@@ -128,7 +128,7 @@ where
 mod tests {
     use super::*;
     use crate::protocol::msg::{Login, Message, MSG_LOGIN};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{duplex, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     fn roundtrip(f: Frame) -> Frame {
@@ -210,6 +210,23 @@ mod tests {
     #[test]
     fn msg_type_const_valid() {
         assert_eq!(MSG_LOGIN, 0x01);
+    }
+
+    #[tokio::test]
+    async fn read_one_frame_works_with_duplex() {
+        // 验证 read_one_frame 已泛型化，可用于 TcpStream 以外的异步流。
+        let (mut a, b) = duplex(64);
+        let msg = Message::Login(Login {
+            run_id: "duplex".into(),
+            token: "".into(),
+            version: PROTOCOL_VERSION,
+        });
+        let frame = msg.to_frame().unwrap();
+        let mut buf = BytesMut::new();
+        FrameCodec.encode(frame.clone(), &mut buf).unwrap();
+        a.write_all(&buf).await.unwrap();
+        let (got, _rest) = read_one_frame(b).await.unwrap();
+        assert_eq!(got, frame);
     }
 
     #[tokio::test]

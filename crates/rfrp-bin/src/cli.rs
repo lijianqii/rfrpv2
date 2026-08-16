@@ -68,14 +68,3 @@ pub enum Commands {
         work_conn_tls: Option<bool>,
     },
 }
-
-impl Cli {
-    /// 返回日志覆盖项 `(level, output, format)`。
-    pub fn log_overrides(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
-        (
-            self.log_level.as_deref(),
-            self.log_output.as_deref(),
-            self.log_format.as_deref(),
-        )
-    }
-}

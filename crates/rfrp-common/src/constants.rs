@@ -16,6 +16,13 @@ pub const WORK_ID_POOL_RESERVED: u64 = 0;
 
 // ---- 超时（秒）----
 
+/// 控制面登录响应等待超时。
+pub const LOGIN_TIMEOUT: u64 = 10;
+/// 单个 NewProxy 注册响应等待超时。
+pub const NEW_PROXY_TIMEOUT: u64 = 10;
+/// 服务端等待连接首帧（Login/StartWorkConn）的超时。
+pub const FIRST_FRAME_TIMEOUT: u64 = 10;
+
 /// 心跳发送间隔。
 pub const HEARTBEAT_INTERVAL: u64 = 30;
 /// 心跳响应等待超时，超时判定对端已死。

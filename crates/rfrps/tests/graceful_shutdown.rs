@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rfrp_common::config::{LogSection, ProxySection, ServerConfig, ServerSection};
 use rfrps::server::Server;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 fn server_config() -> ServerConfig {
     ServerConfig {
@@ -43,5 +43,27 @@ async fn server_run_returns_after_shutdown_token() {
     assert!(
         res.is_ok(),
         "server.run() must return after shutdown signal"
+    );
+}
+
+#[tokio::test]
+async fn server_run_returns_immediately_when_idle() {
+    // 没有在途连接时，即使 grace 很长也不应等待完整宽限期。
+    let server = Server::new(server_config())
+        .await
+        .unwrap()
+        .with_grace(Duration::from_secs(30));
+    let sd = server.shutdown_token();
+    let task = tokio::spawn(async move { server.run().await.unwrap() });
+
+    let start = Instant::now();
+    sd.cancel();
+
+    let _ = timeout(Duration::from_secs(1), task)
+        .await
+        .expect("idle server.run() must return quickly after shutdown");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "idle shutdown should not wait the full grace period"
     );
 }

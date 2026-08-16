@@ -3,6 +3,7 @@
 use crate::error::{config, Result};
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::Path;
 
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
@@ -158,6 +159,16 @@ pub struct LogSection {
     pub format: Option<String>,
 }
 
+/// 校验证书/私钥文件存在且可读。
+fn ensure_file_exists(path: &str, field: &str) -> Result<()> {
+    if !Path::new(path).is_file() {
+        return Err(config(format!(
+            "{field} file not found or not readable: {path}"
+        )));
+    }
+    Ok(())
+}
+
 /// 完整服务端配置。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -184,12 +195,15 @@ impl ServerConfig {
         if self.server.token.is_empty() {
             return Err(config("server token must not be empty"));
         }
-        if (self.server.tls_enable || self.server.work_conn_tls)
-            && (self.server.tls_cert.is_none() || self.server.tls_key.is_none())
-        {
-            return Err(config(
-                "tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key",
-            ));
+        if self.server.tls_enable || self.server.work_conn_tls {
+            let cert = self.server.tls_cert.as_deref().ok_or_else(|| {
+                config("tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key")
+            })?;
+            let key = self.server.tls_key.as_deref().ok_or_else(|| {
+                config("tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key")
+            })?;
+            ensure_file_exists(cert, "tls_cert")?;
+            ensure_file_exists(key, "tls_key")?;
         }
         // allow_ports 格式必须可解析。
         let _ = self.proxy.parse_allow_ports()?;
@@ -201,12 +215,15 @@ impl ServerConfig {
                 return Err(config(format!("vhost port {p} out of range 1-65535")));
             }
         }
-        if self.proxy.vhost_https_port.is_some()
-            && (self.proxy.vhost_tls_cert.is_none() || self.proxy.vhost_tls_key.is_none())
-        {
-            return Err(config(
-                "vhost_https_port requires vhost_tls_cert and vhost_tls_key",
-            ));
+        if self.proxy.vhost_https_port.is_some() {
+            let cert = self.proxy.vhost_tls_cert.as_deref().ok_or_else(|| {
+                config("vhost_https_port requires vhost_tls_cert and vhost_tls_key")
+            })?;
+            let key = self.proxy.vhost_tls_key.as_deref().ok_or_else(|| {
+                config("vhost_https_port requires vhost_tls_cert and vhost_tls_key")
+            })?;
+            ensure_file_exists(cert, "vhost_tls_cert")?;
+            ensure_file_exists(key, "vhost_tls_key")?;
         }
         if let Some(d) = &self.dashboard {
             d.validate()?;
@@ -311,6 +328,22 @@ mod tests {
     }
 
     #[test]
+    fn tls_cert_file_missing_rejected() {
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                tls_enable: true,
+                tls_cert: Some("./definitely-missing-cert.pem".into()),
+                tls_key: Some("./definitely-missing-key.pem".into()),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn empty_token_rejected() {
         let cfg = ServerConfig {
             server: ServerSection {
@@ -366,8 +399,8 @@ mod tests {
             allow_ports = "6000-6100,7001-7010"
             vhost_http_port = 80
             vhost_https_port = 443
-            vhost_tls_cert = "./vhost-cert.pem"
-            vhost_tls_key = "./vhost-key.pem"
+            vhost_tls_cert = "../../examples/vhost-cert.pem"
+            vhost_tls_key = "../../examples/vhost-key.pem"
 
             [log]
             level = "info"

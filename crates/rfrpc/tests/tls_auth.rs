@@ -1,30 +1,23 @@
 //! M3 安全相关集成测试：TLS 控制/工作连接、token 鉴权、服务端偏好覆盖。
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use common::*;
 use rfrp_common::config::{
     ClientConfig, ClientLogSection, ClientProxy, ClientSection, LogSection, ProxySection,
     ServerConfig, ServerSection,
 };
 use rfrp_common::protocol::msg::ProxyType;
-use rfrpc::client::Client;
-use rfrps::server::Server;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
 
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_writer(std::io::stderr)
         .try_init();
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
 }
 
 fn cert_paths() -> (PathBuf, PathBuf) {
@@ -89,49 +82,6 @@ fn tcp_proxy(name: &str, local_port: u16, remote_port: u16) -> ClientProxy {
     }
 }
 
-async fn spawn_echo() -> u16 {
-    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = echo.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        while let Ok((s, _)) = echo.accept().await {
-            tokio::spawn(async move {
-                let (mut r, mut w) = tokio::io::split(s);
-                let _ = tokio::io::copy(&mut r, &mut w).await;
-            });
-        }
-    });
-    port
-}
-
-async fn start_server(cfg: ServerConfig) -> (JoinHandle<()>, SocketAddr) {
-    let server = Server::new(cfg).await.unwrap();
-    let addr = server.local_addr();
-    let task = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    (task, addr)
-}
-
-async fn start_client(cfg: ClientConfig) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let _ = Client::new(cfg).unwrap().run().await;
-    })
-}
-
-async fn wait_ready() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
-}
-
-async fn expect_echo(remote_port: u16, server_addr: SocketAddr, data: &[u8]) {
-    let mut user = TcpStream::connect((server_addr.ip(), remote_port))
-        .await
-        .expect("connect to server remote_port");
-    user.write_all(data).await.unwrap();
-    let mut buf = vec![0u8; data.len()];
-    user.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, data);
-}
-
 #[tokio::test]
 async fn tls_control_and_work_roundtrip() {
     init_logging();
@@ -146,7 +96,10 @@ async fn tls_control_and_work_roundtrip() {
         vec![tcp_proxy("ssh", echo_port, remote)],
     ))
     .await;
-    wait_ready().await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "TLS proxy should become ready"
+    );
 
     expect_echo(remote, addr, b"tls-hello").await;
 
@@ -163,7 +116,7 @@ async fn wrong_token_is_fatal() {
     let mut cfg = client_config(addr, false, false, "wrong", vec![]);
     cfg.client.run_id_file = Some(run_id_file.to_string_lossy().to_string());
 
-    let client = Client::new(cfg).unwrap();
+    let client = rfrpc::client::Client::new(cfg).unwrap();
     let res = tokio::time::timeout(Duration::from_secs(5), client.run()).await;
     assert!(
         res.is_ok(),
@@ -177,7 +130,6 @@ async fn wrong_token_is_fatal() {
 
 #[tokio::test]
 async fn tls_control_only_work_plaintext() {
-    // 控制链路 TLS，但服务端/客户端都允许工作连接明文：验证同一端口混合识别。
     init_logging();
     let echo_port = spawn_echo().await;
     let (srv, addr) = start_server(server_config(true, false, "secret")).await;
@@ -190,7 +142,10 @@ async fn tls_control_only_work_plaintext() {
         vec![tcp_proxy("ssh", echo_port, remote)],
     ))
     .await;
-    wait_ready().await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
 
     expect_echo(remote, addr, b"control-tls-work-plain").await;
 
@@ -200,7 +155,6 @@ async fn tls_control_only_work_plaintext() {
 
 #[tokio::test]
 async fn work_conn_tls_upgrades_when_server_prefers_tls() {
-    // 客户端配置 work_conn_tls=false，但服务端偏好 true；rfrpc 应升级为 TLS 工作连接。
     init_logging();
     let echo_port = spawn_echo().await;
     let (srv, addr) = start_server(server_config(false, true, "secret")).await;
@@ -213,7 +167,10 @@ async fn work_conn_tls_upgrades_when_server_prefers_tls() {
         vec![tcp_proxy("ssh", echo_port, remote)],
     ))
     .await;
-    wait_ready().await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready after work TLS upgrade"
+    );
 
     expect_echo(remote, addr, b"work-upgrade-ok").await;
 
@@ -224,7 +181,6 @@ async fn work_conn_tls_upgrades_when_server_prefers_tls() {
 #[tokio::test]
 async fn work_conn_tls_follows_server_preference() {
     init_logging();
-    // 客户端希望 work_conn_tls=true，但服务端偏好 false；rfrpc 应降级为明文工作连接。
     let echo_port = spawn_echo().await;
     let (srv, addr) = start_server(server_config(false, false, "secret")).await;
     let remote = free_port();
@@ -236,7 +192,10 @@ async fn work_conn_tls_follows_server_preference() {
         vec![tcp_proxy("ssh", echo_port, remote)],
     ))
     .await;
-    wait_ready().await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready after downgrade"
+    );
 
     expect_echo(remote, addr, b"downgrade-ok").await;
 

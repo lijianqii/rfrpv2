@@ -1,7 +1,7 @@
 //! `rfrp` 二进制入口。
 //!
-//! 解析 CLI、初始化日志，按子命令分派到 `rfrps::server::Server::run` 或
-//! `rfrpc::client::Client::run`（M1 起接入真实逻辑）。
+//! 解析 CLI、加载配置、应用 CLI 覆盖、初始化日志，按子命令分派到
+//! `rfrps::server::Server::run` 或 `rfrpc::client::Client::run`。
 
 mod cli;
 mod logging;
@@ -14,24 +14,62 @@ use cli::{Cli, Commands};
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    // CLI 全局日志参数覆盖（优先级高于配置/环境变量，见 DESIGN §9.3）。
-    let (lvl, _, _) = cli.log_overrides();
-    logging::init_logging(lvl);
+    let log_level = cli.log_level.clone();
+    let log_output = cli.log_output.clone();
+    let log_format = cli.log_format.clone();
 
     match cli.command {
         // ---- server ----
         Commands::Server {
-            config, grace_secs, ..
+            config,
+            bind,
+            token,
+            tls_enable,
+            work_conn_tls,
+            grace_secs,
         } => match config {
             Some(path) => {
-                let cfg = match rfrp_common::config::load_server_config(&path) {
+                let mut cfg = match rfrp_common::config::load_server_config(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!(?path, error = %e, "failed to load server config");
+                        eprintln!("failed to load server config {}: {e}", path.display());
                         return ExitCode::FAILURE;
                     }
                 };
+
+                // CLI 参数覆盖配置文件（DESIGN §9.3）。
+                if let Some(bind) = bind {
+                    match bind.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => {
+                            cfg.server.bind_addr = addr.ip().to_string();
+                            cfg.server.bind_port = addr.port();
+                        }
+                        Err(e) => {
+                            eprintln!("invalid --bind '{bind}': {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                if let Some(token) = token {
+                    cfg.server.token = token;
+                }
+                if let Some(v) = tls_enable {
+                    cfg.server.tls_enable = v;
+                }
+                if let Some(v) = work_conn_tls {
+                    cfg.server.work_conn_tls = v;
+                }
+                if let Err(e) = cfg.validate() {
+                    eprintln!("server config invalid after CLI overrides: {e}");
+                    return ExitCode::FAILURE;
+                }
+
+                logging::init_logging(
+                    log_level.as_deref().or(cfg.log.level.as_deref()),
+                    log_output.as_deref().or(cfg.log.output.as_deref()),
+                    log_format.as_deref().or(cfg.log.format.as_deref()),
+                );
+
                 let server = match rfrps::server::Server::new(cfg).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -60,15 +98,55 @@ async fn main() -> ExitCode {
         },
 
         // ---- client ----
-        Commands::Client { config, .. } => match config {
+        Commands::Client {
+            config,
+            server,
+            token,
+            tls_enable,
+            work_conn_tls,
+        } => match config {
             Some(path) => {
-                let cfg = match rfrp_common::config::load_client_config(&path) {
+                let mut cfg = match rfrp_common::config::load_client_config(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!(?path, error = %e, "failed to load client config");
+                        eprintln!("failed to load client config {}: {e}", path.display());
                         return ExitCode::FAILURE;
                     }
                 };
+
+                // CLI 参数覆盖配置文件（DESIGN §9.3）。
+                if let Some(server) = server {
+                    match server.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => {
+                            cfg.client.server_addr = addr.ip().to_string();
+                            cfg.client.server_port = addr.port();
+                        }
+                        Err(e) => {
+                            eprintln!("invalid --server '{server}': {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                if let Some(token) = token {
+                    cfg.client.token = token;
+                }
+                if let Some(v) = tls_enable {
+                    cfg.client.tls_enable = v;
+                }
+                if let Some(v) = work_conn_tls {
+                    cfg.client.work_conn_tls = v;
+                }
+                if let Err(e) = cfg.validate() {
+                    eprintln!("client config invalid after CLI overrides: {e}");
+                    return ExitCode::FAILURE;
+                }
+
+                logging::init_logging(
+                    log_level.as_deref().or(cfg.log.level.as_deref()),
+                    log_output.as_deref().or(cfg.log.output.as_deref()),
+                    log_format.as_deref().or(cfg.log.format.as_deref()),
+                );
+
                 let client = match rfrpc::client::Client::new(cfg) {
                     Ok(c) => c,
                     Err(e) => {
