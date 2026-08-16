@@ -5,10 +5,10 @@
 server_addr = "127.0.0.1"
 server_port = 7000
 token = "shared-secret"
-tls_enable = false
-tls_server_name = "your.server.com"
-# tls_ca = "./ca.pem"            # 可选；自签证书场景指定 CA/服务端证书，缺省使用系统/webpki 根证书
-work_conn_tls = false              # 工作连接是否走 TLS，默认 true
+tls_enable = true
+tls_server_name = "localhost"      # 与 examples/cert.pem 的 SAN 匹配
+tls_ca = "./ca.pem"               # 自签证书场景指定 CA/服务端证书，已随示例生成
+work_conn_tls = true              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
 
 [[proxy]]
@@ -19,14 +19,13 @@ local_port = 22
 remote_port = 6000
 pool_size = 1                     # 工作连接池大小，默认 1；0 表示禁用预热、纯按需建立
 
-[[proxy]]
-name = "web"
-type = "http"
-local_ip = "127.0.0.1"
-local_port = 8080
-custom_domains = ["dev.example.com"]
-# 当前版本（M2，仅 TCP）会拒绝此 http 代理，M4 才支持；
-# 若想 M2 跑通，可改为 type="tcp" 并指向一个本地在跑的服务。
+# M4 支持 HTTP/HTTPS 后，可取消注释使用 vhost 代理：
+# [[proxy]]
+# name = "web"
+# type = "http"
+# local_ip = "127.0.0.1"
+# local_port = 8080
+# custom_domains = ["dev.example.com"]
 
 [log]                            # 整段可选，默认 level=info、output=stderr、format=text
 level = "info"

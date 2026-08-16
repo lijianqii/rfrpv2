@@ -5,10 +5,10 @@
 bind_addr = "127.0.0.1"           # 控制监听地址，默认 0.0.0.0
 bind_port = 7000                # 控制端口，默认 7000
 token = "shared-secret"          # 鉴权 token
-tls_enable = false                # 控制链路 TLS 总开关（M1 测试期可关，生产必须开）
-tls_cert = "./cert.pem"          # 控制链路证书
+tls_enable = true                 # 控制链路 TLS 总开关（M3 起默认开启）
+tls_cert = "./cert.pem"          # 控制链路证书（已随示例生成）
 tls_key  = "./key.pem"
-work_conn_tls = false             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+work_conn_tls = true              # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps<->rfrpc 控制连接

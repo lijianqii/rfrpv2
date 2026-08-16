@@ -2,7 +2,7 @@
 //! 验证示例配置可被加载、控制连接建立、代理注册（TCP 成功 / 非 TCP 被拒）。
 //! 同时作为「启动后应该看到哪些日志」的活文档。
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rfrp_common::config::{load_client_config, load_server_config};
@@ -19,17 +19,23 @@ async fn example_configs_smoke() {
         .try_init();
 
     let base = env!("CARGO_MANIFEST_DIR");
-    let mut server_cfg = load_server_config(Path::new(&format!(
-        "{base}/../../examples/rfrp-server.toml"
-    )))
-    .expect("load example server config");
+    let example_dir = PathBuf::from(format!("{base}/../../examples"));
+    let mut server_cfg = load_server_config(&example_dir.join("rfrp-server.toml"))
+        .expect("load example server config");
     // 用 OS 分配端口，避免固定 7000 在 CI/本机被占用导致偶发失败。
     server_cfg.server.bind_port = 0;
-    let mut client_cfg = load_client_config(Path::new(&format!(
-        "{base}/../../examples/rfrp-client.toml"
-    )))
-    .expect("load example client config");
-    assert_eq!(client_cfg.proxies.len(), 2, "example must define 2 proxies");
+    // 示例配置里证书路径是相对 examples/ 的，测试进程 CWD 不一定是 examples/，
+    // 这里改成绝对路径以便直接加载。
+    server_cfg.server.tls_cert = Some(example_dir.join("cert.pem").display().to_string());
+    server_cfg.server.tls_key = Some(example_dir.join("key.pem").display().to_string());
+    server_cfg.proxy.vhost_tls_cert =
+        Some(example_dir.join("vhost-cert.pem").display().to_string());
+    server_cfg.proxy.vhost_tls_key = Some(example_dir.join("vhost-key.pem").display().to_string());
+
+    let mut client_cfg = load_client_config(&example_dir.join("rfrp-client.toml"))
+        .expect("load example client config");
+    client_cfg.client.tls_ca = Some(example_dir.join("ca.pem").display().to_string());
+    assert_eq!(client_cfg.proxies.len(), 1, "example must define 1 proxy");
 
     let server = Server::new(server_cfg).await.expect("server new");
     let server_addr = server.local_addr();

@@ -24,28 +24,18 @@ fn client_example_parses_with_proxies() {
     assert_eq!(cfg.client.server_addr, "127.0.0.1");
     assert_eq!(cfg.client.server_port, 7000);
     assert_eq!(cfg.client.token, "shared-secret");
-    assert!(!cfg.client.tls_enable);
-    assert_eq!(
-        cfg.client.tls_server_name,
-        Some("your.server.com".to_string())
-    );
-    assert!(!cfg.client.work_conn_tls);
+    assert!(cfg.client.tls_enable);
+    assert_eq!(cfg.client.tls_server_name, Some("localhost".to_string()));
+    assert_eq!(cfg.client.tls_ca, Some("./ca.pem".to_string()));
+    assert!(cfg.client.work_conn_tls);
 
     // 关键回归：[[proxy]] 必须被解析为 proxies，不能静默丢弃。
-    assert_eq!(cfg.proxies.len(), 2, "[[proxy]] entries must be parsed");
+    assert_eq!(cfg.proxies.len(), 1, "[[proxy]] entries must be parsed");
     assert_eq!(cfg.proxies[0].name, "ssh");
     assert_eq!(cfg.proxies[0].r#type, ProxyType::Tcp);
     assert_eq!(cfg.proxies[0].local_ip, "127.0.0.1");
     assert_eq!(cfg.proxies[0].local_port, 22);
     assert_eq!(cfg.proxies[0].remote_port, Some(6000));
-
-    assert_eq!(cfg.proxies[1].name, "web");
-    assert_eq!(cfg.proxies[1].r#type, ProxyType::Http);
-    assert_eq!(cfg.proxies[1].local_port, 8080);
-    assert_eq!(
-        cfg.proxies[1].custom_domains,
-        Some(vec!["dev.example.com".to_string()])
-    );
 }
 
 #[test]
@@ -56,6 +46,8 @@ fn server_example_parses_with_sections() {
     assert_eq!(cfg.server.bind_addr, "127.0.0.1");
     assert_eq!(cfg.server.bind_port, 7000);
     assert_eq!(cfg.server.token, "shared-secret");
+    assert!(cfg.server.tls_enable);
+    assert!(cfg.server.work_conn_tls);
 
     // [proxy] 段
     assert_eq!(cfg.proxy.allow_ports, "6000-6100,7001-7010");
