@@ -4,6 +4,7 @@
 //! 优先级：CLI 参数 > 配置文件 `[log]` > 默认值。
 
 use std::fs::File;
+use std::io::IsTerminal;
 use std::sync::Mutex;
 
 use tracing_subscriber::fmt;
@@ -26,15 +27,17 @@ pub fn init_logging(
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
     let is_json = format.eq_ignore_ascii_case("json");
 
-    let install = |writer: tracing_subscriber::fmt::writer::BoxMakeWriter| {
+    let install = |writer: tracing_subscriber::fmt::writer::BoxMakeWriter, ansi: bool| {
         if is_json {
             fmt()
                 .json()
+                .with_ansi(false)
                 .with_env_filter(filter.clone())
                 .with_writer(writer)
                 .try_init()
         } else {
             fmt()
+                .with_ansi(ansi)
                 .with_env_filter(filter.clone())
                 .with_writer(writer)
                 .try_init()
@@ -44,14 +47,31 @@ pub fn init_logging(
     if let Some(path) = output.strip_prefix("file:") {
         match File::options().create(true).append(true).open(path) {
             Ok(file) => {
-                let _ = install(BoxMakeWriter::new(Mutex::new(file)));
+                let _ = install(BoxMakeWriter::new(Mutex::new(file)), false);
             }
             Err(e) => {
                 eprintln!("failed to open log file {path}: {e}; falling back to stderr");
-                let _ = install(BoxMakeWriter::new(std::io::stderr));
+                let _ = install(BoxMakeWriter::new(std::io::stderr), ansi_enabled());
             }
         }
     } else {
-        let _ = install(BoxMakeWriter::new(std::io::stderr));
+        let _ = install(BoxMakeWriter::new(std::io::stderr), ansi_enabled());
     }
+}
+
+/// 判断 stderr 日志是否应启用 ANSI 颜色。
+///
+/// Windows 下 PowerShell/旧终端对 ANSI 支持不稳定，默认关闭；
+/// 非终端（管道/重定向/服务）也关闭；设置 `NO_COLOR` 时关闭。
+fn ansi_enabled() -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    if !std::io::stderr().is_terminal() {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    true
 }
