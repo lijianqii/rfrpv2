@@ -11,13 +11,6 @@ use std::process::ExitCode;
 use clap::Parser;
 use cli::{Cli, Commands};
 
-/// 解析 `ADDR:PORT` 形式的 CLI 参数。
-fn parse_addr(value: String, flag: &str) -> Result<std::net::SocketAddr, String> {
-    value
-        .parse()
-        .map_err(|e| format!("invalid {flag} '{value}': {e}"))
-}
-
 /// 按“CLI 参数 > 配置文件 > 默认值”合并日志设置并初始化。
 fn init_logging(
     log: &rfrp_common::config::LogSection,
@@ -58,26 +51,16 @@ async fn main() -> ExitCode {
                     }
                 };
 
-                // CLI 参数覆盖配置文件（DESIGN §9.3）。
-                if let Some(bind) = bind {
-                    let addr = match parse_addr(bind, "--bind") {
-                        Ok(a) => a,
-                        Err(e) => {
-                            eprintln!("{e}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
-                    cfg.server.bind_addr = addr.ip().to_string();
-                    cfg.server.bind_port = addr.port();
-                }
-                if let Some(token) = token {
-                    cfg.server.token = token;
-                }
-                if let Some(v) = tls_enable {
-                    cfg.server.tls_enable = v;
-                }
-                if let Some(v) = work_conn_tls {
-                    cfg.server.work_conn_tls = v;
+                // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrps。
+                if let Err(e) = rfrps::server::apply_cli_overrides(
+                    &mut cfg,
+                    bind,
+                    token,
+                    tls_enable,
+                    work_conn_tls,
+                ) {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
                 }
                 if let Err(e) = cfg.validate() {
                     eprintln!("server config invalid after CLI overrides: {e}");
@@ -135,26 +118,16 @@ async fn main() -> ExitCode {
                     }
                 };
 
-                // CLI 参数覆盖配置文件（DESIGN §9.3）。
-                if let Some(server) = server {
-                    let addr = match parse_addr(server, "--server") {
-                        Ok(a) => a,
-                        Err(e) => {
-                            eprintln!("{e}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
-                    cfg.client.server_addr = addr.ip().to_string();
-                    cfg.client.server_port = addr.port();
-                }
-                if let Some(token) = token {
-                    cfg.client.token = token;
-                }
-                if let Some(v) = tls_enable {
-                    cfg.client.tls_enable = v;
-                }
-                if let Some(v) = work_conn_tls {
-                    cfg.client.work_conn_tls = v;
+                // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrpc。
+                if let Err(e) = rfrpc::client::apply_cli_overrides(
+                    &mut cfg,
+                    server,
+                    token,
+                    tls_enable,
+                    work_conn_tls,
+                ) {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
                 }
                 if let Err(e) = cfg.validate() {
                     eprintln!("client config invalid after CLI overrides: {e}");
