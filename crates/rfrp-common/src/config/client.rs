@@ -1,5 +1,6 @@
 //! 客户端配置结构（DESIGN §9.2）。
 
+use crate::config::LogSection;
 use crate::constants::{MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, POOL_SIZE_WARN_THRESHOLD};
 use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
@@ -136,18 +137,6 @@ impl ClientProxy {
         }
         Ok(())
     }
-}
-
-/// `[log]` 日志设置（整段可选）。
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct LogSection {
-    #[serde(default)]
-    pub level: Option<String>,
-    #[serde(default)]
-    pub output: Option<String>,
-    #[serde(default)]
-    pub format: Option<String>,
 }
 
 /// 完整客户端配置。

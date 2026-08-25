@@ -11,6 +11,27 @@ use std::process::ExitCode;
 use clap::Parser;
 use cli::{Cli, Commands};
 
+/// 解析 `ADDR:PORT` 形式的 CLI 参数。
+fn parse_addr(value: String, flag: &str) -> Result<std::net::SocketAddr, String> {
+    value
+        .parse()
+        .map_err(|e| format!("invalid {flag} '{value}': {e}"))
+}
+
+/// 按“CLI 参数 > 配置文件 > 默认值”合并日志设置并初始化。
+fn init_logging(
+    log: &rfrp_common::config::LogSection,
+    level: Option<&str>,
+    output: Option<&str>,
+    format: Option<&str>,
+) {
+    logging::init_logging(
+        level.or(log.level.as_deref()),
+        output.or(log.output.as_deref()),
+        format.or(log.format.as_deref()),
+    );
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -39,16 +60,15 @@ async fn main() -> ExitCode {
 
                 // CLI 参数覆盖配置文件（DESIGN §9.3）。
                 if let Some(bind) = bind {
-                    match bind.parse::<std::net::SocketAddr>() {
-                        Ok(addr) => {
-                            cfg.server.bind_addr = addr.ip().to_string();
-                            cfg.server.bind_port = addr.port();
-                        }
+                    let addr = match parse_addr(bind, "--bind") {
+                        Ok(a) => a,
                         Err(e) => {
-                            eprintln!("invalid --bind '{bind}': {e}");
+                            eprintln!("{e}");
                             return ExitCode::FAILURE;
                         }
-                    }
+                    };
+                    cfg.server.bind_addr = addr.ip().to_string();
+                    cfg.server.bind_port = addr.port();
                 }
                 if let Some(token) = token {
                     cfg.server.token = token;
@@ -64,10 +84,11 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
 
-                logging::init_logging(
-                    log_level.as_deref().or(cfg.log.level.as_deref()),
-                    log_output.as_deref().or(cfg.log.output.as_deref()),
-                    log_format.as_deref().or(cfg.log.format.as_deref()),
+                init_logging(
+                    &cfg.log,
+                    log_level.as_deref(),
+                    log_output.as_deref(),
+                    log_format.as_deref(),
                 );
 
                 let server = match rfrps::server::Server::new(cfg).await {
@@ -116,16 +137,15 @@ async fn main() -> ExitCode {
 
                 // CLI 参数覆盖配置文件（DESIGN §9.3）。
                 if let Some(server) = server {
-                    match server.parse::<std::net::SocketAddr>() {
-                        Ok(addr) => {
-                            cfg.client.server_addr = addr.ip().to_string();
-                            cfg.client.server_port = addr.port();
-                        }
+                    let addr = match parse_addr(server, "--server") {
+                        Ok(a) => a,
                         Err(e) => {
-                            eprintln!("invalid --server '{server}': {e}");
+                            eprintln!("{e}");
                             return ExitCode::FAILURE;
                         }
-                    }
+                    };
+                    cfg.client.server_addr = addr.ip().to_string();
+                    cfg.client.server_port = addr.port();
                 }
                 if let Some(token) = token {
                     cfg.client.token = token;
@@ -141,10 +161,11 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
 
-                logging::init_logging(
-                    log_level.as_deref().or(cfg.log.level.as_deref()),
-                    log_output.as_deref().or(cfg.log.output.as_deref()),
-                    log_format.as_deref().or(cfg.log.format.as_deref()),
+                init_logging(
+                    &cfg.log,
+                    log_level.as_deref(),
+                    log_output.as_deref(),
+                    log_format.as_deref(),
                 );
 
                 let client = match rfrpc::client::Client::new(cfg) {

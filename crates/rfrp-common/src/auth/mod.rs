@@ -8,7 +8,6 @@
 /// 长度不同直接返回 `false`（长度本身不视为机密）；长度相同时按字节做
 /// 恒定时间异或累加，避免时序侧信道。空串与空串比较会返回 `true`，
 /// 调用方需在 M3 保证 expected 非空。
-#[allow(dead_code)]
 pub fn verify_token(expected: &str, provided: &str) -> bool {
     if expected.len() != provided.len() {
         return false;

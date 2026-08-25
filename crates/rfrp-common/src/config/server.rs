@@ -1,5 +1,6 @@
 //! 服务端配置结构（DESIGN §9.1）。
 
+use crate::config::LogSection;
 use crate::error::{config, Result};
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -145,18 +146,6 @@ impl ProxySection {
         }
         Ok(ranges.iter().any(|(s, e)| port >= *s && port <= *e))
     }
-}
-
-/// `[log]` 日志设置（整段可选）。
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct LogSection {
-    #[serde(default)]
-    pub level: Option<String>,
-    #[serde(default)]
-    pub output: Option<String>,
-    #[serde(default)]
-    pub format: Option<String>,
 }
 
 /// 校验证书/私钥文件存在且可读。

@@ -9,11 +9,26 @@
 mod client;
 mod server;
 
-pub use client::LogSection as ClientLogSection;
+/// `[log]` 日志设置（整段可选），服务端与客户端共用。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LogSection {
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// 兼容别名：客户端侧日志段与 `LogSection` 相同。
+pub use LogSection as ClientLogSection;
+
 pub use client::{ClientConfig, ClientProxy, ClientSection};
-pub use server::{DashboardSection, LogSection, ProxySection, ServerConfig, ServerSection};
+pub use server::{DashboardSection, ProxySection, ServerConfig, ServerSection};
 
 use crate::error::{config, Result};
+use serde::Deserialize;
 use std::path::Path;
 
 /// 加载并校验服务端配置。
@@ -59,9 +74,4 @@ fn resolve_opt_path(value: &mut Option<String>, base: &Path) {
             *value = Some(resolved);
         }
     }
-}
-
-/// 判定 `output` 字段是否指向文件（DESIGN §9.1 `output = "file:/path"`）。
-pub fn is_file_output(output: &str) -> bool {
-    output.starts_with("file:")
 }
