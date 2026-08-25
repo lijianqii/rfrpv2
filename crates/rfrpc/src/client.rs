@@ -17,6 +17,7 @@ use rfrp_common::protocol::msg::*;
 use rfrp_common::util::platform::default_run_id_path;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
+use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
@@ -142,7 +143,12 @@ impl Client {
             None
         };
         let stream = match TcpStream::connect(server_addr).await {
-            Ok(s) => s,
+            Ok(s) => {
+                if let Err(e) = configure_tcp_stream(&s) {
+                    tracing::warn!(error = %e, "failed to configure control TCP stream");
+                }
+                s
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "connect failed");
                 return Err(anyhow::anyhow!(e));

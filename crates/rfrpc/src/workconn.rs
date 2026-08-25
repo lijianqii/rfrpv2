@@ -12,6 +12,7 @@ use rfrp_common::protocol::frame::FrameCodec;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::stream::BoxedStream;
+use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
@@ -36,6 +37,9 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     )
     .await
     .map_err(|_| Error::Other("work connection connect timeout".into()))??;
+    if let Err(e) = configure_tcp_stream(&work) {
+        tracing::warn!(proxy = %req.proxy_name, error = %e, "failed to configure work TCP stream");
+    }
     let use_tls = *state.work_conn_tls.lock().unwrap();
     let work: BoxedStream = if use_tls {
         let tls = state.tls.as_ref().ok_or_else(|| {
@@ -62,7 +66,12 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     )
     .await
     {
-        Ok(Ok(l)) => l,
+        Ok(Ok(l)) => {
+            if let Err(e) = configure_tcp_stream(&l) {
+                tracing::warn!(proxy = %req.proxy_name, error = %e, "failed to configure local TCP stream");
+            }
+            l
+        }
         Ok(Err(e)) => {
             // 本地连不上：直接关闭工作连接（TCP FIN），服务端不会入池。
             tracing::warn!(proxy = %req.proxy_name, error = %e, "local connect failed; closing work connection");

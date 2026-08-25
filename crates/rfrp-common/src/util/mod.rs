@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod platform;
 pub mod signal;
 pub mod stream;
+pub mod tcp;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

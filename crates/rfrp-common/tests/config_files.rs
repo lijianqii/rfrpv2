@@ -50,7 +50,7 @@ fn server_example_parses_with_sections() {
     let cfg =
         load_server_config(&example_path("rfrp-server.toml")).expect("load example server config");
 
-    assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+    assert_eq!(cfg.server.bind_addr, "0.0.0.0");
     assert_eq!(cfg.server.bind_port, 7000);
     assert_eq!(cfg.server.token, "shared-secret");
     assert!(cfg.server.tls_enable);

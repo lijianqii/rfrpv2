@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
+use rfrp_common::util::tcp::configure_tcp_stream;
 use rfrp_common::{constants::*, error::Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -76,6 +77,9 @@ async fn proxy_accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((user, peer)) => {
+                        if let Err(e) = configure_tcp_stream(&user) {
+                            tracing::warn!(%proxy_name, %peer, error = %e, "failed to configure user TCP stream");
+                        }
                         // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
                         // 桥接必须在独立任务中进行，不能在 accept 循环内 await，
                         // 否则首个占用池连接的用户会话期间，后续用户连接无法被 accept（卡死，§8.2）。

@@ -16,6 +16,7 @@ use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
+use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -127,6 +128,9 @@ impl Server {
                 res = self.listener.accept() => {
                     match res {
                         Ok((stream, peer)) => {
+                            if let Err(e) = configure_tcp_stream(&stream) {
+                                tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
+                            }
                             let state = self.state.clone();
                             let config = self.config.clone();
                             let tls = tls.clone();

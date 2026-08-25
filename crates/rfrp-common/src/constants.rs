@@ -38,6 +38,9 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT: u64 = 30;
 
 // ---- 重连退避（秒）----
 
+/// 数据面 TCP keepalive 间隔（秒），用于长连接断线感知。
+pub const TCP_KEEPALIVE_INTERVAL: u64 = 30;
+
 /// 重连退避初值。
 pub const RECONNECT_BACKOFF_INITIAL: u64 = 1;
 /// 重连退避上限。
