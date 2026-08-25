@@ -184,3 +184,49 @@ async fn tcp_proxy_rejects_unregistered_port() {
     }
     srv.abort();
 }
+
+#[tokio::test]
+async fn first_user_connection_receives_pushed_data_from_local() {
+    // 模拟 SSH：本地服务在 accept 后立即推送 banner，再回显。
+    // 验证预热池连接在第一次被用户使用时能正确透传已推送的数据。
+    let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = local.accept().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(b"BANNER\n").await;
+                let (mut r, mut w) = tokio::io::split(s);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let proxy = ClientProxy {
+        name: "ssh".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port,
+        remote_port: Some(remote),
+        custom_domains: None,
+        pool_size: 1,
+    };
+    let cli = start_client(client_config(addr, vec![proxy], None)).await;
+
+    // 等待预热完成（不消费池内连接）。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut user = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+    let mut buf = [0u8; 7];
+    let r = tokio::time::timeout(Duration::from_secs(3), user.read_exact(&mut buf)).await;
+    assert!(
+        r.is_ok(),
+        "first user connection must receive pushed banner"
+    );
+    assert_eq!(&buf, b"BANNER\n");
+
+    drop(user);
+    srv.abort();
+    cli.abort();
+}
