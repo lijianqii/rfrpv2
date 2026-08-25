@@ -54,6 +54,10 @@ crates/
 cargo test --all
 ```
 
+## 注意事项
+
+- **SSH 等有状态协议建议 `pool_size = 0`**：预热会在启动时建立一条空闲本地连接，有状态服务可能在首次使用前将其关闭，导致第一次连接 `Connection reset by peer`。RDP 等场景建议保留预热以降低首连延迟。
+
 ## License
 
 [MIT](LICENSE)

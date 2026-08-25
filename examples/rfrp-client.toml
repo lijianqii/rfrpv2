@@ -17,7 +17,7 @@ type = "tcp"
 local_ip = "127.0.0.1"            # 本地回连地址，默认 127.0.0.1
 local_port = 22
 remote_port = 6000
-pool_size = 1                     # 工作连接池大小，默认 1；0 表示禁用预热、纯按需建立
+pool_size = 0                     # SSH 等有状态协议建议 0（禁用预热，避免首连命中失效连接）；RDP 等可用默认 1
 
 # M4 支持 HTTP/HTTPS 后，可取消注释使用 vhost 代理：
 # [[proxy]]
