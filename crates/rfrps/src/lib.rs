@@ -6,6 +6,7 @@
 pub mod control;
 pub mod listener;
 pub mod server;
+pub mod vhost;
 pub mod work;
 
 pub use server::Server;

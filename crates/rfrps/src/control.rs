@@ -29,14 +29,24 @@ use tokio::time::interval;
 use crate::listener;
 use crate::server::ServerState;
 
+/// 一个已注册代理的元信息。
+pub struct ProxyEntry {
+    /// 代理监听任务句柄（断开时清理）。
+    pub handle: JoinHandle<()>,
+    /// 代理类型（TCP/UDP/HTTP/HTTPS）。
+    pub kind: rfrp_common::protocol::msg::ProxyType,
+}
+
 /// 一个 rfrpc 与服务端之间的控制连接会话。
 pub struct Session {
     pub run_id: String,
     pub session_id: String,
     /// 出站控制消息通道（监听任务发 ReqWorkConn，本任务转交写任务）。
     pub tx: mpsc::Sender<Message>,
-    /// 已注册代理的监听任务句柄（用于断开时清理）。
-    pub proxies: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// 已注册代理（proxy_name -> 监听任务句柄 + 类型）。
+    pub proxies: Mutex<HashMap<String, ProxyEntry>>,
+    /// vhost 域名 -> proxy_name（HTTP/HTTPS 路由用）。
+    pub proxy_domains: Mutex<HashMap<String, String>>,
     /// 断开 / 重连通知（§8.3）：清理旧会话或正常断开时唤醒控制循环退出。
     pub stop: Arc<Notify>,
     /// 预热工作连接池（proxy_name -> 空闲服务端侧工作流），按 §8.2 命中用户连接。
@@ -107,6 +117,7 @@ where
         session_id: session_id.clone(),
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
+        proxy_domains: Mutex::new(HashMap::new()),
         stop: Arc::new(Notify::new()),
         pools: Mutex::new(HashMap::new()),
     });
@@ -282,9 +293,10 @@ where
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
-    for (_, h) in session.proxies.lock().unwrap().drain() {
-        h.abort();
+    for (_, entry) in session.proxies.lock().unwrap().drain() {
+        entry.handle.abort();
     }
+    session.proxy_domains.lock().unwrap().clear();
     // 关闭并丢弃所有预热的工作连接池（§8.2）。
     for (_, mut v) in session.pools.lock().unwrap().drain() {
         for _s in v.drain(..) {

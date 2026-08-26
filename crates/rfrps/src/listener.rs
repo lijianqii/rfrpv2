@@ -8,26 +8,47 @@ use std::sync::Arc;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
+use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
 use rfrp_common::{constants::*, error::Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 
-use crate::control::Session;
+use crate::control::{ProxyEntry, Session};
 use crate::server::{PendingWork, ServerState};
 
-/// 注册一个 TCP 代理：校验后在 `remote_port` 起监听，返回 Ok 表示注册成功。
+/// 注册代理：TCP 在 `remote_port` 起监听；HTTP 走共享 vhost 监听，仅登记域名。
 pub async fn register_proxy(
     np: &NewProxy,
     session: &Arc<Session>,
     state: &Arc<ServerState>,
     config: &ServerConfig,
 ) -> Result<()> {
+    if np.r#type == ProxyType::Http {
+        // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
+        let domains = np.custom_domains.as_ref().ok_or_else(|| {
+            rfrp_common::Error::Config("http proxy requires custom_domains".into())
+        })?;
+        let mut map = session.proxy_domains.lock().unwrap();
+        for d in domains {
+            map.insert(d.clone(), np.proxy_name.clone());
+        }
+        let handle = tokio::spawn(async {});
+        session.proxies.lock().unwrap().insert(
+            np.proxy_name.clone(),
+            ProxyEntry {
+                handle,
+                kind: ProxyType::Http,
+            },
+        );
+        tracing::info!(proxy = %np.proxy_name, "proxy registered (http)");
+        return Ok(());
+    }
     if np.r#type != ProxyType::Tcp {
-        // 当前仅 TCP；其余类型在 M4 实现。
+        // 其余类型（UDP/HTTPS）在后续 M4 子任务实现。
         return Err(rfrp_common::Error::Config(
-            "only tcp proxy supported".into(),
+            "only tcp/http proxy supported".into(),
         ));
     }
     let remote_port = np
@@ -57,11 +78,19 @@ pub async fn register_proxy(
     let handle = tokio::spawn(async move {
         proxy_accept_loop(listener, proxy_name, session, state).await;
     });
-    session_for_insert
-        .proxies
-        .lock()
-        .unwrap()
-        .insert(np.proxy_name.clone(), handle);
+    session_for_insert.proxies.lock().unwrap().insert(
+        np.proxy_name.clone(),
+        ProxyEntry {
+            handle,
+            kind: np.r#type,
+        },
+    );
+    if let Some(domains) = &np.custom_domains {
+        let mut map = session_for_insert.proxy_domains.lock().unwrap();
+        for d in domains {
+            map.insert(d.clone(), np.proxy_name.clone());
+        }
+    }
     tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (tcp)");
     Ok(())
 }
@@ -80,63 +109,8 @@ async fn proxy_accept_loop(
                         if let Err(e) = configure_tcp_stream(&user) {
                             tracing::warn!(%proxy_name, %peer, error = %e, "failed to configure user TCP stream");
                         }
-                        // 优先命中预热池（§8.2）：命中则直接桥接并请求补充（work_id=0）。
-                        // 桥接必须在独立任务中进行，不能在 accept 循环内 await，
-                        // 否则首个占用池连接的用户会话期间，后续用户连接无法被 accept（卡死，§8.2）。
-                        let pooled = {
-                            let mut pools = session.pools.lock().unwrap();
-                            pools.get_mut(&proxy_name).and_then(|v| v.pop())
-                        };
-                        if let Some(work) = pooled {
-                            tracing::debug!(%proxy_name, %peer, "user connected; pool hit, bridging");
-                            let pname = proxy_name.clone();
-                            tokio::spawn(async move {
-                                let _ = bridge(user, work).await;
-                                tracing::debug!(proxy = %pname, "pooled work bridge finished");
-                            });
-                            // 立即请求补充预热连接（无需等待本次用户断开）。
-                            if session
-                                .tx
-                                .send(Message::ReqWorkConn(ReqWorkConn {
-                                    proxy_name: proxy_name.clone(),
-                                    work_id: WORK_ID_POOL_RESERVED,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                // 控制连接已断，忽略补充请求。
-                            }
-                            continue;
-                        }
-                        let work_id = state.next_work_id();
-                        tracing::debug!(%proxy_name, work_id, %peer, "user connected");
-                        {
-                            let mut p = state.pending.lock().unwrap();
-                            p.insert(
-                                work_id,
-                                PendingWork {
-                                    proxy_name: proxy_name.clone(),
-                                    session_id: session.session_id.clone(),
-                                    user: Some(user),
-                                },
-                            );
-                        }
-                        // 经控制连接请求客户端建立工作连接。
-                        if session
-                            .tx
-                            .send(Message::ReqWorkConn(ReqWorkConn {
-                                proxy_name: proxy_name.clone(),
-                                work_id,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            // 控制连接已断，清理待处理项。
-                            state.pending.lock().unwrap().remove(&work_id);
-                            continue;
-                        }
-                        // 超时兜底：用户连接长时间等不到工作连接则关闭（见 DESIGN §8.5）。
-                        spawn_pending_timeout(work_id, state.clone());
+                        tracing::debug!(%proxy_name, %peer, "user connected");
+                        dispatch_user_connection(proxy_name.clone(), Box::new(user), session.clone(), state.clone());
                     }
                     Err(e) => {
                         tracing::warn!("proxy listener accept error: {e}");
@@ -150,6 +124,70 @@ async fn proxy_accept_loop(
             }
         }
     }
+}
+
+/// 统一处理一条用户连接：优先命中预热池，否则登记 pending 并按需请求工作连接。
+/// 桥接与 ReqWorkConn 均放入独立任务，避免阻塞 accept 循环。
+pub(crate) fn dispatch_user_connection(
+    proxy_name: String,
+    user: BoxedStream,
+    session: Arc<Session>,
+    state: Arc<ServerState>,
+) {
+    // 优先命中预热池（§8.2）。
+    let pooled = {
+        let mut pools = session.pools.lock().unwrap();
+        pools.get_mut(&proxy_name).and_then(|v| v.pop())
+    };
+    if let Some(work) = pooled {
+        tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
+        let pname = proxy_name.clone();
+        tokio::spawn(async move {
+            let _ = bridge(user, work).await;
+            tracing::debug!(proxy = %pname, "pooled work bridge finished");
+        });
+        // 立即请求补充预热连接（无需等待本次用户断开）。
+        let tx = session.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Message::ReqWorkConn(ReqWorkConn {
+                    proxy_name,
+                    work_id: WORK_ID_POOL_RESERVED,
+                }))
+                .await;
+        });
+        return;
+    }
+
+    let work_id = state.next_work_id();
+    tracing::debug!(%proxy_name, work_id, "user connected (on-demand)");
+    state.pending.lock().unwrap().insert(
+        work_id,
+        PendingWork {
+            proxy_name: proxy_name.clone(),
+            session_id: session.session_id.clone(),
+            user: Some(user),
+        },
+    );
+
+    let tx = session.tx.clone();
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        if tx
+            .send(Message::ReqWorkConn(ReqWorkConn {
+                proxy_name,
+                work_id,
+            }))
+            .await
+            .is_err()
+        {
+            // 控制连接已断，清理待处理项。
+            state2.pending.lock().unwrap().remove(&work_id);
+            return;
+        }
+        // 超时兜底：用户连接长时间等不到工作连接则关闭（见 DESIGN §8.5）。
+        spawn_pending_timeout(work_id, state2);
+    });
 }
 
 /// 超时清理：WORK_CONN_TIMEOUT_RFRPS 后仍未消费则关闭用户连接。
@@ -207,6 +245,7 @@ mod tests {
             session_id: "s".into(),
             tx,
             proxies: Mutex::new(HashMap::new()),
+            proxy_domains: Mutex::new(HashMap::new()),
             stop: Arc::new(Notify::new()),
             pools: Mutex::new(HashMap::new()),
         })
@@ -380,7 +419,7 @@ mod tests {
             PendingWork {
                 proxy_name: "ssh".into(),
                 session_id: "s".into(),
-                user: Some(user),
+                user: Some(Box::new(user)),
             },
         );
         spawn_pending_timeout(42, state.clone());

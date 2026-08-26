@@ -29,7 +29,8 @@ use crate::work;
 pub struct PendingWork {
     pub proxy_name: String,
     pub session_id: String,
-    pub user: Option<TcpStream>,
+    /// 用户侧流（类型擦除，兼容明文/TLS/vhost 已读缓冲包装）。
+    pub user: Option<BoxedStream>,
 }
 
 /// 服务端共享状态（所有 accept 任务共享）。
@@ -98,12 +99,21 @@ pub struct Server {
     grace: Duration,
     /// 控制/工作连接 TLS acceptor（按配置按需加载）。
     tls: Option<ServerTls>,
+    /// HTTP vhost 监听（可选）。
+    vhost_http: Option<TcpListener>,
 }
 
 impl Server {
     /// 绑定 `config.server.bind_addr:bind_port`。`bind_port=0` 由 OS 分配。
     pub async fn new(config: ServerConfig) -> Result<Self> {
         let listener = TcpListener::bind(config.server.bind_socket_addr()?).await?;
+        let vhost_http = match config.proxy.vhost_http_port {
+            Some(port) => {
+                let addr = (config.server.bind_addr.as_str(), port);
+                Some(TcpListener::bind(addr).await?)
+            }
+            None => None,
+        };
         let tls = if config.server.tls_enable || config.server.work_conn_tls {
             let cert = config.server.tls_cert.as_deref().ok_or_else(|| {
                 rfrp_common::Error::Config("tls_cert is required when TLS is enabled".into())
@@ -124,6 +134,7 @@ impl Server {
             state: ServerState::new(),
             grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
             tls,
+            vhost_http,
         })
     }
 
@@ -149,9 +160,19 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let shutdown = self.state.shutdown.clone();
         let tls = self.tls.clone();
+        let vhost_http = self.vhost_http;
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
+        // HTTP vhost 监听循环（可选）。
+        if let Some(listener) = vhost_http {
+            let state = self.state.clone();
+            let config = self.config.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move {
+                crate::vhost::run_http_vhost(listener, state, config, shutdown).await;
+            });
+        }
         loop {
             tokio::select! {
                 res = self.listener.accept() => {
