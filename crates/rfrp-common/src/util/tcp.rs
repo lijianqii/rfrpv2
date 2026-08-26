@@ -7,12 +7,13 @@
 //! 探测间隔，可能导致空闲连接在约 30s 后被系统主动断开。因此在 Windows 上暂不
 //! 启用 keepalive（只保留 TCP_NODELAY），避免空闲 SSH 等连接周期性掉线。
 
-use std::time::Duration;
-
 use socket2::SockRef;
 use tokio::net::TcpStream;
 
+#[cfg(not(windows))]
 use crate::constants::{TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_PROBE_INTERVAL};
+#[cfg(not(windows))]
+use std::time::Duration;
 
 /// 对 TCP 流启用 `TCP_NODELAY` 与 keepalive。
 pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
