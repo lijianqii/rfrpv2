@@ -57,6 +57,7 @@ cargo test --all
 ## 注意事项
 
 - **SSH 等有状态协议建议 `pool_size = 0`**：预热会在启动时建立一条空闲本地连接，有状态服务可能在首次使用前将其关闭，导致第一次连接 `Connection reset by peer`。RDP 等场景建议保留预热以降低首连延迟。
+- **Windows 下 TCP keepalive 已禁用**：Windows 上通过 socket2 设置 keepalive 可能导致空闲连接约 30s 后被系统主动断开；当前 Windows 仅启用 `TCP_NODELAY`，Linux 保留 keepalive。
 
 ## License
 
