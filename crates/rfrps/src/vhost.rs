@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use rfrp_common::config::ServerConfig;
+use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
@@ -80,8 +81,99 @@ async fn handle_http_connection(stream: TcpStream, state: Arc<ServerState>) -> R
     Ok(())
 }
 
+/// HTTPS vhost accept 循环：TLS 终止后按 SNI/Host 路由。
+pub async fn run_https_vhost(
+    listener: TcpListener,
+    tls: ServerTls,
+    state: Arc<ServerState>,
+    _config: ServerConfig,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        if let Err(e) = configure_tcp_stream(&stream) {
+                            tracing::warn!(%peer, error = %e, "failed to configure vhost TLS TCP stream");
+                        }
+                        let tls = tls.clone();
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            match tls.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let sni = tls_stream
+                                        .get_ref()
+                                        .1
+                                        .server_name()
+                                        .map(|s| s.to_string());
+                                    let _ = handle_https_connection(sni, tls_stream, state).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%peer, error = %e, "vhost TLS accept failed");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("vhost https accept error: {e}");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                tracing::info!("vhost https listener shutting down");
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_https_connection<S>(
+    sni: Option<String>,
+    stream: S,
+    state: Arc<ServerState>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (host, stream) = match read_request_head(stream).await? {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    // SNI 优先；未提供 SNI 时回退到 Host 头。
+    let host = sni.unwrap_or(host);
+
+    let (session, proxy_name) = match find_proxy_by_domain(&state, &host) {
+        Some(x) => x,
+        None => {
+            tracing::warn!(host = %host, "no vhost proxy matched, closing");
+            return Ok(());
+        }
+    };
+
+    // 确认该代理确实是 HTTPS 类型。
+    let is_https = session
+        .proxies
+        .lock()
+        .unwrap()
+        .get(&proxy_name)
+        .map(|e| e.kind == ProxyType::Https)
+        .unwrap_or(false);
+    if !is_https {
+        tracing::warn!(host = %host, proxy = %proxy_name, "proxy is not https type, closing");
+        return Ok(());
+    }
+
+    dispatch_user_connection(proxy_name, stream, session, state);
+    Ok(())
+}
+
 /// 读取 HTTP 请求头，返回 `(Host, 带已读缓冲的流)`。
-async fn read_request_head(mut stream: TcpStream) -> Result<Option<(String, BoxedStream)>> {
+async fn read_request_head<S>(mut stream: S) -> Result<Option<(String, BoxedStream)>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 8192];
     loop {

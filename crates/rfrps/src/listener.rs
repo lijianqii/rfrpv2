@@ -25,10 +25,10 @@ pub async fn register_proxy(
     state: &Arc<ServerState>,
     config: &ServerConfig,
 ) -> Result<()> {
-    if np.r#type == ProxyType::Http {
+    if matches!(np.r#type, ProxyType::Http | ProxyType::Https) {
         // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
         let domains = np.custom_domains.as_ref().ok_or_else(|| {
-            rfrp_common::Error::Config("http proxy requires custom_domains".into())
+            rfrp_common::Error::Config("http/https proxy requires custom_domains".into())
         })?;
         let mut map = session.proxy_domains.lock().unwrap();
         for d in domains {
@@ -39,16 +39,16 @@ pub async fn register_proxy(
             np.proxy_name.clone(),
             ProxyEntry {
                 handle,
-                kind: ProxyType::Http,
+                kind: np.r#type,
             },
         );
-        tracing::info!(proxy = %np.proxy_name, "proxy registered (http)");
+        tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "proxy registered (vhost)");
         return Ok(());
     }
     if np.r#type != ProxyType::Tcp {
-        // 其余类型（UDP/HTTPS）在后续 M4 子任务实现。
+        // UDP 在后续 M4 子任务实现。
         return Err(rfrp_common::Error::Config(
-            "only tcp/http proxy supported".into(),
+            "only tcp/http/https proxy supported".into(),
         ));
     }
     let remote_port = np

@@ -101,6 +101,8 @@ pub struct Server {
     tls: Option<ServerTls>,
     /// HTTP vhost 监听（可选）。
     vhost_http: Option<TcpListener>,
+    /// HTTPS vhost 监听 + TLS acceptor（可选）。
+    vhost_https: Option<(TcpListener, ServerTls)>,
 }
 
 impl Server {
@@ -111,6 +113,24 @@ impl Server {
             Some(port) => {
                 let addr = (config.server.bind_addr.as_str(), port);
                 Some(TcpListener::bind(addr).await?)
+            }
+            None => None,
+        };
+        let vhost_https = match config.proxy.vhost_https_port {
+            Some(port) => {
+                let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(|| {
+                    rfrp_common::Error::Config(
+                        "vhost_https_port requires vhost_tls_cert and vhost_tls_key".into(),
+                    )
+                })?;
+                let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(|| {
+                    rfrp_common::Error::Config(
+                        "vhost_https_port requires vhost_tls_cert and vhost_tls_key".into(),
+                    )
+                })?;
+                let listener = TcpListener::bind((config.server.bind_addr.as_str(), port)).await?;
+                let tls = ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))?;
+                Some((listener, tls))
             }
             None => None,
         };
@@ -135,6 +155,7 @@ impl Server {
             grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
             tls,
             vhost_http,
+            vhost_https,
         })
     }
 
@@ -161,6 +182,7 @@ impl Server {
         let shutdown = self.state.shutdown.clone();
         let tls = self.tls.clone();
         let vhost_http = self.vhost_http;
+        let vhost_https = self.vhost_https;
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
@@ -171,6 +193,15 @@ impl Server {
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
                 crate::vhost::run_http_vhost(listener, state, config, shutdown).await;
+            });
+        }
+        // HTTPS vhost 监听循环（可选）。
+        if let Some((listener, tls)) = vhost_https {
+            let state = self.state.clone();
+            let config = self.config.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move {
+                crate::vhost::run_https_vhost(listener, tls, state, config, shutdown).await;
             });
         }
         loop {

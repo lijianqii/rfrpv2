@@ -149,3 +149,86 @@ async fn http_vhost_rejects_unknown_host() {
     srv.abort();
     cli.abort();
 }
+
+#[tokio::test]
+async fn https_vhost_routes_by_sni() {
+    use rfrp_common::config::ClientSection;
+    use rfrp_common::crypto::ClientTls;
+
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cert = base.join("../../examples/vhost-cert.pem");
+    let key = base.join("../../examples/vhost-key.pem");
+
+    let server_cfg = ServerConfig {
+        server: ServerSection {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            token: "".into(),
+            tls_enable: false,
+            tls_cert: None,
+            tls_key: None,
+            work_conn_tls: false,
+        },
+        dashboard: None,
+        proxy: ProxySection {
+            allow_ports: String::new(),
+            vhost_http_port: None,
+            vhost_https_port: Some(vhost_port),
+            vhost_tls_cert: Some(cert.to_string_lossy().to_string()),
+            vhost_tls_key: Some(key.to_string_lossy().to_string()),
+        },
+        log: LogSection::default(),
+    };
+    let (srv, addr) = start_server(server_cfg).await;
+
+    let proxy = ClientProxy {
+        name: "web".into(),
+        r#type: ProxyType::Https,
+        local_ip: "127.0.0.1".into(),
+        local_port,
+        remote_port: None,
+        custom_domains: Some(vec!["dev.example.com".into()]),
+        pool_size: 0,
+    };
+    let cli = start_client(client_config(addr, vec![proxy], None)).await;
+
+    // TLS 客户端配置：SNI 用 dev.example.com，信任 vhost 自签证书。
+    let section = ClientSection {
+        tls_server_name: Some("dev.example.com".into()),
+        tls_ca: Some(cert.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let tls = ClientTls::new(&section).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let resp = loop {
+        if let Ok(tcp) = TcpStream::connect(("127.0.0.1", vhost_port)).await {
+            if let Ok(mut s) = tls.connect(tcp).await {
+                let _ = s
+                    .write_all(b"GET / HTTP/1.1\r\nHost: dev.example.com\r\n\r\n")
+                    .await;
+                let mut buf = [0u8; 256];
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await
+                {
+                    if n > 0 {
+                        break String::from_utf8_lossy(&buf[..n]).to_string();
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("https vhost proxy did not become ready");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        resp.contains("200 OK") && resp.contains("ok"),
+        "unexpected https vhost response: {resp}"
+    );
+
+    srv.abort();
+    cli.abort();
+}
