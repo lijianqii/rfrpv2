@@ -4,6 +4,7 @@ pub mod platform;
 pub mod signal;
 pub mod stream;
 pub mod tcp;
+pub mod udp;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

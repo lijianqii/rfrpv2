@@ -54,11 +54,39 @@ pub async fn register_proxy(
         tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "proxy registered (vhost)");
         return Ok(());
     }
+    if np.r#type == ProxyType::Udp {
+        let remote_port = np
+            .remote_port
+            .ok_or_else(|| rfrp_common::Error::Config("udp proxy requires remote_port".into()))?;
+        if !config.proxy.is_port_allowed(remote_port)? {
+            return Err(rfrp_common::Error::Config("port not allowed".into()));
+        }
+        {
+            let proxies = session.proxies.lock().unwrap();
+            if proxies.contains_key(&np.proxy_name) {
+                return Err(rfrp_common::Error::Config("proxy_name exists".into()));
+            }
+        }
+        let handle = crate::udp::register_udp_proxy(
+            np.proxy_name.clone(),
+            remote_port,
+            session,
+            state,
+            &config.server.bind_addr,
+        )
+        .await?;
+        session.proxies.lock().unwrap().insert(
+            np.proxy_name.clone(),
+            ProxyEntry {
+                handle,
+                kind: ProxyType::Udp,
+            },
+        );
+        tracing::info!(proxy = %np.proxy_name, remote_port, "proxy registered (udp)");
+        return Ok(());
+    }
     if np.r#type != ProxyType::Tcp {
-        // UDP 在后续 M4 子任务实现。
-        return Err(rfrp_common::Error::Config(
-            "only tcp/http/https proxy supported".into(),
-        ));
+        return Err(rfrp_common::Error::Config("unsupported proxy type".into()));
     }
     let remote_port = np
         .remote_port
@@ -274,10 +302,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_rejects_non_tcp() {
+    async fn register_udp_port_not_allowed_rejected() {
         let state = ServerState::new();
         let session = test_session();
-        let cfg = test_config("");
+        let cfg = test_config("5000-5001");
         let np = NewProxy {
             proxy_name: "p".into(),
             r#type: ProxyType::Udp,
@@ -401,18 +429,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_rejects_udp_proxy() {
-        // UDP 尚未实现：应被拒。
+    async fn register_udp_missing_remote_port_rejected() {
         let state = ServerState::new();
         let session = test_session();
         let cfg = test_config("");
         let np = NewProxy {
             proxy_name: "p".into(),
             r#type: ProxyType::Udp,
-            remote_port: Some(18080),
+            remote_port: None,
             custom_domains: None,
         };
         assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_udp_proxy_ok() {
+        let state = ServerState::new();
+        let session = test_session();
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "dns".into(),
+            r#type: ProxyType::Udp,
+            remote_port: Some(free_port()),
+            custom_domains: None,
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+        let proxies = session.proxies.lock().unwrap();
+        let entry = proxies.get("dns").unwrap();
+        assert_eq!(entry.kind, ProxyType::Udp);
+        assert!(state.udp.lock().unwrap().contains_key("dns"));
     }
 
     #[tokio::test]

@@ -32,6 +32,18 @@ where
         }
     };
 
+    // UDP 代理：工作连接走分帧协议，不走 TCP 桥接（DESIGN §8.6）。
+    if crate::udp::is_udp_proxy(&state, &proxy_name) {
+        if work_id == WORK_ID_POOL_RESERVED {
+            tracing::warn!(%proxy_name, "udp proxy does not support pooled work conns");
+            return Ok(());
+        }
+        if let Some(proxy) = crate::udp::get_udp_proxy(&state, &proxy_name) {
+            return crate::udp::handle_udp_work_conn(proxy, work_id, Box::new(stream)).await;
+        }
+        return Ok(());
+    }
+
     // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
     if work_id == WORK_ID_POOL_RESERVED {
         match find_session_by_proxy(&state, &proxy_name) {

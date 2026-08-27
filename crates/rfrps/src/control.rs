@@ -293,8 +293,21 @@ where
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
+    // 先收集 UDP 代理名，用于清理全局注册表。
+    let udp_names: Vec<String> = session
+        .proxies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| e.kind == ProxyType::Udp)
+        .map(|(n, _)| n.clone())
+        .collect();
     for (_, entry) in session.proxies.lock().unwrap().drain() {
         entry.handle.abort();
+    }
+    let mut udp = state.udp.lock().unwrap();
+    for n in udp_names {
+        udp.remove(&n);
     }
     session.proxy_domains.lock().unwrap().clear();
     // 关闭并丢弃所有预热的工作连接池（§8.2）。
@@ -358,6 +371,23 @@ mod tests {
             .lock()
             .unwrap()
             .insert("dev.example.com".into(), "web".into());
+        session.proxies.lock().unwrap().insert(
+            "udp".into(),
+            ProxyEntry {
+                handle: tokio::spawn(async {}),
+                kind: ProxyType::Udp,
+            },
+        );
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        state.udp.lock().unwrap().insert(
+            "udp".into(),
+            Arc::new(crate::udp::UdpProxy {
+                socket,
+                sessions: Mutex::new(HashMap::new()),
+                pending_by_id: Mutex::new(HashMap::new()),
+                pending_client: Mutex::new(HashMap::new()),
+            }),
+        );
         state
             .sessions
             .lock()
@@ -368,6 +398,10 @@ mod tests {
         assert!(
             session.proxy_domains.lock().unwrap().is_empty(),
             "cleanup must clear vhost domain mappings"
+        );
+        assert!(
+            state.udp.lock().unwrap().is_empty(),
+            "cleanup must remove udp proxy registry"
         );
     }
 

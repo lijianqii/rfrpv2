@@ -41,6 +41,8 @@ pub struct ServerState {
     pub pending: Mutex<HashMap<u64, PendingWork>>,
     /// run_id → 控制会话。重连时按 run_id 定位旧会话并清理（§8.3）。
     pub sessions: Mutex<HashMap<String, Arc<crate::control::Session>>>,
+    /// UDP 代理运行状态（proxy_name -> UdpProxy）。
+    pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -51,6 +53,7 @@ impl ServerState {
             work_id: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            udp: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
         })
     }
