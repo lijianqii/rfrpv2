@@ -232,3 +232,192 @@ async fn https_vhost_routes_by_sni() {
     srv.abort();
     cli.abort();
 }
+
+#[tokio::test]
+async fn https_vhost_falls_back_to_host_header_without_sni() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let (srv, _addr, cli) = start_vhost_stack(
+        None,
+        Some(vhost_port),
+        web_proxy(ProxyType::Https, local_port, 0),
+    )
+    .await;
+
+    // 用 IP 作为 server_name：rustls 对 IP 不发送 SNI，服务端应回退到 Host 头。
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cert = base.join("../../examples/vhost-cert.pem");
+    let section = rfrp_common::config::ClientSection {
+        tls_server_name: Some("127.0.0.1".into()),
+        tls_ca: Some(cert.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let tls = ClientTls::new(&section).unwrap();
+
+    let resp = wait_vhost_response(vhost_port, "dev.example.com", Some(&tls)).await;
+    assert!(
+        resp.contains("200 OK"),
+        "host-header fallback failed: {resp}"
+    );
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn http_vhost_closes_on_oversized_head() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let (srv, _addr, cli) = start_vhost_stack(
+        Some(vhost_port),
+        None,
+        web_proxy(ProxyType::Http, local_port, 0),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut s = TcpStream::connect(("127.0.0.1", vhost_port)).await.unwrap();
+    // 超过 64KB 且不结束请求头：服务端应关闭连接。
+    let big = vec![b'a'; 70 * 1024];
+    s.write_all(&big).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("connection should be closed by server");
+    match n {
+        Ok(0) => {}
+        Ok(_) => panic!("oversized head should not be forwarded"),
+        Err(_) => {} // RST 同样视为被关闭
+    }
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn http_vhost_with_tls_work_conn() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cert = base.join("../../examples/cert.pem");
+    let key = base.join("../../examples/key.pem");
+    let ca = base.join("../../examples/ca.pem");
+
+    // 服务端：控制链路明文，工作连接 TLS。
+    let server_cfg = ServerConfig {
+        server: ServerSection {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            token: "".into(),
+            tls_enable: false,
+            tls_cert: Some(cert.to_string_lossy().to_string()),
+            tls_key: Some(key.to_string_lossy().to_string()),
+            work_conn_tls: true,
+        },
+        dashboard: None,
+        proxy: ProxySection {
+            allow_ports: String::new(),
+            vhost_http_port: Some(vhost_port),
+            vhost_https_port: None,
+            vhost_tls_cert: None,
+            vhost_tls_key: None,
+        },
+        log: LogSection::default(),
+    };
+    let (srv, addr) = start_server(server_cfg).await;
+
+    let proxy = web_proxy(ProxyType::Http, local_port, 0);
+    let client_cfg = rfrp_common::config::ClientConfig {
+        client: rfrp_common::config::ClientSection {
+            server_addr: addr.ip().to_string(),
+            server_port: addr.port(),
+            token: "".into(),
+            tls_enable: false,
+            tls_server_name: Some("localhost".into()),
+            tls_ca: Some(ca.to_string_lossy().to_string()),
+            work_conn_tls: true,
+            run_id_file: None,
+        },
+        proxies: vec![proxy],
+        log: rfrp_common::config::ClientLogSection::default(),
+    };
+    let cli = start_client(client_cfg).await;
+
+    let resp = wait_vhost_response(vhost_port, "dev.example.com", None).await;
+    assert!(
+        resp.contains("200 OK"),
+        "vhost over TLS work conn failed: {resp}"
+    );
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn http_vhost_concurrent_requests() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let (srv, _addr, cli) = start_vhost_stack(
+        Some(vhost_port),
+        None,
+        web_proxy(ProxyType::Http, local_port, 1),
+    )
+    .await;
+    // 等第一个请求成功后，再并发压测。
+    assert!(wait_vhost_response(vhost_port, "dev.example.com", None)
+        .await
+        .contains("200 OK"));
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        handles.push(tokio::spawn(async move {
+            send_http_request(vhost_port, "dev.example.com", None).await
+        }));
+    }
+    for h in handles {
+        let resp = h.await.unwrap().expect("concurrent vhost request failed");
+        assert!(
+            resp.contains("200 OK"),
+            "unexpected concurrent response: {resp}"
+        );
+    }
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn http_vhost_recovers_after_client_reconnect() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let (srv, addr) = start_server(vhost_server_config(Some(vhost_port), None)).await;
+    let run_id_file =
+        std::env::temp_dir().join(format!("rfrp-vhost-{}.runid", uuid::Uuid::new_v4()));
+
+    let cfg = |a: SocketAddr| {
+        let mut c = client_config(a, vec![web_proxy(ProxyType::Http, local_port, 0)], None);
+        c.client.run_id_file = Some(run_id_file.to_string_lossy().to_string());
+        c
+    };
+
+    let cli1 = start_client(cfg(addr)).await;
+    assert!(wait_vhost_response(vhost_port, "dev.example.com", None)
+        .await
+        .contains("200 OK"));
+
+    // 模拟客户端控制连接断开。
+    cli1.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 新客户端复用 run_id 重连，vhost 应恢复。
+    let cli2 = start_client(cfg(addr)).await;
+    let resp = wait_vhost_response(vhost_port, "dev.example.com", None).await;
+    assert!(
+        resp.contains("200 OK"),
+        "vhost did not recover after reconnect: {resp}"
+    );
+
+    srv.abort();
+    cli2.abort();
+    let _ = std::fs::remove_file(run_id_file);
+}

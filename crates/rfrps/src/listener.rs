@@ -17,6 +17,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::control::{ProxyEntry, Session};
 use crate::server::{PendingWork, ServerState};
+use crate::vhost::find_proxy_by_domain;
 
 /// 注册代理：TCP 在 `remote_port` 起监听；HTTP 走共享 vhost 监听，仅登记域名。
 pub async fn register_proxy(
@@ -30,6 +31,14 @@ pub async fn register_proxy(
         let domains = np.custom_domains.as_ref().ok_or_else(|| {
             rfrp_common::Error::Config("http/https proxy requires custom_domains".into())
         })?;
+        // 域名全局唯一：与其他代理冲突则拒绝（DESIGN §6.6）。
+        for d in domains {
+            if let Some((_, owner)) = find_proxy_by_domain(state, d) {
+                return Err(rfrp_common::Error::Config(format!(
+                    "domain conflict: {d} owned by {owner}"
+                )));
+            }
+        }
         let mut map = session.proxy_domains.lock().unwrap();
         for d in domains {
             map.insert(d.clone(), np.proxy_name.clone());
@@ -447,6 +456,35 @@ mod tests {
         let proxies = session.proxies.lock().unwrap();
         let entry = proxies.get("web").unwrap();
         assert_eq!(entry.kind, ProxyType::Https);
+    }
+
+    #[tokio::test]
+    async fn register_http_domain_conflict_rejected() {
+        let state = ServerState::new();
+        let session_a = test_session();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session_a.run_id.clone(), session_a.clone());
+        let cfg = test_config("");
+        let np1 = NewProxy {
+            proxy_name: "a".into(),
+            r#type: ProxyType::Http,
+            remote_port: None,
+            custom_domains: Some(vec!["dev.example.com".into()]),
+        };
+        assert!(register_proxy(&np1, &session_a, &state, &cfg).await.is_ok());
+
+        let session_b = test_session();
+        let np2 = NewProxy {
+            proxy_name: "b".into(),
+            r#type: ProxyType::Http,
+            remote_port: None,
+            custom_domains: Some(vec!["dev.example.com".into()]),
+        };
+        let r = register_proxy(&np2, &session_b, &state, &cfg).await;
+        assert!(r.is_err(), "duplicate domain should be rejected");
     }
 
     #[tokio::test]

@@ -203,7 +203,10 @@ fn strip_port(host: &str) -> &str {
 }
 
 /// 按域名查找所属会话与代理名。
-fn find_proxy_by_domain(state: &ServerState, host: &str) -> Option<(Arc<Session>, String)> {
+pub(crate) fn find_proxy_by_domain(
+    state: &ServerState,
+    host: &str,
+) -> Option<(Arc<Session>, String)> {
     let sessions = state.sessions.lock().unwrap();
     for s in sessions.values() {
         if let Some(proxy) = s.proxy_domains.lock().unwrap().get(host) {

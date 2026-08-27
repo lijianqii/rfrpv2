@@ -341,6 +341,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_clears_proxy_domains() {
+        let state = ServerState::new();
+        let (tx, _rx) = mpsc::channel::<Message>(8);
+        let session = Arc::new(Session {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            tx,
+            proxies: Mutex::new(HashMap::new()),
+            proxy_domains: Mutex::new(HashMap::new()),
+            stop: Arc::new(Notify::new()),
+            pools: Mutex::new(HashMap::new()),
+        });
+        session
+            .proxy_domains
+            .lock()
+            .unwrap()
+            .insert("dev.example.com".into(), "web".into());
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r".into(), session.clone());
+
+        cleanup(&session, &state);
+        assert!(
+            session.proxy_domains.lock().unwrap().is_empty(),
+            "cleanup must clear vhost domain mappings"
+        );
+    }
+
+    #[tokio::test]
     async fn newproxy_heartbeat_close_flow() {
         let (server_end, client_end) = duplex(8192);
         let state = ServerState::new();
