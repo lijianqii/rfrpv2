@@ -1,8 +1,8 @@
-//! HTTP vhost 代理：按 Host 头路由到对应代理，把已读请求头连同剩余流一起桥接。
+//! HTTP/HTTPS vhost 代理：按 Host/SNI 路由到对应代理，
+//! 把已读请求头连同剩余流一起桥接。
 
 use std::sync::Arc;
 
-use rfrp_common::config::ServerConfig;
 use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
@@ -20,7 +20,6 @@ use crate::server::ServerState;
 pub async fn run_http_vhost(
     listener: TcpListener,
     state: Arc<ServerState>,
-    _config: ServerConfig,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -55,30 +54,7 @@ async fn handle_http_connection(stream: TcpStream, state: Arc<ServerState>) -> R
         Some(x) => x,
         None => return Ok(()), // 客户端未发完整请求头
     };
-
-    let (session, proxy_name) = match find_proxy_by_domain(&state, &host) {
-        Some(x) => x,
-        None => {
-            tracing::warn!(host = %host, "no vhost proxy matched, closing");
-            return Ok(());
-        }
-    };
-
-    // 确认该代理确实是 HTTP 类型（HTTPS vhost 走独立监听）。
-    let is_http = session
-        .proxies
-        .lock()
-        .unwrap()
-        .get(&proxy_name)
-        .map(|e| e.kind == ProxyType::Http)
-        .unwrap_or(false);
-    if !is_http {
-        tracing::warn!(host = %host, proxy = %proxy_name, "proxy is not http type, closing");
-        return Ok(());
-    }
-
-    dispatch_user_connection(proxy_name, stream, session, state);
-    Ok(())
+    route_and_dispatch(host, ProxyType::Http, stream, state).await
 }
 
 /// HTTPS vhost accept 循环：TLS 终止后按 SNI/Host 路由。
@@ -86,7 +62,6 @@ pub async fn run_https_vhost(
     listener: TcpListener,
     tls: ServerTls,
     state: Arc<ServerState>,
-    _config: ServerConfig,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -142,8 +117,18 @@ where
         None => return Ok(()),
     };
     // SNI 优先；未提供 SNI 时回退到 Host 头。
-    let host = sni.unwrap_or(host);
+    route_and_dispatch(sni.unwrap_or(host), ProxyType::Https, stream, state).await
+}
 
+/// 按域名找到代理后做类型校验并分发用户连接。
+async fn route_and_dispatch(
+    host: String,
+    expected_kind: ProxyType,
+    stream: BoxedStream,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    // 域名大小写不敏感，统一小写后路由。
+    let host = host.to_lowercase();
     let (session, proxy_name) = match find_proxy_by_domain(&state, &host) {
         Some(x) => x,
         None => {
@@ -152,16 +137,15 @@ where
         }
     };
 
-    // 确认该代理确实是 HTTPS 类型。
-    let is_https = session
+    let kind_ok = session
         .proxies
         .lock()
         .unwrap()
         .get(&proxy_name)
-        .map(|e| e.kind == ProxyType::Https)
+        .map(|e| e.kind == expected_kind)
         .unwrap_or(false);
-    if !is_https {
-        tracing::warn!(host = %host, proxy = %proxy_name, "proxy is not https type, closing");
+    if !kind_ok {
+        tracing::warn!(host = %host, proxy = %proxy_name, "proxy type mismatch, closing");
         return Ok(());
     }
 
@@ -227,4 +211,58 @@ fn find_proxy_by_domain(state: &ServerState, host: &str) -> Option<(Arc<Session>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::ServerState;
+    use tokio::sync::mpsc;
+
+    fn test_session(domains: &[&str]) -> Arc<Session> {
+        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
+        let session = Arc::new(Session {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            tx,
+            proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            pools: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        {
+            let mut map = session.proxy_domains.lock().unwrap();
+            for d in domains {
+                map.insert(d.to_string(), "web".to_string());
+            }
+        }
+        session
+    }
+
+    fn test_state() -> Arc<ServerState> {
+        ServerState::new()
+    }
+
+    #[test]
+    fn strip_port_handles_variants() {
+        assert_eq!(strip_port("dev.example.com"), "dev.example.com");
+        assert_eq!(strip_port("dev.example.com:8080"), "dev.example.com");
+        assert_eq!(strip_port("[::1]:8080"), "[::1]:8080");
+    }
+
+    #[test]
+    fn find_proxy_by_domain_finds_and_skips() {
+        let state = test_state();
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert("s1".into(), test_session(&["dev.example.com"]));
+            sessions.insert("s2".into(), test_session(&["other.example.com"]));
+        }
+
+        let hit = find_proxy_by_domain(&state, "dev.example.com");
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().1, "web");
+
+        assert!(find_proxy_by_domain(&state, "missing.example.com").is_none());
+    }
 }

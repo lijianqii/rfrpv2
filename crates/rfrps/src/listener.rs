@@ -392,16 +392,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_rejects_https_proxy() {
-        // 当前仅 TCP：Https 类型也应被拒（与 Udp 同属 `!= Tcp` 分支）。
+    async fn register_rejects_udp_proxy() {
+        // UDP 尚未实现：应被拒。
         let state = ServerState::new();
         let session = test_session();
         let cfg = test_config("");
         let np = NewProxy {
             proxy_name: "p".into(),
-            r#type: ProxyType::Https,
+            r#type: ProxyType::Udp,
             remote_port: Some(18080),
-            custom_domains: Some(vec!["a.example.com".into()]),
+            custom_domains: None,
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_http_proxy_registers_domains() {
+        let state = ServerState::new();
+        let session = test_session();
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "web".into(),
+            r#type: ProxyType::Http,
+            remote_port: None,
+            custom_domains: Some(vec!["dev.example.com".into()]),
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+        assert_eq!(
+            session
+                .proxy_domains
+                .lock()
+                .unwrap()
+                .get("dev.example.com")
+                .map(|s| s.as_str()),
+            Some("web")
+        );
+        let proxies = session.proxies.lock().unwrap();
+        let entry = proxies.get("web").unwrap();
+        assert_eq!(entry.kind, ProxyType::Http);
+    }
+
+    #[tokio::test]
+    async fn register_https_proxy_registers_domains() {
+        let state = ServerState::new();
+        let session = test_session();
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "web".into(),
+            r#type: ProxyType::Https,
+            remote_port: None,
+            custom_domains: Some(vec!["secure.example.com".into()]),
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+        let proxies = session.proxies.lock().unwrap();
+        let entry = proxies.get("web").unwrap();
+        assert_eq!(entry.kind, ProxyType::Https);
+    }
+
+    #[tokio::test]
+    async fn register_vhost_without_domains_rejected() {
+        let state = ServerState::new();
+        let session = test_session();
+        let cfg = test_config("");
+        let np = NewProxy {
+            proxy_name: "web".into(),
+            r#type: ProxyType::Http,
+            remote_port: None,
+            custom_domains: None,
         };
         assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
     }

@@ -333,6 +333,25 @@ mod tests {
     }
 
     #[test]
+    fn vhost_cert_file_missing_rejected() {
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            proxy: ProxySection {
+                vhost_https_port: Some(443),
+                vhost_tls_cert: Some("./definitely-missing-vhost-cert.pem".into()),
+                vhost_tls_key: Some("./definitely-missing-vhost-key.pem".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn empty_token_rejected() {
         let cfg = ServerConfig {
             server: ServerSection {

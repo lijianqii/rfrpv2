@@ -67,3 +67,20 @@ impl AsyncWrite for PrependStream {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn prepend_stream_serves_buffer_then_inner() {
+        let (mut inner_w, inner_r) = duplex(64);
+        inner_w.write_all(b"world").await.unwrap();
+
+        let mut s = PrependStream::new(b"hello ".to_vec(), Box::new(inner_r));
+        let mut buf = [0u8; 11];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello world");
+    }
+}

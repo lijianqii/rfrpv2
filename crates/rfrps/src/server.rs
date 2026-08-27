@@ -189,19 +189,17 @@ impl Server {
         // HTTP vhost 监听循环（可选）。
         if let Some(listener) = vhost_http {
             let state = self.state.clone();
-            let config = self.config.clone();
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
-                crate::vhost::run_http_vhost(listener, state, config, shutdown).await;
+                crate::vhost::run_http_vhost(listener, state, shutdown).await;
             });
         }
         // HTTPS vhost 监听循环（可选）。
         if let Some((listener, tls)) = vhost_https {
             let state = self.state.clone();
-            let config = self.config.clone();
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
-                crate::vhost::run_https_vhost(listener, tls, state, config, shutdown).await;
+                crate::vhost::run_https_vhost(listener, tls, state, shutdown).await;
             });
         }
         loop {
