@@ -4,7 +4,9 @@
 //! 当前仅实现 TCP 代理；TLS 与 token 鉴权已在 M3 完成，UDP/HTTP/HTTPS 在 M4 扩展。
 
 pub mod control;
+pub mod dashboard;
 pub mod listener;
+pub mod metrics;
 pub mod server;
 pub mod udp;
 pub mod vhost;

@@ -23,6 +23,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::control;
+use crate::metrics::Metrics;
 use crate::work;
 
 /// 一条等待工作连接到达的「待处理」项。工作连接到达后取出 `user` 与之桥接。
@@ -43,6 +44,8 @@ pub struct ServerState {
     pub sessions: Mutex<HashMap<String, Arc<crate::control::Session>>>,
     /// UDP 代理运行状态（proxy_name -> UdpProxy）。
     pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
+    /// 运行指标（连接数/流量）。
+    pub metrics: Arc<Metrics>,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -54,6 +57,7 @@ impl ServerState {
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
+            metrics: Arc::new(Metrics::new()),
             shutdown: CancellationToken::new(),
         })
     }
@@ -106,6 +110,8 @@ pub struct Server {
     vhost_http: Option<TcpListener>,
     /// HTTPS vhost 监听 + TLS acceptor（可选）。
     vhost_https: Option<(TcpListener, ServerTls)>,
+    /// Dashboard 监听（可选）。
+    dashboard: Option<TcpListener>,
 }
 
 impl Server {
@@ -115,6 +121,15 @@ impl Server {
         let vhost_http = match config.proxy.vhost_http_port {
             Some(port) => {
                 let addr = (config.server.bind_addr.as_str(), port);
+                Some(TcpListener::bind(addr).await?)
+            }
+            None => None,
+        };
+        let dashboard = match &config.dashboard {
+            Some(d) => {
+                let addr: SocketAddr = d.addr.parse().map_err(|e| {
+                    rfrp_common::Error::Config(format!("invalid dashboard addr: {e}"))
+                })?;
                 Some(TcpListener::bind(addr).await?)
             }
             None => None,
@@ -159,6 +174,7 @@ impl Server {
             tls,
             vhost_http,
             vhost_https,
+            dashboard,
         })
     }
 
@@ -186,6 +202,8 @@ impl Server {
         let tls = self.tls.clone();
         let vhost_http = self.vhost_http;
         let vhost_https = self.vhost_https;
+        let dashboard = self.dashboard;
+        let dashboard_cfg = self.config.dashboard.clone();
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
@@ -195,6 +213,14 @@ impl Server {
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
                 crate::vhost::run_http_vhost(listener, state, shutdown).await;
+            });
+        }
+        // Dashboard 监听循环（可选）。
+        if let (Some(listener), Some(cfg)) = (dashboard, dashboard_cfg) {
+            let state = self.state.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move {
+                crate::dashboard::run_dashboard(listener, cfg, state, shutdown).await;
             });
         }
         // HTTPS vhost 监听循环（可选）。

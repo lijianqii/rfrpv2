@@ -34,6 +34,7 @@ rustls-pemfile = "2"
 webpki-roots = "0.26"
 socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

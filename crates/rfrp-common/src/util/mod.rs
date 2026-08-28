@@ -1,5 +1,6 @@
 //! 通用工具模块。
 pub mod bridge;
+pub mod counting;
 pub mod platform;
 pub mod signal;
 pub mod stream;

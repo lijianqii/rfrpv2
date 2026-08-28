@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
+use rfrp_common::util::counting::CountingStream;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
 use rfrp_common::{constants::*, error::Result};
@@ -171,6 +172,21 @@ pub(crate) fn dispatch_user_connection(
     session: Arc<Session>,
     state: Arc<ServerState>,
 ) {
+    // 统计连接与流量（M5）。
+    let metrics = state.metrics.clone();
+    metrics
+        .total_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .active_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let user = Box::new(CountingStream::new(
+        user,
+        metrics.bytes_up.clone(),
+        metrics.bytes_down.clone(),
+        metrics.active_connections.clone(),
+    ));
+
     // 优先命中预热池（§8.2）。
     let pooled = {
         let mut pools = session.pools.lock().unwrap();
