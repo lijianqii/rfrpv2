@@ -421,3 +421,35 @@ async fn http_vhost_recovers_after_client_reconnect() {
     cli2.abort();
     let _ = std::fs::remove_file(run_id_file);
 }
+
+#[tokio::test]
+async fn https_vhost_sni_mismatch_falls_back_to_host() {
+    let local_port = spawn_http_local().await;
+    let vhost_port = free_port();
+    let (srv, _addr, cli) = start_vhost_stack(
+        None,
+        Some(vhost_port),
+        web_proxy(ProxyType::Https, local_port, 0),
+    )
+    .await;
+
+    // SNI 用 localhost（证书合法但无代理注册），Host 头用 dev.example.com，
+    // 服务端应回退到 Host 路由。
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cert = base.join("../../examples/vhost-cert.pem");
+    let section = rfrp_common::config::ClientSection {
+        tls_server_name: Some("localhost".into()),
+        tls_ca: Some(cert.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let tls = ClientTls::new(&section).unwrap();
+
+    let resp = wait_vhost_response(vhost_port, "dev.example.com", Some(&tls)).await;
+    assert!(
+        resp.contains("200 OK"),
+        "sni fallback to host failed: {resp}"
+    );
+
+    srv.abort();
+    cli.abort();
+}

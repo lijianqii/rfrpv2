@@ -1,6 +1,9 @@
 //! Dashboard：Basic Auth + 状态 API + Prometheus 指标。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rfrp_common::auth::verify_token;
@@ -19,6 +22,7 @@ pub async fn run_dashboard(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
+    let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -27,8 +31,9 @@ pub async fn run_dashboard(
                         tracing::debug!(%peer, "dashboard connection");
                         let cfg = cfg.clone();
                         let state = state.clone();
+                        let limiter = limiter.clone();
                         tokio::spawn(async move {
-                            let _ = handle_request(stream, &cfg, &state).await;
+                            let _ = handle_request(stream, &cfg, &state, &limiter, peer).await;
                         });
                     }
                     Err(e) => {
@@ -49,7 +54,12 @@ async fn handle_request(
     mut stream: TcpStream,
     cfg: &DashboardSection,
     state: &Arc<ServerState>,
+    limiter: &RateLimiter,
+    peer: SocketAddr,
 ) -> std::io::Result<()> {
+    if !limiter.allow(peer, Instant::now()) {
+        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
+    }
     let head = match read_request_head(&mut stream).await? {
         Some(h) => h,
         None => return Ok(()),
@@ -253,4 +263,66 @@ async fn write_response(
     resp.push_str("Connection: close\r\n\r\n");
     resp.push_str(body);
     stream.write_all(resp.as_bytes()).await
+}
+
+/// 简单的每 IP 请求限频（滑动窗口计数）。
+struct RateLimiter {
+    inner: Mutex<HashMap<SocketAddr, (u32, Instant)>>,
+    max: u32,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(max: u32, window: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max,
+            window,
+        }
+    }
+
+    fn allow(&self, ip: SocketAddr, now: Instant) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        if let Some((count, start)) = m.get_mut(&ip) {
+            if now.duration_since(*start) >= self.window {
+                *count = 1;
+                *start = now;
+                true
+            } else if *count < self.max {
+                *count += 1;
+                true
+            } else {
+                false
+            }
+        } else {
+            m.insert(ip, (1, now));
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_blocks_after_limit_and_resets() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let now = Instant::now();
+        assert!(limiter.allow(ip, now));
+        assert!(limiter.allow(ip, now));
+        assert!(limiter.allow(ip, now));
+        assert!(
+            !limiter.allow(ip, now),
+            "4th request in window should be blocked"
+        );
+
+        // 窗口过后重置。
+        assert!(limiter.allow(ip, now + Duration::from_secs(61)));
+
+        // 不同 IP 不受影响。
+        let other: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        assert!(limiter.allow(other, now));
+    }
 }

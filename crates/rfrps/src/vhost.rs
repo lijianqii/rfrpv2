@@ -116,8 +116,12 @@ where
         Some(x) => x,
         None => return Ok(()),
     };
-    // SNI 优先；未提供 SNI 时回退到 Host 头。
-    route_and_dispatch(sni.unwrap_or(host), ProxyType::Https, stream, state).await
+    // SNI 优先（仅当 SNI 能命中代理时使用），否则回退到 Host 头。
+    let host = match &sni {
+        Some(s) if find_proxy_by_domain(&state, s).is_some() => s.clone(),
+        _ => host,
+    };
+    route_and_dispatch(host, ProxyType::Https, stream, state).await
 }
 
 /// 按域名找到代理后做类型校验并分发用户连接。

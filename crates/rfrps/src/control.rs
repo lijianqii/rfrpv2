@@ -14,7 +14,10 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::ServerConfig;
-use rfrp_common::constants::PROTOCOL_VERSION;
+use rfrp_common::constants::{
+    MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, MAX_PROXY_NAME_LEN, MAX_RUN_ID_LEN, MAX_TOKEN_LEN,
+    PROTOCOL_VERSION,
+};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
@@ -92,6 +95,27 @@ where
             .await;
         return Ok(());
     }
+    // 字段上限校验（DESIGN §6.2.3）：run_id 必须是 UUID，token 长度受限。
+    if uuid::Uuid::parse_str(&run_id).is_err()
+        || run_id.len() > MAX_RUN_ID_LEN
+        || token.len() > MAX_TOKEN_LEN
+    {
+        tracing::warn!(run_id = %run_id, "login rejected: invalid fields");
+        let mut w = FramedWrite::new(stream, FrameCodec);
+        let _ = w
+            .send(
+                Message::LoginResp(LoginResp {
+                    ok: false,
+                    error: None,
+                    session_id: None,
+                    work_conn_tls: None,
+                })
+                .to_frame()?,
+            )
+            .await;
+        return Ok(());
+    }
+
     // M3：token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
         tracing::warn!(run_id = %run_id, "login rejected: token mismatch");
@@ -139,11 +163,24 @@ where
     // 写任务：消费出站控制消息；服务端退出或会话被替换时尽量发送 TLS close_notify。
     let shutdown_writer = state.shutdown.clone();
     let stop_writer = session.stop.clone();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(msg) = msg else {
+                        // 通道关闭且处于退出流程：补发 Close 再 close_notify。
+                        if shutdown_writer.is_cancelled() {
+                            if let Ok(frame) = Message::Close(Close {
+                                reason: Some("server shutdown".into()),
+                            })
+                            .to_frame()
+                            {
+                                let _ = writer.send(frame).await;
+                            }
+                            let _ = writer.get_mut().shutdown().await;
+                        }
+                        break;
+                    };
                     match msg.to_frame() {
                         Ok(frame) => {
                             if let Err(e) = writer.send(frame).await {
@@ -158,10 +195,25 @@ where
                     }
                 }
                 _ = shutdown_writer.cancelled() => {
+                    // 服务端退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
+                    if let Ok(frame) = Message::Close(Close {
+                        reason: Some("server shutdown".into()),
+                    })
+                    .to_frame()
+                    {
+                        let _ = writer.send(frame).await;
+                    }
                     let _ = writer.get_mut().shutdown().await;
                     break;
                 }
                 _ = stop_writer.notified() => {
+                    if let Ok(frame) = Message::Close(Close {
+                        reason: Some("session replaced".into()),
+                    })
+                    .to_frame()
+                    {
+                        let _ = writer.send(frame).await;
+                    }
                     let _ = writer.get_mut().shutdown().await;
                     break;
                 }
@@ -224,6 +276,17 @@ where
                         match msg {
                             Message::NewProxy(np) => {
                                 tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "received NewProxy");
+                                if let Some(err) = new_proxy_invalid(&np) {
+                                    tracing::warn!(proxy = %np.proxy_name, error = err, "NewProxy rejected");
+                                    tx.send(Message::NewProxyResp(NewProxyResp {
+                                        proxy_name: np.proxy_name,
+                                        ok: false,
+                                        error: Some(err.into()),
+                                    }))
+                                    .await
+                                    .ok();
+                                    continue;
+                                }
                                 let result = listener::register_proxy(&np, &session, &state, &config).await;
                                 let (ok, error) = match result {
                                     Ok(()) => (true, None),
@@ -276,7 +339,12 @@ where
     }
 
     heartbeat_task.abort();
-    writer_task.abort();
+    // 给写任务机会刷出 Close 帧，超时再强杀。
+    drop(tx);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task).await;
+    if done.is_err() {
+        writer_task.abort();
+    }
     // 从会话注册表移除自身（仅当仍是当前条目，避免误删重连后的新会话）。
     {
         let mut reg = state.sessions.lock().unwrap();
@@ -288,6 +356,28 @@ where
     }
     cleanup(&session, &state);
     Ok(())
+}
+
+/// NewProxy 字段校验（DESIGN §6.2.3），返回错误标识或 None。
+fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
+    if np.proxy_name.is_empty()
+        || np.proxy_name.len() > MAX_PROXY_NAME_LEN
+        || np.proxy_name.contains('/')
+        || np.proxy_name.chars().any(|c| c.is_whitespace())
+    {
+        return Some("invalid field");
+    }
+    if let Some(doms) = &np.custom_domains {
+        if doms.len() > MAX_CUSTOM_DOMAINS {
+            return Some("invalid field");
+        }
+        for d in doms {
+            if d.is_empty() || d.len() > MAX_DOMAIN_LEN {
+                return Some("invalid field");
+            }
+        }
+    }
+    None
 }
 
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
@@ -344,8 +434,14 @@ mod tests {
     }
 
     fn login_frame(run_id: &str) -> Frame {
+        // 用确定性 UUID（由 run_id 字节派生）保证同名 run_id 稳定，同时满足服务端 UUID 校验。
+        let mut b = [0u8; 16];
+        for (i, byte) in run_id.as_bytes().iter().take(16).enumerate() {
+            b[i] = *byte;
+        }
+        let rid = uuid::Uuid::from_bytes(b).to_string();
         Message::Login(Login {
-            run_id: run_id.into(),
+            run_id: rid,
             token: String::new(),
             version: PROTOCOL_VERSION,
         })
@@ -386,6 +482,7 @@ mod tests {
                 sessions: Mutex::new(HashMap::new()),
                 pending_by_id: Mutex::new(HashMap::new()),
                 pending_client: Mutex::new(HashMap::new()),
+                metrics: Arc::new(crate::metrics::Metrics::new()),
             }),
         );
         state
@@ -653,7 +750,7 @@ mod tests {
             other => panic!("expected LoginResp, got {other:?}"),
         }
         task.await.unwrap().unwrap();
-        assert!(!state.sessions.lock().unwrap().contains_key("rAuth"));
+        assert!(state.sessions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -678,6 +775,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!task.is_finished());
         shutdown.cancel();
+        // 服务端退出应发送 Close 帧（DESIGN §6.2.2）。
+        let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut cr))
+            .await
+            .expect("server should send Close before shutdown");
+        assert!(matches!(msg, Message::Close(_)));
         let r = tokio::time::timeout(Duration::from_secs(3), task).await;
         assert!(r.is_ok(), "control loop must exit on shutdown token");
         r.unwrap().unwrap().unwrap();
@@ -707,7 +809,7 @@ mod tests {
             }
             other => panic!("expected LoginResp, got {other:?}"),
         }
-        assert!(state.sessions.lock().unwrap().contains_key("rOk"));
+        assert_eq!(state.sessions.lock().unwrap().len(), 1);
         send_msg(&mut cw, Message::Close(Close { reason: None })).await;
         task.await.unwrap().unwrap();
     }
@@ -839,5 +941,111 @@ mod tests {
         let r = tokio::time::timeout(Duration::from_secs(3), task).await;
         assert!(r.is_ok(), "control loop must break on EOF");
         r.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_invalid_run_id_rejected() {
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let bad = Message::Login(Login {
+            run_id: "not-a-uuid".into(),
+            token: String::new(),
+            version: PROTOCOL_VERSION,
+        })
+        .to_frame()
+        .unwrap();
+        let task = tokio::spawn(handle_control_login(
+            bad,
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, _cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        match recv_msg(&mut cr).await {
+            Message::LoginResp(r) => {
+                assert!(!r.ok);
+                assert!(r.error.is_none());
+            }
+            other => panic!("expected LoginResp, got {other:?}"),
+        }
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_oversize_token_rejected() {
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let bad = Message::Login(Login {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            token: "x".repeat(MAX_TOKEN_LEN + 1),
+            version: PROTOCOL_VERSION,
+        })
+        .to_frame()
+        .unwrap();
+        let task = tokio::spawn(handle_control_login(
+            bad,
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, _cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        match recv_msg(&mut cr).await {
+            Message::LoginResp(r) => assert!(!r.ok),
+            other => panic!("expected LoginResp, got {other:?}"),
+        }
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn newproxy_invalid_name_rejected() {
+        let (server_end, client_end) = duplex(8192);
+        let state = ServerState::new();
+        let config = ServerConfig::default();
+        let login = Message::Login(Login {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            token: String::new(),
+            version: PROTOCOL_VERSION,
+        })
+        .to_frame()
+        .unwrap();
+        let task = tokio::spawn(handle_control_login(
+            login,
+            server_end,
+            state,
+            config,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let (cr, cw) = split(client_end);
+        let mut cr = FramedRead::new(cr, FrameCodec);
+        let mut cw = FramedWrite::new(cw, FrameCodec);
+        assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+        send_msg(
+            &mut cw,
+            Message::NewProxy(NewProxy {
+                proxy_name: "bad/name".into(),
+                r#type: ProxyType::Tcp,
+                remote_port: Some(6000),
+                custom_domains: None,
+            }),
+        )
+        .await;
+        match recv_msg(&mut cr).await {
+            Message::NewProxyResp(r) => {
+                assert!(!r.ok);
+                assert_eq!(r.error.as_deref(), Some("invalid field"));
+            }
+            other => panic!("expected NewProxyResp, got {other:?}"),
+        }
+        send_msg(&mut cw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
     }
 }

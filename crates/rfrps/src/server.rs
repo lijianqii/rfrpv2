@@ -9,6 +9,7 @@ use std::time::Duration;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+    MAX_ACTIVE_CONNECTIONS,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::Result;
@@ -238,6 +239,12 @@ impl Server {
                         Ok((stream, peer)) => {
                             if let Err(e) = configure_tcp_stream(&stream) {
                                 tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
+                            }
+                            // 并发连接数兜底（防 DoS）。
+                            let active = self.state.metrics.active_connections.load(Ordering::Relaxed);
+                            if active >= MAX_ACTIVE_CONNECTIONS {
+                                tracing::warn!(%peer, active, "too many active connections, rejecting");
+                                continue;
                             }
                             let state = self.state.clone();
                             let config = self.config.clone();

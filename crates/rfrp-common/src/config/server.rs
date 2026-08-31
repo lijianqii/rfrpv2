@@ -216,6 +216,28 @@ impl ServerConfig {
         }
         if let Some(d) = &self.dashboard {
             d.validate()?;
+            let daddr: SocketAddr = d
+                .addr
+                .parse()
+                .map_err(|e| config(format!("invalid dashboard addr '{}': {e}", d.addr)))?;
+            let dport = daddr.port();
+            if dport == self.server.bind_port {
+                return Err(config("dashboard addr port must not equal bind_port"));
+            }
+            if self.proxy.vhost_http_port == Some(dport) {
+                return Err(config("dashboard addr port must not equal vhost_http_port"));
+            }
+            if self.proxy.vhost_https_port == Some(dport) {
+                return Err(config(
+                    "dashboard addr port must not equal vhost_https_port",
+                ));
+            }
+            if daddr.ip().is_unspecified() {
+                tracing::warn!(
+                    addr = %d.addr,
+                    "dashboard bound to a non-loopback address; Basic Auth is plaintext, restrict access"
+                );
+            }
         }
         Ok(())
     }
@@ -351,6 +373,42 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    #[test]
+    fn dashboard_port_conflict_rejected() {
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                bind_port: 7000,
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            dashboard: Some(DashboardSection {
+                addr: "127.0.0.1:7000".into(),
+                user: "admin".into(),
+                password: "secret123".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn dashboard_nonloopback_valid_but_warns() {
+        let cfg = ServerConfig {
+            server: ServerSection {
+                token: "x".into(),
+                work_conn_tls: false,
+                ..Default::default()
+            },
+            dashboard: Some(DashboardSection {
+                addr: "0.0.0.0:7500".into(),
+                user: "admin".into(),
+                password: "secret123".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
     #[test]
     fn empty_token_rejected() {
         let cfg = ServerConfig {

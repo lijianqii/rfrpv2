@@ -37,6 +37,7 @@ pub struct UdpProxy {
     pub sessions: Mutex<HashMap<SocketAddr, UdpSession>>,
     pub pending_by_id: Mutex<HashMap<u64, PendingUdp>>,
     pub pending_client: Mutex<HashMap<SocketAddr, u64>>,
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// 注册 UDP 代理：绑定 UDP socket 并启动监听循环。
@@ -55,6 +56,7 @@ pub async fn register_udp_proxy(
         sessions: Mutex::new(HashMap::new()),
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
+        metrics: state.metrics.clone(),
     });
     state
         .udp
@@ -123,6 +125,10 @@ async fn handle_datagram(
         }
     };
     if let Some(tx) = tx {
+        proxy
+            .metrics
+            .bytes_up
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let _ = tx.send(data.to_vec()).await;
         return;
     }
@@ -148,6 +154,10 @@ async fn handle_datagram(
     // 避免工作连接建立期间丢包（DESIGN §8.6）。
     let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
     let work_id = state.next_work_id();
+    proxy
+        .metrics
+        .bytes_up
+        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let _ = tx.send(data.to_vec()).await;
     proxy.pending_by_id.lock().unwrap().insert(
         work_id,
@@ -233,6 +243,7 @@ pub async fn handle_udp_work_conn(
             data = rx.recv() => {
                 match data {
                     Some(d) => {
+                        touch_session(&proxy, pending.client);
                         if let Err(e) = write_udp_frame(&mut stream, &d).await {
                             tracing::warn!(work_id, error = %e, "udp write frame error");
                             break;
@@ -244,6 +255,11 @@ pub async fn handle_udp_work_conn(
             r = read_udp_frame(&mut stream) => {
                 match r {
                     Ok(Some(d)) => {
+                        touch_session(&proxy, pending.client);
+                        proxy
+                            .metrics
+                            .bytes_down
+                            .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = proxy.socket.send_to(&d, pending.client).await {
                             tracing::warn!(work_id, error = %e, "udp send_to client error");
                         }
@@ -261,6 +277,13 @@ pub async fn handle_udp_work_conn(
     proxy.sessions.lock().unwrap().remove(&pending.client);
     tracing::debug!(client = %pending.client, work_id, "udp work connection closed");
     Ok(())
+}
+
+/// 更新 UDP 会话的最后活跃时间（双向流量都算活跃）。
+fn touch_session(proxy: &Arc<UdpProxy>, client: SocketAddr) {
+    if let Some(s) = proxy.sessions.lock().unwrap().get_mut(&client) {
+        s.last_active = Instant::now();
+    }
 }
 
 /// 判断代理是否为 UDP 类型。

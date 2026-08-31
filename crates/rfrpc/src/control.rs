@@ -35,11 +35,24 @@ where
     // 写任务：消费出站控制消息；收到退出信号时尽量发送 TLS close_notify。
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
     let shutdown_writer = shutdown.clone();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 msg = out_rx.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(msg) = msg else {
+                        // 通道关闭且处于退出流程：补发 Close 再 close_notify。
+                        if shutdown_writer.is_cancelled() {
+                            if let Ok(frame) = Message::Close(Close {
+                                reason: Some("client shutdown".into()),
+                            })
+                            .to_frame()
+                            {
+                                let _ = writer.send(frame).await;
+                            }
+                            let _ = writer.get_mut().shutdown().await;
+                        }
+                        break;
+                    };
                     match msg.to_frame() {
                         Ok(frame) => {
                             if let Err(e) = writer.send(frame).await {
@@ -54,6 +67,14 @@ where
                     }
                 }
                 _ = shutdown_writer.cancelled() => {
+                    // 优雅退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
+                    if let Ok(frame) = Message::Close(Close {
+                        reason: Some("client shutdown".into()),
+                    })
+                    .to_frame()
+                    {
+                        let _ = writer.send(frame).await;
+                    }
                     let _ = writer.get_mut().shutdown().await;
                     break;
                 }
@@ -129,7 +150,12 @@ where
         }
     }
 
-    writer_task.abort();
+    // 给写任务机会刷出 Close 帧，超时再强杀。
+    drop(out_tx);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task).await;
+    if done.is_err() {
+        writer_task.abort();
+    }
     Ok(())
 }
 
@@ -303,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn control_loop_exits_on_shutdown() {
         // 退出令牌被取消时，控制循环应立即退出（§14.4）。
-        let (client_end, _server_end) = duplex(8192);
+        let (client_end, server_end) = duplex(8192);
         let (_tx, rx) = mpsc::channel::<Message>(64);
         let config = ClientConfig::default();
         let shutdown = CancellationToken::new();
@@ -318,6 +344,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!task.is_finished());
         shutdown.cancel();
+        // 优雅退出应发送 Close 帧（DESIGN §6.2.2）。
+        let (sr, _sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        // 先消费 Login 帧，再取消并读取 Close 帧。
+        let _ = recv_msg(&mut sr).await;
+        let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut sr))
+            .await
+            .expect("client should send Close before shutdown");
+        assert!(matches!(msg, Message::Close(_)));
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .unwrap()

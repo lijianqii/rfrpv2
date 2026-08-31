@@ -872,20 +872,20 @@ CLI 参数 > 配置文件 > 默认值。
 
 - [x] `rfrp server` 监听控制端口，接受多客户端登录
 - [x] Token 鉴权 + TLS 控制链路
-- [ ] TCP 代理：外部端口 → 本地 TCP 服务
-- [ ] UDP 代理：外部 UDP 端口 → 本地 UDP 服务
-- [ ] HTTP 代理：基于 Host 的 vhost 路由
-- [ ] HTTPS 代理：基于 SNI 的 vhost 路由，vhost 证书加载正确
-- [ ] 心跳保活 + 断线指数退避重连
-- [ ] 重连后 Proxy 恢复（run_id 复用，端口冲突按 6.6 处理）
-- [ ] 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充流程 work_id=0 语义，pool_size=0 纯按需模式），降低首包延迟
+- [x] TCP 代理：外部端口 → 本地 TCP 服务
+- [x] UDP 代理：外部 UDP 端口 → 本地 UDP 服务
+- [x] HTTP 代理：基于 Host 的 vhost 路由
+- [x] HTTPS 代理：基于 SNI 的 vhost 路由，vhost 证书加载正确
+- [x] 心跳保活 + 断线指数退避重连
+- [x] 重连后 Proxy 恢复（run_id 复用，端口冲突按 6.6 处理）
+- [x] 工作连接池预热（per-Proxy，pool_size 可配，池命中/补充流程 work_id=0 语义，pool_size=0 纯按需模式），降低首包延迟
 - [x] 优雅退出（信号触发资源回收，在途连接 30s 超时强制关闭，无端口泄漏）
 - [x] 工作连接 TLS（可配置，服务端优先）
-- [ ] Dashboard：客户端/代理列表、连接数、流量统计
+- [x] Dashboard：客户端/代理列表、连接数、流量统计
 - [x] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
 - [x] 配置文件 + CLI 参数双入口：CLI 参数覆盖配置同名字段，`-c` 与字段参数可组合（见 7.3、9.3）
-- [ ] 单二进制 CLI：`rfrp server` / `rfrp client`
-- [ ] Linux (gnu/musl) + Windows (MinGW-w64) 双平台构建与产物
+- [x] 单二进制 CLI：`rfrp server` / `rfrp client`
+- [x] Linux (gnu/musl) + Windows (MinGW-w64) 双平台构建与产物
 
 ---
 
@@ -1480,3 +1480,20 @@ M6 发布与打包已完成：
 - 已验证 `make release` 在 Debian 上成功产出三平台产物。
 
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。
+
+---
+
+### 17.20 工程审视补强
+
+对全工程审视后补齐的遗漏项：
+
+- **优雅退出发送 `Close` 帧**：客户端退出发 `Close{reason:"client shutdown"}`，服务端退出/会话替换发 `Close{reason:"server shutdown"/"session replaced"}`，随后 TLS close_notify（DESIGN §6.2.2）。
+- **服务端字段校验**：`run_id` 必须是 UUID、`token` ≤ 256 字节；`proxy_name` ≤ 64 字节且不含 `/` 与空白；`custom_domains` 数量/长度上限（DESIGN §6.2.3）。
+- **Dashboard 配置校验**：端口不得与 `bind_port` / vhost 端口冲突；绑定非回环地址输出安全警告；每 IP 请求限频（60s 窗口 100 次，429）。
+- **UDP 可观测修复**：会话活跃时间双向更新；UDP 流量计入 `bytes_up/bytes_down` 指标。
+- **HTTPS vhost SNI 回退**：SNI 无法命中代理时回退到 Host 头路由。
+- **性能基准**：`benches/forward.rs` 用 Criterion 填充（帧编解码吞吐、桥接吞吐、配置解析耗时）。
+- **连接数兜底**：服务端活跃连接数超过 `MAX_ACTIVE_CONNECTIONS` 时拒绝新连接（防 DoS）。
+- **DESIGN §11 验收清单**：全部已实现项标记完成。
+
+当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all`、`cargo bench --no-run` 均通过。

@@ -21,3 +21,6 @@ tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 socket2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }

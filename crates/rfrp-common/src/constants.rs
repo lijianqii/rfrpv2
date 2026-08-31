@@ -59,6 +59,9 @@ pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
 /// 单个 UDP 包最大字节数（IPv4 UDP payload 上限）。
 pub const MAX_UDP_PACKET_SIZE: usize = 65507;
 
+/// 服务端最大并发用户连接数（防 DoS 兜底）。
+pub const MAX_ACTIVE_CONNECTIONS: i64 = 65536;
+
 // ---- 字符串长度上限（字节）----
 
 pub const MAX_RUN_ID_LEN: usize = 64;
