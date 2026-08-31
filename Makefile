@@ -27,3 +27,13 @@ ci: fmt-check clippy build test
 
 clean:
 	cargo clean
+
+.PHONY: gen-cert release
+
+# 生成 examples 下的自签证书
+gen-cert:
+	./scripts/gen-self-signed-cert.sh
+
+# 交叉编译并打包三产物到 dist/
+release:
+	./scripts/release.sh

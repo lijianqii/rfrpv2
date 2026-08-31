@@ -24,6 +24,28 @@ cargo build --release
 make ci
 ```
 
+## 发布产物
+
+在 Debian 开发机上一条命令构建三平台产物：
+
+```bash
+make release
+```
+
+产物输出到 `dist/`：
+
+- Linux x86_64（glibc）`rfrp-<version>-x86_64-linux-gnu.tar.gz`
+- Linux x86_64（musl 静态）`rfrp-<version>-x86_64-linux-musl.tar.gz`
+- Windows x86_64 `rfrp-<version>-x86_64-windows-gnu.zip`
+
+同时生成 `SHA256SUMS`。
+
+生成自签证书：
+
+```bash
+make gen-cert
+```
+
 ## 快速启动
 
 示例配置已附带自签证书，可直接本地测试：

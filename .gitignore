@@ -15,3 +15,6 @@
 
 # pi agent session dir
 .pi/
+
+# Release artifacts
+/dist/

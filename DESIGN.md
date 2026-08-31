@@ -1133,7 +1133,7 @@ C:\rfrp\
 | M3 | 安全：TLS 控制链路 + 工作连接 TLS + token 鉴权 | ✅ **已完成** |
 | M4 | UDP / HTTP / HTTPS（vhost） | ⬜ 未开始 |
 | M5 | Dashboard 与可观测（指标/结构化日志） | ⬜ 未开始 |
-| M6 | 打磨与发布（交叉编译三产物/打包/文档） | ⬜ 未开始 |
+| M6 | 打磨与发布（交叉编译三产物/打包/文档） | ✅ **已完成** |
 
 ### 17.2 M0 交付物核对（对照 §12）
 
@@ -1462,3 +1462,21 @@ M3 主功能已完成，交付内容如下：
 - `debug`：高频排障信息（心跳、桥接、连接分类）
 
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、关键测试均通过。
+
+---
+
+### 17.19 M6 完成（发布与打包）
+
+M6 发布与打包已完成：
+
+- **发布脚本**：`scripts/release.sh` 一键构建并打包三平台产物：
+  - `x86_64-unknown-linux-gnu` → `tar.gz`
+  - `x86_64-unknown-linux-musl` → `tar.gz`
+  - `x86_64-pc-windows-gnu` → `zip`
+- **校验和**：产物目录生成 `SHA256SUMS`。
+- **自签证书脚本**：`scripts/gen-self-signed-cert.sh` 生成控制链路/工作连接与 vhost 证书。
+- **Makefile**：新增 `make release` / `make gen-cert`。
+- **README**：补充发布产物与证书生成说明。
+- 已验证 `make release` 在 Debian 上成功产出三平台产物。
+
+当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all` 均通过。
