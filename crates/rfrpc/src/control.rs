@@ -446,4 +446,39 @@ mod tests {
         send_msg(&mut sw, Message::Close(Close { reason: None })).await;
         task.await.unwrap().unwrap();
     }
+
+    #[tokio::test]
+    async fn unknown_control_msg_ignored_keeps_loop_alive() {
+        // 客户端收到不认识的 StartWorkConn 等控制消息应忽略并保持循环存活。
+        let (client_end, server_end) = duplex(8192);
+        let (_tx, rx) = mpsc::channel::<Message>(64);
+        let config = ClientConfig::default();
+        let task = tokio::spawn(control_loop(
+            client_end,
+            rx,
+            default_state(),
+            config,
+            CancellationToken::new(),
+        ));
+        let (sr, sw) = split(server_end);
+        let mut sr = FramedRead::new(sr, FrameCodec);
+        let mut sw = FramedWrite::new(sw, FrameCodec);
+        let _ = recv_msg(&mut sr).await; // Login
+        send_msg(
+            &mut sw,
+            Message::StartWorkConn(StartWorkConn {
+                proxy_name: "p".into(),
+                work_id: 7,
+            }),
+        )
+        .await;
+        // 随后 Heartbeat 仍应得到回应，证明循环未退出。
+        send_msg(&mut sw, Message::Heartbeat(Heartbeat { ts: 3 })).await;
+        match recv_msg(&mut sr).await {
+            Message::HeartbeatResp(h) => assert_eq!(h.ts, 3),
+            other => panic!("expected HeartbeatResp, got {other:?}"),
+        }
+        send_msg(&mut sw, Message::Close(Close { reason: None })).await;
+        task.await.unwrap().unwrap();
+    }
 }

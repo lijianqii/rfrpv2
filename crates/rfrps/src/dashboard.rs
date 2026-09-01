@@ -327,3 +327,47 @@ mod tests {
         assert!(limiter.allow(other, now));
     }
 }
+
+#[cfg(test)]
+mod authorized_tests {
+    use super::*;
+    use rfrp_common::config::DashboardSection;
+
+    fn cfg() -> DashboardSection {
+        DashboardSection {
+            addr: "127.0.0.1:7500".into(),
+            user: "admin".into(),
+            password: "secret123".into(),
+        }
+    }
+
+    #[test]
+    fn authorized_accepts_valid_credentials() {
+        let auth = base64::engine::general_purpose::STANDARD.encode("admin:secret123");
+        let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
+        assert!(authorized(head.as_bytes(), &cfg()));
+    }
+
+    #[test]
+    fn authorized_rejects_wrong_credentials() {
+        let cfg = cfg();
+        let auth = base64::engine::general_purpose::STANDARD.encode("admin:wrongpass");
+        let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
+        assert!(!authorized(head.as_bytes(), &cfg));
+    }
+
+    #[test]
+    fn authorized_rejects_malformed() {
+        let cfg = cfg();
+        assert!(
+            !authorized(b"GET / HTTP/1.1\r\n\r\n", &cfg),
+            "no auth header"
+        );
+        let head = b"GET / HTTP/1.1\r\nAuthorization: Basic !!!\r\n\r\n";
+        assert!(!authorized(head, &cfg), "invalid base64");
+        // 缺少冒号
+        let auth = base64::engine::general_purpose::STANDARD.encode("adminsecret123");
+        let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
+        assert!(!authorized(head.as_bytes(), &cfg));
+    }
+}

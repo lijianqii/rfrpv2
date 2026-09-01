@@ -1499,3 +1499,5 @@ M6 发布与打包已完成：
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all`、`cargo bench --no-run` 均通过。
 
 > 后续补充的自动化测试：UDP 会话/待配对超时清理（可配置超时的单测）、UDP + 工作连接 TLS 集成、连接上限（`with_max_active`）集成、Dashboard 限频端到端 429。Windows 运行时冒烟仍为手动项。
+
+> 进一步补齐的测试条件：Dashboard Basic Auth 正确/错误/畸形凭据、`read_request_head` 半包/畸形返回 None、vhost 类型不匹配不误路由、客户端控制循环忽略未知控制消息。Windows 运行时冒烟仍为手动项。

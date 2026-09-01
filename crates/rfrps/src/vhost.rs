@@ -273,3 +273,66 @@ mod tests {
         assert!(find_proxy_by_domain(&state, "missing.example.com").is_none());
     }
 }
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+    use crate::control::ProxyEntry;
+    use crate::server::ServerState;
+    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn read_request_head_partial_eof_returns_none() {
+        let (mut a, b) = duplex(1024);
+        a.write_all(b"GET / HTTP/1.1\r\nHost: dev.example.com")
+            .await
+            .unwrap();
+        drop(a);
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_malformed_returns_none() {
+        let (mut a, b) = duplex(1024);
+        a.write_all(b"garbage\r\n\r\n").await.unwrap();
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn route_and_dispatch_type_mismatch_ok() {
+        // 会话里代理是 Tcp 类型，但 vhost 期望 Http：应返回 Ok 且不建立连接。
+        let state = ServerState::new();
+        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
+        let session = Arc::new(Session {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            tx,
+            proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
+            proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            pools: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        {
+            let mut m = session.proxy_domains.lock().unwrap();
+            m.insert("dev.example.com".into(), "web".into());
+        }
+        session.proxies.lock().unwrap().insert(
+            "web".into(),
+            ProxyEntry {
+                handle: tokio::spawn(async {}),
+                kind: ProxyType::Tcp,
+            },
+        );
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.insert("r".into(), session);
+        }
+
+        let (mut a, b) = duplex(1024);
+        a.write_all(b"x").await.unwrap();
+        let stream: BoxedStream = Box::new(b);
+        let r = route_and_dispatch("dev.example.com".into(), ProxyType::Http, stream, state).await;
+        assert!(r.is_ok(), "type mismatch should not error");
+    }
+}
