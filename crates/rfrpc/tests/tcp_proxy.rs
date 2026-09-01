@@ -7,6 +7,7 @@ use std::time::Duration;
 use common::*;
 use rfrp_common::config::ClientProxy;
 use rfrp_common::protocol::msg::ProxyType;
+use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -227,6 +228,53 @@ async fn first_user_connection_receives_pushed_data_from_local() {
     assert_eq!(&buf, b"BANNER\n");
 
     drop(user);
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn tcp_proxy_connection_cap_enforced() {
+    let echo_port = spawn_echo().await;
+    let server = Server::new(server_config(0))
+        .await
+        .unwrap()
+        .with_max_active(2);
+    let addr = server.local_addr();
+    let srv = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let remote = free_port();
+    let cli = start_client(client_config(
+        addr,
+        vec![tcp_proxy("p1", echo_port, remote)],
+        None,
+    ))
+    .await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
+
+    // 占用两个活跃连接。
+    let mut u1 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+    let mut u2 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+    let _ = &mut u1;
+    let _ = &mut u2;
+
+    // 第三个连接应被连接上限拒绝（立即关闭）。
+    let mut u3 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(2), u3.read(&mut buf))
+        .await
+        .expect("rejected connection should be closed");
+    match r {
+        Ok(0) => {}
+        Ok(_) => panic!("third connection should be rejected by connection cap"),
+        Err(_) => {} // RST 同样视为被拒绝
+    }
+
+    drop(u1);
+    drop(u2);
     srv.abort();
     cli.abort();
 }

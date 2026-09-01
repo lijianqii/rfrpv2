@@ -483,6 +483,8 @@ mod tests {
                 pending_by_id: Mutex::new(HashMap::new()),
                 pending_client: Mutex::new(HashMap::new()),
                 metrics: Arc::new(crate::metrics::Metrics::new()),
+                session_timeout: std::time::Duration::from_secs(60),
+                pending_timeout: std::time::Duration::from_secs(10),
             }),
         );
         state

@@ -57,13 +57,14 @@ async fn handle_request(
     limiter: &RateLimiter,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
-    if !limiter.allow(peer, Instant::now()) {
-        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
-    }
     let head = match read_request_head(&mut stream).await? {
         Some(h) => h,
         None => return Ok(()),
     };
+
+    if !limiter.allow(peer.ip(), Instant::now()) {
+        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
+    }
 
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -267,7 +268,7 @@ async fn write_response(
 
 /// 简单的每 IP 请求限频（滑动窗口计数）。
 struct RateLimiter {
-    inner: Mutex<HashMap<SocketAddr, (u32, Instant)>>,
+    inner: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,
     max: u32,
     window: Duration,
 }
@@ -281,7 +282,7 @@ impl RateLimiter {
         }
     }
 
-    fn allow(&self, ip: SocketAddr, now: Instant) -> bool {
+    fn allow(&self, ip: std::net::IpAddr, now: Instant) -> bool {
         let mut m = self.inner.lock().unwrap();
         if let Some((count, start)) = m.get_mut(&ip) {
             if now.duration_since(*start) >= self.window {
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn rate_limiter_blocks_after_limit_and_resets() {
         let limiter = RateLimiter::new(3, Duration::from_secs(60));
-        let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let now = Instant::now();
         assert!(limiter.allow(ip, now));
         assert!(limiter.allow(ip, now));
@@ -322,7 +323,7 @@ mod tests {
         assert!(limiter.allow(ip, now + Duration::from_secs(61)));
 
         // 不同 IP 不受影响。
-        let other: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
         assert!(limiter.allow(other, now));
     }
 }

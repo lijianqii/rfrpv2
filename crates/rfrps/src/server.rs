@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub struct ServerState {
     pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
     /// 运行指标（连接数/流量）。
     pub metrics: Arc<Metrics>,
+    /// 最大并发用户连接数（防 DoS 兜底，测试可调小）。
+    pub max_active: AtomicI64,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -59,6 +61,7 @@ impl ServerState {
             sessions: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
+            max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
             shutdown: CancellationToken::new(),
         })
     }
@@ -184,6 +187,12 @@ impl Server {
         self.listener.local_addr().unwrap()
     }
 
+    /// 覆盖最大并发用户连接数（主要用于测试）。
+    pub fn with_max_active(self, max: i64) -> Self {
+        self.state.max_active.store(max, Ordering::Relaxed);
+        self
+    }
+
     /// 覆盖优雅退出宽限期（主要用于测试）。
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
@@ -239,12 +248,6 @@ impl Server {
                         Ok((stream, peer)) => {
                             if let Err(e) = configure_tcp_stream(&stream) {
                                 tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
-                            }
-                            // 并发连接数兜底（防 DoS）。
-                            let active = self.state.metrics.active_connections.load(Ordering::Relaxed);
-                            if active >= MAX_ACTIVE_CONNECTIONS {
-                                tracing::warn!(%peer, active, "too many active connections, rejecting");
-                                continue;
                             }
                             let state = self.state.clone();
                             let config = self.config.clone();

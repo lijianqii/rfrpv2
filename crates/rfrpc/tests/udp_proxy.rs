@@ -127,3 +127,65 @@ async fn udp_proxy_multiple_clients() {
     srv.abort();
     cli.abort();
 }
+
+#[tokio::test]
+async fn udp_proxy_with_tls_work_conn() {
+    use rfrp_common::config::{
+        ClientConfig, ClientLogSection, ClientSection, LogSection, ProxySection, ServerConfig,
+        ServerSection,
+    };
+
+    let echo_port = spawn_udp_echo().await;
+    let remote = free_port();
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cert = base.join("../../examples/cert.pem");
+    let key = base.join("../../examples/key.pem");
+    let ca = base.join("../../examples/ca.pem");
+
+    let server_cfg = ServerConfig {
+        server: ServerSection {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            token: "".into(),
+            tls_enable: false,
+            tls_cert: Some(cert.to_string_lossy().to_string()),
+            tls_key: Some(key.to_string_lossy().to_string()),
+            work_conn_tls: true,
+        },
+        dashboard: None,
+        proxy: ProxySection {
+            allow_ports: String::new(),
+            vhost_http_port: None,
+            vhost_https_port: None,
+            vhost_tls_cert: None,
+            vhost_tls_key: None,
+        },
+        log: LogSection::default(),
+    };
+    let (srv, addr) = start_server(server_cfg).await;
+
+    let client_cfg = ClientConfig {
+        client: ClientSection {
+            server_addr: addr.ip().to_string(),
+            server_port: addr.port(),
+            token: "".into(),
+            tls_enable: false,
+            tls_server_name: Some("localhost".into()),
+            tls_ca: Some(ca.to_string_lossy().to_string()),
+            work_conn_tls: true,
+            run_id_file: None,
+        },
+        proxies: vec![udp_proxy(echo_port, remote)],
+        log: ClientLogSection::default(),
+    };
+    let cli = start_client(client_cfg).await;
+    wait_udp_ready(addr, remote).await;
+
+    assert!(
+        udp_echo(addr, remote, b"tls-udp").await,
+        "udp over TLS work conn failed"
+    );
+
+    srv.abort();
+    cli.abort();
+}

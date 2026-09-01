@@ -172,6 +172,16 @@ pub(crate) fn dispatch_user_connection(
     session: Arc<Session>,
     state: Arc<ServerState>,
 ) {
+    // 并发连接数兜底（防 DoS）。
+    let active = state
+        .metrics
+        .active_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if active >= state.max_active.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(%proxy_name, active, "too many active connections, rejecting");
+        return;
+    }
+
     // 统计连接与流量（M5）。
     let metrics = state.metrics.clone();
     metrics

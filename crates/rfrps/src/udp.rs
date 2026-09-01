@@ -38,6 +38,8 @@ pub struct UdpProxy {
     pub pending_by_id: Mutex<HashMap<u64, PendingUdp>>,
     pub pending_client: Mutex<HashMap<SocketAddr, u64>>,
     pub metrics: Arc<crate::metrics::Metrics>,
+    pub session_timeout: Duration,
+    pub pending_timeout: Duration,
 }
 
 /// 注册 UDP 代理：绑定 UDP socket 并启动监听循环。
@@ -57,6 +59,8 @@ pub async fn register_udp_proxy(
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
         metrics: state.metrics.clone(),
+        session_timeout: Duration::from_secs(UDP_SESSION_TIMEOUT),
+        pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
     });
     state
         .udp
@@ -187,17 +191,13 @@ async fn handle_datagram(
 fn sweep(proxy: &Arc<UdpProxy>) {
     let now = Instant::now();
     let mut sessions = proxy.sessions.lock().unwrap();
-    sessions.retain(|_, s| {
-        now.duration_since(s.last_active) < Duration::from_secs(UDP_SESSION_TIMEOUT)
-    });
+    sessions.retain(|_, s| now.duration_since(s.last_active) < proxy.session_timeout);
     drop(sessions);
 
     let mut pending = proxy.pending_by_id.lock().unwrap();
     let expired: Vec<u64> = pending
         .iter()
-        .filter(|(_, p)| {
-            now.duration_since(p.created) >= Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS)
-        })
+        .filter(|(_, p)| now.duration_since(p.created) >= proxy.pending_timeout)
         .map(|(id, _)| *id)
         .collect();
     for id in expired {
@@ -294,4 +294,75 @@ pub fn is_udp_proxy(state: &ServerState, proxy_name: &str) -> bool {
 /// 取 UDP 代理运行状态。
 pub fn get_udp_proxy(state: &ServerState, proxy_name: &str) -> Option<Arc<UdpProxy>> {
     state.udp.lock().unwrap().get(proxy_name).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::Metrics;
+
+    async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc<UdpProxy> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Arc::new(UdpProxy {
+            socket: Arc::new(socket),
+            sessions: Mutex::new(HashMap::new()),
+            pending_by_id: Mutex::new(HashMap::new()),
+            pending_client: Mutex::new(HashMap::new()),
+            metrics: Arc::new(Metrics::new()),
+            session_timeout,
+            pending_timeout,
+        })
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_expired_session_and_pending() {
+        let proxy = test_proxy(Duration::from_millis(50), Duration::from_millis(50)).await;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let old = Instant::now() - Duration::from_secs(1);
+
+        proxy.sessions.lock().unwrap().insert(
+            "127.0.0.1:1".parse().unwrap(),
+            UdpSession {
+                tx: tx.clone(),
+                last_active: old,
+            },
+        );
+        proxy.pending_by_id.lock().unwrap().insert(
+            1,
+            PendingUdp {
+                client: "127.0.0.1:2".parse().unwrap(),
+                tx: tx.clone(),
+                rx: mpsc::channel(4).1,
+                created: old,
+            },
+        );
+        proxy
+            .pending_client
+            .lock()
+            .unwrap()
+            .insert("127.0.0.1:2".parse().unwrap(), 1);
+        // 新鲜会话应保留。
+        proxy.sessions.lock().unwrap().insert(
+            "127.0.0.1:3".parse().unwrap(),
+            UdpSession {
+                tx: tx.clone(),
+                last_active: Instant::now(),
+            },
+        );
+
+        sweep(&proxy);
+
+        assert!(!proxy
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&"127.0.0.1:1".parse().unwrap()));
+        assert!(proxy
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&"127.0.0.1:3".parse().unwrap()));
+        assert!(proxy.pending_by_id.lock().unwrap().is_empty());
+        assert!(proxy.pending_client.lock().unwrap().is_empty());
+    }
 }

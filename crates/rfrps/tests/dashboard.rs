@@ -116,3 +116,21 @@ async fn dashboard_metrics_and_page() {
 
     srv.abort();
 }
+
+#[tokio::test]
+async fn dashboard_rate_limits_excess_requests() {
+    let port = free_port();
+    let (srv, _addr) = start_server(port).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let auth = basic_auth("admin", "secret123");
+    let mut statuses = Vec::new();
+    for _ in 0..101 {
+        let (status, _) = http_get(port, "/api/status", Some(&auth)).await;
+        statuses.push(status);
+    }
+    assert_eq!(statuses[..100].iter().filter(|s| **s == 200).count(), 100);
+    assert_eq!(statuses[100], 429, "101st request should be rate limited");
+
+    srv.abort();
+}

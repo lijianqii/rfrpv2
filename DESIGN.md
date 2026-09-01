@@ -1497,3 +1497,5 @@ M6 发布与打包已完成：
 - **DESIGN §11 验收清单**：全部已实现项标记完成。
 
 当前 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all`、`cargo bench --no-run` 均通过。
+
+> 后续补充的自动化测试：UDP 会话/待配对超时清理（可配置超时的单测）、UDP + 工作连接 TLS 集成、连接上限（`with_max_active`）集成、Dashboard 限频端到端 429。Windows 运行时冒烟仍为手动项。
