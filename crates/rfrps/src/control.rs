@@ -21,9 +21,10 @@ use rfrp_common::constants::{
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::control::graceful_close;
 use rfrp_common::util::now_ms;
 use rfrp_common::util::stream::BoxedStream;
-use tokio::io::{split, AsyncWriteExt};
+use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -170,14 +171,7 @@ where
                     let Some(msg) = msg else {
                         // 通道关闭且处于退出流程：补发 Close 再 close_notify。
                         if shutdown_writer.is_cancelled() {
-                            if let Ok(frame) = Message::Close(Close {
-                                reason: Some("server shutdown".into()),
-                            })
-                            .to_frame()
-                            {
-                                let _ = writer.send(frame).await;
-                            }
-                            let _ = writer.get_mut().shutdown().await;
+                            graceful_close(&mut writer, "server shutdown").await;
                         }
                         break;
                     };
@@ -196,25 +190,11 @@ where
                 }
                 _ = shutdown_writer.cancelled() => {
                     // 服务端退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
-                    if let Ok(frame) = Message::Close(Close {
-                        reason: Some("server shutdown".into()),
-                    })
-                    .to_frame()
-                    {
-                        let _ = writer.send(frame).await;
-                    }
-                    let _ = writer.get_mut().shutdown().await;
+                    graceful_close(&mut writer, "server shutdown").await;
                     break;
                 }
                 _ = stop_writer.notified() => {
-                    if let Ok(frame) = Message::Close(Close {
-                        reason: Some("session replaced".into()),
-                    })
-                    .to_frame()
-                    {
-                        let _ = writer.send(frame).await;
-                    }
-                    let _ = writer.get_mut().shutdown().await;
+                    graceful_close(&mut writer, "session replaced").await;
                     break;
                 }
             }

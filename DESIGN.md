@@ -1501,3 +1501,5 @@ M6 发布与打包已完成：
 > 后续补充的自动化测试：UDP 会话/待配对超时清理（可配置超时的单测）、UDP + 工作连接 TLS 集成、连接上限（`with_max_active`）集成、Dashboard 限频端到端 429。Windows 运行时冒烟仍为手动项。
 
 > 进一步补齐的测试条件：Dashboard Basic Auth 正确/错误/畸形凭据、`read_request_head` 半包/畸形返回 None、vhost 类型不匹配不误路由、客户端控制循环忽略未知控制消息。Windows 运行时冒烟仍为手动项。
+
+> 又补齐：`render_metrics` 会话 gauge 断言、`wait_for_reconnect` 正常完成路径、明文控制连接被 TLS 服务端拒绝的集成验证；并把控制连接优雅关闭的 Close 发送抽取为公共 `util::control::graceful_close`，消除客户端/服务端重复。Windows 运行时冒烟仍为手动项。

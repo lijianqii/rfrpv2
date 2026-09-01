@@ -371,3 +371,36 @@ mod authorized_tests {
         assert!(!authorized(head.as_bytes(), &cfg));
     }
 }
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::control::Session;
+    use crate::server::ServerState;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::sync::{mpsc, Notify};
+
+    #[test]
+    fn render_metrics_includes_session_gauge() {
+        let state = ServerState::new();
+        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
+        let session = Arc::new(Session {
+            run_id: "r".into(),
+            session_id: "s".into(),
+            tx,
+            proxies: Mutex::new(HashMap::new()),
+            proxy_domains: Mutex::new(HashMap::new()),
+            stop: Arc::new(Notify::new()),
+            pools: Mutex::new(HashMap::new()),
+        });
+        state.sessions.lock().unwrap().insert("r".into(), session);
+
+        let text = render_metrics(&state);
+        assert!(
+            text.contains("rfrp_sessions 1"),
+            "expected 1 session: {text}"
+        );
+    }
+}

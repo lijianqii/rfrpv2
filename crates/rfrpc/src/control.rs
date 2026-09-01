@@ -11,7 +11,8 @@ use rfrp_common::constants::PROTOCOL_VERSION;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
-use tokio::io::{split, AsyncWriteExt};
+use rfrp_common::util::control::graceful_close;
+use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -42,14 +43,7 @@ where
                     let Some(msg) = msg else {
                         // 通道关闭且处于退出流程：补发 Close 再 close_notify。
                         if shutdown_writer.is_cancelled() {
-                            if let Ok(frame) = Message::Close(Close {
-                                reason: Some("client shutdown".into()),
-                            })
-                            .to_frame()
-                            {
-                                let _ = writer.send(frame).await;
-                            }
-                            let _ = writer.get_mut().shutdown().await;
+                            graceful_close(&mut writer, "client shutdown").await;
                         }
                         break;
                     };
@@ -68,14 +62,7 @@ where
                 }
                 _ = shutdown_writer.cancelled() => {
                     // 优雅退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
-                    if let Ok(frame) = Message::Close(Close {
-                        reason: Some("client shutdown".into()),
-                    })
-                    .to_frame()
-                    {
-                        let _ = writer.send(frame).await;
-                    }
-                    let _ = writer.get_mut().shutdown().await;
+                    graceful_close(&mut writer, "client shutdown").await;
                     break;
                 }
             }

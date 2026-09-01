@@ -12,6 +12,7 @@ use rfrp_common::config::{
     ServerConfig, ServerSection,
 };
 use rfrp_common::protocol::msg::ProxyType;
+use tokio::net::TcpStream;
 
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
@@ -198,6 +199,34 @@ async fn work_conn_tls_follows_server_preference() {
     );
 
     expect_echo(remote, addr, b"downgrade-ok").await;
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn plaintext_control_rejected_by_tls_server() {
+    init_logging();
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(true, true, "secret")).await;
+    let remote = free_port();
+    // 客户端未启用 TLS，直接连接配置了 TLS 的服务端：登录应被拒绝，代理不注册。
+    let cli = start_client(client_config(
+        addr,
+        false,
+        false,
+        "secret",
+        vec![tcp_proxy("ssh", echo_port, remote)],
+    ))
+    .await;
+
+    // 给客户端几次重连机会；代理端口不应有监听。
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let refused = TcpStream::connect((addr.ip(), remote)).await.is_err();
+    assert!(
+        refused,
+        "proxy should never be registered when control login is rejected"
+    );
 
     srv.abort();
     cli.abort();

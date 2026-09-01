@@ -455,6 +455,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_delay_completes_without_shutdown() {
+        // 未收到退出信号时，wait_for_reconnect 应等满退避并返回 true。
+        let shutdown = CancellationToken::new();
+        let ok = wait_for_reconnect(Duration::from_millis(10), &shutdown).await;
+        assert!(ok);
+    }
+    #[tokio::test]
     async fn reconnect_delay_is_interruptible_by_shutdown() {
         // 若退出信号落在退避 sleep 期间，wait_for_reconnect 应立即返回 false，
         // 避免客户端在 30s 退避期间无法及时退出（§8.3 / §14.4）。

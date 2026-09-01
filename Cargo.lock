@@ -719,6 +719,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "criterion",
+ "futures",
  "rustls",
  "rustls-pemfile",
  "serde",
