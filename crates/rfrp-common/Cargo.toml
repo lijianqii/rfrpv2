@@ -25,3 +25,7 @@ socket2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bench]]
+name = "forward"
+harness = false
