@@ -28,3 +28,49 @@ pub fn default_run_id_path() -> std::path::PathBuf {
     p.push("run_id");
     p
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_run_id_path_under_home_dot_rfrp() {
+        // HOME 存在（常见环境）：路径应为 ~/.rfrp/run_id（§6.2.1）。
+        if let Some(home) = home_dir() {
+            let p = default_run_id_path();
+            assert_eq!(p.parent().unwrap().parent().unwrap(), home.as_path());
+            assert_eq!(p.file_name().unwrap(), "run_id");
+            assert_eq!(p.parent().unwrap().file_name().unwrap(), ".rfrp");
+        }
+    }
+
+    #[test]
+    fn default_run_id_path_falls_back_to_current_dir() {
+        // 无 HOME（服务/容器环境）：回退到当前目录下的 .rfrp/run_id，不 panic。
+        // 用互斥锁串行化，避免与其他读环境变量的测试并发竞争。
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        #[cfg(unix)]
+        {
+            let old = std::env::var_os("HOME");
+            std::env::remove_var("HOME");
+            let p = default_run_id_path();
+            assert_eq!(p, std::path::PathBuf::from("./.rfrp/run_id"));
+            match old {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let old = std::env::var_os("USERPROFILE");
+            std::env::remove_var("USERPROFILE");
+            let p = default_run_id_path();
+            assert_eq!(p, std::path::PathBuf::from("./.rfrp/run_id"));
+            match old {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}

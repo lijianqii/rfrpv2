@@ -413,6 +413,25 @@ mod tests {
     }
 
     #[test]
+    fn new_fails_fast_when_tls_required_but_unconfigurable() {
+        // ClientTls 缓存提前到 Client::new：work_conn_tls=true 但缺 tls_server_name，
+        // 应立刻报错而非等到首次重连才发现（§6.5 负路径）。
+        let cfg = ClientConfig {
+            client: ClientSection {
+                work_conn_tls: true,
+                tls_server_name: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = match Client::new(cfg) {
+            Ok(_) => panic!("expected Err when TLS required but not configurable"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("tls_server_name"), "{err}");
+    }
+
+    #[test]
     fn run_id_empty_file_regenerates() {
         // 文件存在但内容为空/空白：应重新生成非空 run_id（§6.6）。
         let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));

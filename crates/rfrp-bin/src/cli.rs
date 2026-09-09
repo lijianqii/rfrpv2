@@ -68,3 +68,103 @@ pub enum Commands {
         work_conn_tls: Option<bool>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_server_subcommand_with_all_overrides() {
+        let cli = Cli::try_parse_from([
+            "rfrp",
+            "server",
+            "-c",
+            "examples/rfrp-server.toml",
+            "--bind",
+            "0.0.0.0:8000",
+            "--token",
+            "secret",
+            "--tls-enable=true",
+            "--work-conn-tls=true",
+            "--grace-secs",
+            "5",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        assert!(cli.log_level.as_deref() == Some("debug"));
+        match cli.command {
+            Commands::Server {
+                config,
+                bind,
+                token,
+                tls_enable,
+                work_conn_tls,
+                grace_secs,
+            } => {
+                assert_eq!(config, Some(PathBuf::from("examples/rfrp-server.toml")));
+                assert_eq!(bind.as_deref(), Some("0.0.0.0:8000"));
+                assert_eq!(token.as_deref(), Some("secret"));
+                assert_eq!(tls_enable, Some(true));
+                assert_eq!(work_conn_tls, Some(true));
+                assert_eq!(grace_secs, Some(5));
+            }
+            other => panic!("expected server command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_client_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rfrp",
+            "client",
+            "-c",
+            "examples/rfrp-client.toml",
+            "--server",
+            "127.0.0.1:7000",
+            "--tls-enable=false",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(cli.log_format.as_deref(), Some("json"));
+        match cli.command {
+            Commands::Client {
+                config,
+                server,
+                token,
+                tls_enable,
+                work_conn_tls,
+            } => {
+                assert_eq!(config, Some(PathBuf::from("examples/rfrp-client.toml")));
+                assert_eq!(server.as_deref(), Some("127.0.0.1:7000"));
+                assert_eq!(token, None);
+                assert_eq!(tls_enable, Some(false));
+                assert_eq!(work_conn_tls, None);
+            }
+            other => panic!("expected client command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_log_flags_accepted_without_subcommand_args() {
+        // 全局参数可与子命令任意组合（§7.3）。
+        let cli =
+            Cli::try_parse_from(["rfrp", "--log-level", "warn", "server", "-c", "x.toml"]).unwrap();
+        assert_eq!(cli.log_level.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn invalid_bool_value_rejected() {
+        let err = Cli::try_parse_from(["rfrp", "server", "--tls-enable=maybe", "-c", "x.toml"])
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid value"), "{err}");
+    }
+
+    #[test]
+    fn unknown_subcommand_rejected() {
+        let err = Cli::try_parse_from(["rfrp", "bogus"]).unwrap_err();
+        assert!(err.to_string().contains("unrecognized subcommand"), "{err}");
+    }
+}

@@ -65,4 +65,21 @@ mod tests {
         assert!(text.contains("rfrp_bytes_up_total"));
         assert!(text.contains("rfrp_bytes_down_total"));
     }
+
+    #[test]
+    fn render_reflects_all_counter_values() {
+        // 渲染文本应包含各计数器的实际数值（Prometheus 兼容，§M5）。
+        let m = Metrics::new();
+        m.total_connections.fetch_add(10, Ordering::Relaxed);
+        m.active_connections.fetch_add(4, Ordering::Relaxed);
+        m.bytes_up.fetch_add(1024, Ordering::Relaxed);
+        m.bytes_down.fetch_add(2048, Ordering::Relaxed);
+        let text = m.render();
+        assert!(text.contains("rfrp_connections_total 10"));
+        assert!(text.contains("rfrp_active_connections 4"));
+        assert!(text.contains("rfrp_bytes_up_total 1024"));
+        assert!(text.contains("rfrp_bytes_down_total 2048"));
+        assert!(text.contains("# TYPE rfrp_connections_total counter"));
+        assert!(text.contains("# TYPE rfrp_active_connections gauge"));
+    }
 }
