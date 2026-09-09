@@ -29,7 +29,7 @@ pub use crate::state::{PendingWork, ServerState};
 
 /// rfrps 服务端实例。
 pub struct Server {
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     listener: TcpListener,
     state: Arc<ServerState>,
     /// 优雅退出宽限期：停止接收后等待在途连接结束的最长时间（§14.4）。
@@ -97,7 +97,7 @@ impl Server {
             None
         };
         Ok(Self {
-            config,
+            config: Arc::new(config),
             listener,
             state: ServerState::new(),
             grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
@@ -140,6 +140,7 @@ impl Server {
         let vhost_https = self.vhost_https;
         let dashboard = self.dashboard;
         let dashboard_cfg = self.config.dashboard.clone();
+        let config = self.config.clone();
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
@@ -176,7 +177,7 @@ impl Server {
                                 tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
                             }
                             let state = self.state.clone();
-                            let config = self.config.clone();
+                            let config = config.clone();
                             let tls = tls.clone();
                             tracing::debug!(%peer, "accepted connection");
                             tasks.spawn(async move {
@@ -223,7 +224,7 @@ impl Server {
 async fn handle_connection(
     stream: TcpStream,
     state: Arc<ServerState>,
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     tls: Option<ServerTls>,
 ) -> Result<()> {
     let mut first = [0u8; 1];
@@ -275,7 +276,7 @@ async fn handle_connection(
                 frame,
                 stream,
                 state,
-                config,
+                (*config).clone(),
                 Duration::from_secs(HEARTBEAT_INTERVAL),
                 Duration::from_secs(HEARTBEAT_TIMEOUT),
             )

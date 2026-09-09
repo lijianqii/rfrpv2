@@ -53,6 +53,7 @@ pub async fn register_proxy(
                 kind: np.r#type,
             },
         );
+        state.index_proxy(&np.proxy_name, &session.run_id);
         tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "proxy registered (vhost)");
         return Ok(());
     }
@@ -84,6 +85,7 @@ pub async fn register_proxy(
                 kind: ProxyType::Udp,
             },
         );
+        state.index_proxy(&np.proxy_name, &session.run_id);
         tracing::info!(proxy = %np.proxy_name, remote_port, "proxy registered (udp)");
         return Ok(());
     }
@@ -113,9 +115,9 @@ pub async fn register_proxy(
     let proxy_name = np.proxy_name.clone();
     let session = session.clone();
     let session_for_insert = session.clone();
-    let state = state.clone();
+    let state_loop = state.clone();
     let handle = tokio::spawn(async move {
-        proxy_accept_loop(listener, proxy_name, session, state).await;
+        proxy_accept_loop(listener, proxy_name, session, state_loop).await;
     });
     session_for_insert.proxies.lock().unwrap().insert(
         np.proxy_name.clone(),
@@ -130,6 +132,7 @@ pub async fn register_proxy(
             map.insert(d.clone(), np.proxy_name.clone());
         }
     }
+    state.index_proxy(&np.proxy_name, &session_for_insert.run_id);
     tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (tcp)");
     Ok(())
 }

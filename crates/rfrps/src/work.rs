@@ -46,7 +46,7 @@ where
 
     // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
     if work_id == WORK_ID_POOL_RESERVED {
-        match find_session_by_proxy(&state, &proxy_name) {
+        match state.session_for_proxy(&proxy_name) {
             Some(s) => {
                 s.pools
                     .lock()
@@ -85,20 +85,6 @@ where
     let _ = bridge(user, stream).await;
     tracing::debug!(%proxy_name, work_id, "work bridge finished");
     Ok(())
-}
-
-/// 按 proxy_name 查找其所属控制会话（用于把预热工作连接归入对应池，§8.2）。
-fn find_session_by_proxy(
-    state: &ServerState,
-    proxy_name: &str,
-) -> Option<Arc<crate::control::Session>> {
-    let sessions = state.sessions.lock().unwrap();
-    for s in sessions.values() {
-        if s.proxies.lock().unwrap().contains_key(proxy_name) {
-            return Some(s.clone());
-        }
-    }
-    None
 }
 
 #[cfg(test)]

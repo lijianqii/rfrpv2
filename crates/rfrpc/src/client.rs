@@ -59,7 +59,8 @@ pub struct ClientState {
     pub server_addr: std::net::SocketAddr,
     /// 重连身份标识（持久化复用，DESIGN §6.6）。
     pub run_id: String,
-    pub proxies: Vec<ClientProxy>,
+    /// proxy_name → 代理配置（工作连接按名 O(1) 查找）。
+    pub proxies: HashMap<String, ClientProxy>,
     /// proxy_name → NewProxyResp 的一次性回传通道（注册时 await）。
     pub resps: Mutex<HashMap<String, oneshot::Sender<NewProxyResp>>>,
     /// Login 结果一次性回传通道（连接时 await，用于区分致命/可恢复失败）。
@@ -82,14 +83,27 @@ enum ConnectOutcome {
 /// rfrpc 客户端实例。
 pub struct Client {
     config: ClientConfig,
+    /// 缓存的客户端 TLS 配置（重建连接时复用，避免每次重连读 CA 文件）。
+    tls: Option<ClientTls>,
     /// 优雅退出令牌：信号或外部触发后停止重连并退出（§14.4）。
     shutdown: CancellationToken,
 }
 
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
+        // 只要配置了 tls_server_name 就构建 TLS 客户端，以便服务端在 LoginResp 中要求
+        // 工作连接升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
+        let tls = if config.client.tls_enable
+            || config.client.work_conn_tls
+            || config.client.tls_server_name.is_some()
+        {
+            Some(ClientTls::new(&config.client)?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
+            tls,
             shutdown: CancellationToken::new(),
         })
     }
@@ -161,16 +175,7 @@ impl Client {
         shutdown: &CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
-        // 只要配置了 tls_server_name 就构建 TLS 客户端，以便服务端在 LoginResp 中要求
-        // 工作连接升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
-        let tls = if self.config.client.tls_enable
-            || self.config.client.work_conn_tls
-            || self.config.client.tls_server_name.is_some()
-        {
-            Some(ClientTls::new(&self.config.client)?)
-        } else {
-            None
-        };
+        let tls = self.tls.clone();
         let stream = match TcpStream::connect(server_addr).await {
             Ok(s) => {
                 if let Err(e) = configure_tcp_stream(&s) {
@@ -196,7 +201,12 @@ impl Client {
         let state = Arc::new(ClientState {
             server_addr,
             run_id: run_id.to_string(),
-            proxies: self.config.proxies.clone(),
+            proxies: self
+                .config
+                .proxies
+                .iter()
+                .map(|p| (p.name.clone(), p.clone()))
+                .collect(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls,
@@ -251,7 +261,7 @@ impl Client {
 
         tracing::info!(count = state.proxies.len(), "registering proxies");
         let mut preheat = Vec::new();
-        for p in &state.proxies {
+        for p in state.proxies.values() {
             let (otx, orx) = oneshot::channel();
             state.resps.lock().unwrap().insert(p.name.clone(), otx);
             let np = new_proxy_from_config(p);

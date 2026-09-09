@@ -187,7 +187,7 @@ mod tests {
         let state = Arc::new(ClientState {
             server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
             run_id: String::new(),
-            proxies: vec![],
+            proxies: HashMap::new(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls: None,
@@ -202,7 +202,7 @@ mod tests {
         Arc::new(ClientState {
             server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
             run_id: String::new(),
-            proxies: vec![],
+            proxies: HashMap::new(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls: None,
@@ -371,7 +371,7 @@ mod tests {
         let state = Arc::new(ClientState {
             server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
             run_id: "rid".into(),
-            proxies: vec![],
+            proxies: HashMap::new(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls: None,

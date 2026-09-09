@@ -124,13 +124,15 @@ where
     });
 
     // 重连去重（§8.3）：同一 run_id 的旧会话先清理再接受新登录。
-    {
+    // 注意：cleanup 在锁外执行，避免 sessions→proxy_index 锁序嵌套。
+    let old = {
         let mut reg = state.sessions.lock().unwrap();
-        if let Some(old) = reg.get(&session.run_id) {
-            cleanup(old, &state);
-            reg.remove(&session.run_id);
-        }
+        let old = reg.remove(&session.run_id);
         reg.insert(session.run_id.clone(), session.clone());
+        old
+    };
+    if let Some(old) = old {
+        cleanup(&old, &state);
     }
 
     let (read_half, write_half) = split(stream);
@@ -358,6 +360,8 @@ fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
+    // 先收集代理名，用于清理全局归属索引（proxy_name → run_id）。
+    let proxy_names: Vec<String> = session.proxies.lock().unwrap().keys().cloned().collect();
     // 先收集 UDP 代理名，用于清理全局注册表。
     let udp_names: Vec<String> = session
         .proxies
@@ -367,6 +371,7 @@ fn cleanup(session: &Session, state: &ServerState) {
         .filter(|(_, e)| e.kind == ProxyType::Udp)
         .map(|(n, _)| n.clone())
         .collect();
+    state.unindex_proxies(proxy_names);
     for (_, entry) in session.proxies.lock().unwrap().drain() {
         entry.handle.abort();
     }

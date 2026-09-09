@@ -21,8 +21,7 @@ use tokio_util::codec::Framed;
 use crate::client::ClientState;
 
 pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Result<()> {
-    let proxy = state.proxies.iter().find(|p| p.name == req.proxy_name);
-    let proxy = match proxy {
+    let proxy = match state.proxies.get(&req.proxy_name) {
         Some(p) => p,
         None => {
             tracing::warn!(proxy = %req.proxy_name, "unknown proxy for work connection");
@@ -183,7 +182,7 @@ mod tests {
         let state = Arc::new(ClientState {
             server_addr: "127.0.0.1:9".parse().unwrap(),
             run_id: "r".into(),
-            proxies: vec![],
+            proxies: HashMap::new(),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls: None,
@@ -204,15 +203,18 @@ mod tests {
         let state = Arc::new(ClientState {
             server_addr,
             run_id: "r".into(),
-            proxies: vec![ClientProxy {
-                name: "web".into(),
-                r#type: ProxyType::Tcp,
-                local_ip: "127.0.0.1".into(),
-                local_port: 1, // 无人监听
-                remote_port: Some(8080),
-                custom_domains: None,
-                pool_size: 0,
-            }],
+            proxies: HashMap::from([(
+                "web".to_string(),
+                ClientProxy {
+                    name: "web".into(),
+                    r#type: ProxyType::Tcp,
+                    local_ip: "127.0.0.1".into(),
+                    local_port: 1, // 无人监听
+                    remote_port: Some(8080),
+                    custom_domains: None,
+                    pool_size: 0,
+                },
+            )]),
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls: None,
