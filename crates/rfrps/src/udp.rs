@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, UDP_SESSION_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::control::send_with_timeout;
 use rfrp_common::util::udp::{read_udp_frame, write_udp_frame};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -175,15 +176,24 @@ async fn handle_datagram(
     proxy.pending_client.lock().unwrap().insert(peer, work_id);
     tracing::debug!(proxy = %proxy_name, work_id, %peer, "udp session pending; requesting work conn");
 
+    // 请求工作连接：与按需 TCP 路径一致，用带超时发送避免控制通道拥堵时挂起
+    // （背压死锁修复的同源残留，见 util/control.rs）。失败时清理待配对项。
     let tx_ctl = session.tx.clone();
     let pname = proxy_name.to_string();
+    let proxy_cleanup = proxy.clone();
     tokio::spawn(async move {
-        let _ = tx_ctl
-            .send(Message::ReqWorkConn(ReqWorkConn {
+        if !send_with_timeout(
+            &tx_ctl,
+            Message::ReqWorkConn(ReqWorkConn {
                 proxy_name: pname,
                 work_id,
-            }))
-            .await;
+            }),
+        )
+        .await
+        {
+            proxy_cleanup.pending_by_id.lock().unwrap().remove(&work_id);
+            proxy_cleanup.pending_client.lock().unwrap().remove(&peer);
+        }
     });
 }
 

@@ -14,6 +14,7 @@ use rfrp_common::constants::{
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::control::send_with_timeout;
 use rfrp_common::util::platform::default_run_id_path;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
@@ -265,8 +266,8 @@ impl Client {
             let (otx, orx) = oneshot::channel();
             state.resps.lock().unwrap().insert(p.name.clone(), otx);
             let np = new_proxy_from_config(p);
-            if tx.send(Message::NewProxy(np)).await.is_err() {
-                anyhow::bail!("control connection closed during proxy registration");
+            if !send_with_timeout(&tx, Message::NewProxy(np)).await {
+                anyhow::bail!("control connection closed or congested during proxy registration");
             }
             match tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx).await {
                 Ok(Ok(resp)) => {

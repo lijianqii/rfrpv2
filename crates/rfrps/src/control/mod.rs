@@ -34,6 +34,26 @@ use crate::server::ServerState;
 mod session;
 pub use session::{ProxyEntry, Session};
 
+/// 拒绝登录并下发失败 LoginResp（`error=None` 表示鉴权失败，不回显原因，§10.2）。
+async fn reject_login<S>(stream: S, error: Option<&str>) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let mut w = FramedWrite::new(stream, FrameCodec);
+    let _ = w
+        .send(
+            Message::LoginResp(LoginResp {
+                ok: false,
+                error: error.map(String::from),
+                session_id: None,
+                work_conn_tls: None,
+            })
+            .to_frame()?,
+        )
+        .await;
+    Ok(())
+}
+
 /// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
 pub async fn handle_control_login<S>(
     login_frame: Frame,
@@ -58,18 +78,7 @@ where
     // 协议版本校验：不匹配直接拒绝，且不建立会话（客户端据此判定致命、不重连，§6.6）。
     if version != PROTOCOL_VERSION {
         tracing::warn!(version, "login rejected: protocol version mismatch");
-        let mut w = FramedWrite::new(stream, FrameCodec);
-        let _ = w
-            .send(
-                Message::LoginResp(LoginResp {
-                    ok: false,
-                    error: Some("version mismatch".into()),
-                    session_id: None,
-                    work_conn_tls: None,
-                })
-                .to_frame()?,
-            )
-            .await;
+        reject_login(stream, Some("version mismatch")).await?;
         return Ok(());
     }
     // 字段上限校验（DESIGN §6.2.3）：run_id 必须是 UUID，token 长度受限。
@@ -78,36 +87,14 @@ where
         || token.len() > MAX_TOKEN_LEN
     {
         tracing::warn!(run_id = %run_id, "login rejected: invalid fields");
-        let mut w = FramedWrite::new(stream, FrameCodec);
-        let _ = w
-            .send(
-                Message::LoginResp(LoginResp {
-                    ok: false,
-                    error: None,
-                    session_id: None,
-                    work_conn_tls: None,
-                })
-                .to_frame()?,
-            )
-            .await;
+        reject_login(stream, None).await?;
         return Ok(());
     }
 
     // M3：token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
         tracing::warn!(run_id = %run_id, "login rejected: token mismatch");
-        let mut w = FramedWrite::new(stream, FrameCodec);
-        let _ = w
-            .send(
-                Message::LoginResp(LoginResp {
-                    ok: false,
-                    error: None,
-                    session_id: None,
-                    work_conn_tls: None,
-                })
-                .to_frame()?,
-            )
-            .await;
+        reject_login(stream, None).await?;
         return Ok(());
     }
 

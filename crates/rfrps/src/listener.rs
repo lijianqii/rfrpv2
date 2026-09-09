@@ -176,23 +176,32 @@ pub(crate) fn dispatch_user_connection(
     session: Arc<Session>,
     state: Arc<ServerState>,
 ) {
-    // 并发连接数兜底（防 DoS）。
-    let active = state
+    // 并发连接数兜底（防 DoS）：原子地检查并递增，避免并发尖峰突破上限。
+    let max = state.max_active.load(std::sync::atomic::Ordering::Relaxed);
+    let accepted = state
         .metrics
         .active_connections
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if active >= state.max_active.load(std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(%proxy_name, active, "too many active connections, rejecting");
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |cur| {
+                if cur >= max {
+                    None
+                } else {
+                    Some(cur + 1)
+                }
+            },
+        )
+        .is_ok();
+    if !accepted {
+        tracing::warn!(%proxy_name, "too many active connections, rejecting");
         return;
     }
 
-    // 统计连接与流量（M5）。
+    // 统计连接与流量（M5）。active 已在上面原子递增；CountingStream drop 时递减。
     let metrics = state.metrics.clone();
     metrics
         .total_connections
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    metrics
-        .active_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let user = Box::new(CountingStream::new(
         user,

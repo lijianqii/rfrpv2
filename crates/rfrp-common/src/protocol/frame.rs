@@ -53,10 +53,8 @@ impl Decoder for FrameCodec {
         let msg_type = src[1];
         let length = u32::from_be_bytes([src[2], src[3], src[4], src[5]]) as usize;
 
-        if src.len() < FRAME_HEADER_LEN + length {
-            return Ok(None); // payload 未到齐
-        }
-
+        // 先校验版本与长度上限，再等待 payload：否则恶意头声称超大 length 时
+        // 解码器会一直等数据，缓冲区随读取无界增长（DoS）。
         if version != PROTOCOL_VERSION {
             return Err(protocol(format!(
                 "unsupported protocol version {version}, expected {PROTOCOL_VERSION}"
@@ -64,6 +62,10 @@ impl Decoder for FrameCodec {
         }
         if length > FRAME_MAX_PAYLOAD as usize {
             return Err(protocol(format!("frame payload too large: {length} bytes")));
+        }
+
+        if src.len() < FRAME_HEADER_LEN + length {
+            return Ok(None); // payload 未到齐
         }
 
         src.advance(FRAME_HEADER_LEN);
@@ -184,6 +186,33 @@ mod tests {
         let mut buf = BytesMut::new();
         let err = FrameCodec.encode(f, &mut buf).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn oversize_length_in_header_rejected_without_payload() {
+        // 长度校验必须先于 payload 等待：恶意头声称超大 length 时，
+        // 即使 body 未到齐也应立即报错，避免缓冲区无界增长（DoS 防护）。
+        let mut buf = BytesMut::new();
+        buf.put_u8(PROTOCOL_VERSION);
+        buf.put_u8(0x01);
+        buf.put_u32(FRAME_MAX_PAYLOAD + 1);
+        // 仅头部，无任何 payload 字节。
+        let err = FrameCodec.decode(&mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn oversize_length_header_is_not_oversized_by_arithmetic() {
+        // 长度字段是 u32 全宽（~4 GiB）：不会因 FRAME_HEADER_LEN + length 溢出 usize
+        // 而误判为"未到齐"，必须走长度上限错误分支。
+        let mut buf = BytesMut::new();
+        buf.put_u8(PROTOCOL_VERSION);
+        buf.put_u8(0x01);
+        buf.put_u32(u32::MAX);
+        assert!(matches!(
+            FrameCodec.decode(&mut buf).unwrap_err(),
+            Error::Protocol(_)
+        ));
     }
 
     #[tokio::test]

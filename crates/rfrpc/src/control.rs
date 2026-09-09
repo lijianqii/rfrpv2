@@ -138,7 +138,16 @@ where
             }
             out = rx.recv() => {
                 match out {
-                    Some(m) => { try_send(&out_tx, m); }
+                    Some(m) => {
+                        // 心跳响应可丢弃（非关键）；其余（含 NewProxy 注册）带超时发送，
+                        // 避免写通道拥堵时静默丢弃关键消息。
+                        if matches!(m, Message::HeartbeatResp(_)) {
+                            try_send(&out_tx, m);
+                        } else if !send_with_timeout(&out_tx, m).await {
+                            tracing::warn!("control outbound send failed/timeout");
+                            break;
+                        }
+                    }
                     None => {
                         tracing::info!("control outbound channel closed");
                         break;
