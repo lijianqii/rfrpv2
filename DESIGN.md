@@ -1509,3 +1509,13 @@ M6 发布与打包已完成：
 - 服务端拆分出 `state.rs`（`ServerState` / `PendingWork`）与 `cli.rs`（`apply_cli_overrides`），`server.rs` 只保留 `Server` 主控与连接分派。
 - 控制会话拆分为 `control/session.rs`（`Session` / `ProxyEntry`），`control/mod.rs` 保留主流程；`server.rs` 通过 `pub use` 保持 `ServerState`/`apply_cli_overrides` 的对外路径兼容。
 - 模块职责更单一：`listener`（代理注册/用户分发）、`work`（工作连接）、`udp`、`vhost`、`dashboard`、`metrics`、`control` 各自独立。
+
+### 17.22 控制面背压死锁修复
+
+频繁建立/断开同一代理连接可能导致控制面背压死锁（程序卡住、需重启 client 恢复）。修复：
+
+- 控制写任务加 `CONTROL_SEND_TIMEOUT`（5s）超时，socket 写阻塞超时即断开控制连接。
+- 非关键控制消息（`HeartbeatResp`、池补充 `ReqWorkConn`）改用 `try_send`，通道满时丢弃/跳过，不阻塞。
+- 关键消息（`LoginResp`、`NewProxyResp`、按需 `ReqWorkConn`）用 `send_with_timeout`，失败即清理 pending / 断开。
+- 控制通道容量 64 → 256。
+- 新增回归测试 `tcp_proxy_rapid_connect_disconnect_stays_usable`：50 次高频短连接后代理仍可用。

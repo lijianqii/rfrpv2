@@ -1,4 +1,3 @@
-
 use super::*;
 use rfrp_common::constants::PROTOCOL_VERSION;
 use std::time::Duration;

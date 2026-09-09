@@ -21,7 +21,7 @@ use rfrp_common::constants::{
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
-use rfrp_common::util::control::graceful_close;
+use rfrp_common::util::control::{graceful_close, send_with_timeout, try_send};
 use rfrp_common::util::now_ms;
 use tokio::io::split;
 use tokio::sync::mpsc;
@@ -112,7 +112,7 @@ where
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let (tx, mut rx) = mpsc::channel::<Message>(64);
+    let (tx, mut rx) = mpsc::channel::<Message>(256);
     let session = Arc::new(Session {
         run_id,
         session_id: session_id.clone(),
@@ -153,9 +153,19 @@ where
                     };
                     match msg.to_frame() {
                         Ok(frame) => {
-                            if let Err(e) = writer.send(frame).await {
-                                tracing::warn!("control write error: {e}");
-                                break;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(rfrp_common::util::control::CONTROL_SEND_TIMEOUT),
+                                writer.send(frame),
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!("control write error: {e}");
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("control write timeout, breaking");
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -178,14 +188,20 @@ where
     });
 
     // 登录响应：下发服务端 work_conn_tls 偏好（DESIGN §6.5）。
-    tx.send(Message::LoginResp(LoginResp {
-        ok: true,
-        error: None,
-        session_id: Some(session_id.clone()),
-        work_conn_tls: Some(config.server.work_conn_tls),
-    }))
+    if !send_with_timeout(
+        &tx,
+        Message::LoginResp(LoginResp {
+            ok: true,
+            error: None,
+            session_id: Some(session_id.clone()),
+            work_conn_tls: Some(config.server.work_conn_tls),
+        }),
+    )
     .await
-    .ok();
+    {
+        tracing::warn!(session = %session_id, "login resp send failed/timeout");
+        return Ok(());
+    }
     tracing::info!(session = %session_id, "control connection established");
 
     // 心跳（§8.3）：周期性发送 Heartbeat，等待对端在 HEARTBEAT_TIMEOUT 内回应；
@@ -204,12 +220,9 @@ where
             iv.tick().await;
             let ts = now_ms();
             tracing::debug!(session = %session_id_hb, ts, "heartbeat sent");
-            if hb_tx
-                .send(Message::Heartbeat(Heartbeat { ts }))
-                .await
-                .is_err()
-            {
-                break;
+            if !try_send(&hb_tx, Message::Heartbeat(Heartbeat { ts })) {
+                tracing::warn!(session = %session_id_hb, "heartbeat send failed (channel full), skipping tick");
+                continue;
             }
             // 等待对端心跳回应；超时则判定断连（§8.3）。
             if tokio::time::timeout(heartbeat_timeout, hb_pong.notified())
@@ -234,13 +247,16 @@ where
                                 tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "received NewProxy");
                                 if let Some(err) = new_proxy_invalid(&np) {
                                     tracing::warn!(proxy = %np.proxy_name, error = err, "NewProxy rejected");
-                                    tx.send(Message::NewProxyResp(NewProxyResp {
+                                    if !send_with_timeout(&tx, Message::NewProxyResp(NewProxyResp {
                                         proxy_name: np.proxy_name,
                                         ok: false,
                                         error: Some(err.into()),
                                     }))
                                     .await
-                                    .ok();
+                                    {
+                                        tracing::warn!(session = %session_id, "newproxy resp send failed/timeout");
+                                        break;
+                                    }
                                     continue;
                                 }
                                 let result = listener::register_proxy(&np, &session, &state, &config).await;
@@ -248,17 +264,20 @@ where
                                     Ok(()) => (true, None),
                                     Err(e) => (false, Some(e.to_string())),
                                 };
-                                tx.send(Message::NewProxyResp(NewProxyResp {
+                                if !send_with_timeout(&tx, Message::NewProxyResp(NewProxyResp {
                                     proxy_name: np.proxy_name,
                                     ok,
                                     error,
                                 }))
                                 .await
-                                .ok();
+                                {
+                                    tracing::warn!(session = %session_id, "newproxy resp send failed/timeout");
+                                    break;
+                                }
                             }
                             Message::Heartbeat(h) => {
                                 tracing::debug!(session = %session_id, ts = h.ts, "heartbeat received");
-                                tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
+                                try_send(&tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
                             }
                             Message::HeartbeatResp(_) => {
                                 tracing::debug!(session = %session_id, "heartbeat response received");

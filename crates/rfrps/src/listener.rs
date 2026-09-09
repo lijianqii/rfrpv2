@@ -19,6 +19,7 @@ use tokio::time::{sleep, Duration};
 use crate::control::{ProxyEntry, Session};
 use crate::server::{PendingWork, ServerState};
 use crate::vhost::find_proxy_by_domain;
+use rfrp_common::util::control::{send_with_timeout, try_send};
 
 /// 注册代理：TCP 在 `remote_port` 起监听；HTTP 走共享 vhost 监听，仅登记域名。
 pub async fn register_proxy(
@@ -209,16 +210,14 @@ pub(crate) fn dispatch_user_connection(
             let _ = bridge(user, work).await;
             tracing::debug!(proxy = %pname, "pooled work bridge finished");
         });
-        // 立即请求补充预热连接（无需等待本次用户断开）。
-        let tx = session.tx.clone();
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Message::ReqWorkConn(ReqWorkConn {
-                    proxy_name,
-                    work_id: WORK_ID_POOL_RESERVED,
-                }))
-                .await;
-        });
+        // 立即请求补充预热连接（无需等待本次用户断开）；通道满时跳过本次补充。
+        try_send(
+            &session.tx,
+            Message::ReqWorkConn(ReqWorkConn {
+                proxy_name,
+                work_id: WORK_ID_POOL_RESERVED,
+            }),
+        );
         return;
     }
 
@@ -236,15 +235,16 @@ pub(crate) fn dispatch_user_connection(
     let tx = session.tx.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
-        if tx
-            .send(Message::ReqWorkConn(ReqWorkConn {
+        if !send_with_timeout(
+            &tx,
+            Message::ReqWorkConn(ReqWorkConn {
                 proxy_name,
                 work_id,
-            }))
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            // 控制连接已断，清理待处理项。
+            // 控制连接已断或通道拥堵，清理待处理项（避免任务堆积）。
             state2.pending.lock().unwrap().remove(&work_id);
             return;
         }

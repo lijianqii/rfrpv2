@@ -278,3 +278,45 @@ async fn tcp_proxy_connection_cap_enforced() {
     srv.abort();
     cli.abort();
 }
+
+#[tokio::test]
+async fn tcp_proxy_rapid_connect_disconnect_stays_usable() {
+    // 回归：频繁建立/断开同一代理连接后，控制面不应被背压死锁卡住。
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let cli = start_client(client_config(
+        addr,
+        vec![tcp_proxy("p1", echo_port, remote)],
+        None,
+    ))
+    .await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
+
+    // 高频短连接：连上→回显→断开，重复 50 次。
+    let loop_result = tokio::time::timeout(Duration::from_secs(30), async {
+        for i in 0..50 {
+            let mut s = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+            let data = format!("seq-{i}");
+            s.write_all(data.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; data.len()];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, data.as_bytes());
+            drop(s);
+        }
+    })
+    .await;
+    assert!(
+        loop_result.is_ok(),
+        "rapid connect/disconnect should not hang the proxy"
+    );
+
+    // 结束后仍可正常使用。
+    expect_echo(remote, addr, b"still-works").await;
+
+    srv.abort();
+    cli.abort();
+}

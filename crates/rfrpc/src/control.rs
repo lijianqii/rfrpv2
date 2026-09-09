@@ -11,7 +11,7 @@ use rfrp_common::constants::PROTOCOL_VERSION;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
-use rfrp_common::util::control::graceful_close;
+use rfrp_common::util::control::{graceful_close, send_with_timeout, try_send};
 use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +34,7 @@ where
     let mut writer = FramedWrite::new(write_half, FrameCodec);
 
     // 写任务：消费出站控制消息；收到退出信号时尽量发送 TLS close_notify。
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let shutdown_writer = shutdown.clone();
     let mut writer_task = tokio::spawn(async move {
         loop {
@@ -49,9 +49,19 @@ where
                     };
                     match msg.to_frame() {
                         Ok(frame) => {
-                            if let Err(e) = writer.send(frame).await {
-                                tracing::warn!("control write error: {e}");
-                                break;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(rfrp_common::util::control::CONTROL_SEND_TIMEOUT),
+                                writer.send(frame),
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!("control write error: {e}");
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("control write timeout, breaking");
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -70,14 +80,19 @@ where
     });
 
     // 登录（token 由服务端在 M3 校验；run_id 来自状态以便重连复用，§6.6 / §8.3）。
-    out_tx
-        .send(Message::Login(Login {
+    if !send_with_timeout(
+        &out_tx,
+        Message::Login(Login {
             run_id: state.run_id.clone(),
             token: config.client.token.clone(),
             version: PROTOCOL_VERSION,
-        }))
-        .await
-        .ok();
+        }),
+    )
+    .await
+    {
+        tracing::warn!("login send failed/timeout");
+        return Ok(());
+    }
 
     loop {
         tokio::select! {
@@ -99,7 +114,7 @@ where
                             }
                             Message::Heartbeat(h) => {
                                 tracing::debug!(ts = h.ts, "heartbeat received; responding");
-                                out_tx.send(Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await.ok();
+                                try_send(&out_tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
                             }
                             Message::LoginResp(r) => {
                                 // 路由到连接阶段，供 run() 区分致命 / 可恢复失败（§8.1）。
@@ -123,7 +138,7 @@ where
             }
             out = rx.recv() => {
                 match out {
-                    Some(m) => { out_tx.send(m).await.ok(); }
+                    Some(m) => { try_send(&out_tx, m); }
                     None => {
                         tracing::info!("control outbound channel closed");
                         break;
