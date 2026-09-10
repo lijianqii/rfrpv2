@@ -4,17 +4,34 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::stream::BoxedStream;
 
+/// 本地累计达到该字节数后写入全局计数器。
+///
+/// `bytes_up` / `bytes_down` 是所有连接共享的原子变量；原实现每个读写块都
+/// `fetch_add`，高并发大流量下多个核心争用同一 cache line 成为热点。
+const FLUSH_THRESHOLD: u64 = 256 * 1024;
+
+/// 距上次写入全局计数器的最大时间：保证低速长连接（如 SSH）在传输中也能
+/// 及时反映到监控，而不是等到连接关闭（监控滞后 ≤ 1s）。
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// 统计读/写字节数，并在 drop 时递减活跃连接数。
+///
+/// 计数在本地累计，达到 `FLUSH_THRESHOLD` 或超过 `FLUSH_INTERVAL` 时批量
+/// 写入全局原子计数器；`Drop` 时做最后一次 flush。
 pub struct CountingStream {
     inner: BoxedStream,
     read: Arc<AtomicU64>,
     write: Arc<AtomicU64>,
     active: Arc<AtomicI64>,
+    pending_read: u64,
+    pending_write: u64,
+    last_flush: Instant,
 }
 
 impl CountingStream {
@@ -29,12 +46,42 @@ impl CountingStream {
             read,
             write,
             active,
+            pending_read: 0,
+            pending_write: 0,
+            last_flush: Instant::now(),
+        }
+    }
+
+    /// 把本地累计的读写字节数写入全局计数器。
+    fn flush(&mut self) {
+        if self.pending_read > 0 {
+            self.read.fetch_add(self.pending_read, Ordering::Relaxed);
+            self.pending_read = 0;
+        }
+        if self.pending_write > 0 {
+            self.write.fetch_add(self.pending_write, Ordering::Relaxed);
+            self.pending_write = 0;
+        }
+        self.last_flush = Instant::now();
+    }
+
+    /// 达到字节阈值或时间阈值时刷新全局计数器。
+    fn maybe_flush(&mut self) {
+        if self.pending_read == 0 && self.pending_write == 0 {
+            return;
+        }
+        if self.pending_read >= FLUSH_THRESHOLD
+            || self.pending_write >= FLUSH_THRESHOLD
+            || self.last_flush.elapsed() >= FLUSH_INTERVAL
+        {
+            self.flush();
         }
     }
 }
 
 impl Drop for CountingStream {
     fn drop(&mut self) {
+        self.flush();
         self.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -48,8 +95,9 @@ impl AsyncRead for CountingStream {
         let before = dst.filled().len();
         let r = Pin::new(&mut self.inner).poll_read(cx, dst);
         if let Poll::Ready(Ok(())) = &r {
-            let n = dst.filled().len() - before;
-            self.read.fetch_add(n as u64, Ordering::Relaxed);
+            let n = (dst.filled().len() - before) as u64;
+            self.pending_read += n;
+            self.maybe_flush();
         }
         r
     }
@@ -63,7 +111,8 @@ impl AsyncWrite for CountingStream {
     ) -> Poll<Result<usize, std::io::Error>> {
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
-                self.write.fetch_add(n as u64, Ordering::Relaxed);
+                self.pending_write += n as u64;
+                self.maybe_flush();
                 Poll::Ready(Ok(n))
             }
             other => other,
@@ -108,10 +157,56 @@ mod tests {
         let mut rbuf = [0u8; 4];
         a.read_exact(&mut rbuf).await.unwrap();
 
-        assert_eq!(read.load(Ordering::Relaxed), 5);
-        assert_eq!(write.load(Ordering::Relaxed), 4);
+        // 未达批量阈值/时间阈值：全局计数器暂不更新（drop 时统一 flush）。
+        assert_eq!(read.load(Ordering::Relaxed), 0);
+        assert_eq!(write.load(Ordering::Relaxed), 0);
 
         drop(counted);
+        assert_eq!(read.load(Ordering::Relaxed), 5);
+        assert_eq!(write.load(Ordering::Relaxed), 4);
         assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn flushes_globally_after_interval_for_slow_stream() {
+        // 低速长连接：即使未达字节阈值，超过刷新间隔后的下一次读写也应写入全局
+        // 计数器（保证监控实时性，而非等连接关闭）。
+        let (mut a, b) = duplex(1024);
+        let read = Arc::new(AtomicU64::new(0));
+        let write = Arc::new(AtomicU64::new(0));
+        let active = Arc::new(AtomicI64::new(0));
+        let mut counted =
+            CountingStream::new(Box::new(b), read.clone(), write.clone(), active.clone());
+
+        a.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        counted.read_exact(&mut buf).await.unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), 0);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        a.write_all(b"x").await.unwrap();
+        let mut one = [0u8; 1];
+        counted.read_exact(&mut one).await.unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn flushes_globally_at_threshold_before_drop() {
+        // 累计达到阈值即写入全局计数器（无需等连接关闭），保证监控实时性。
+        let cap = FLUSH_THRESHOLD as usize;
+        let (_a, b) = duplex(cap + 4096);
+        let read = Arc::new(AtomicU64::new(0));
+        let write = Arc::new(AtomicU64::new(0));
+        let active = Arc::new(AtomicI64::new(0));
+
+        let mut counted =
+            CountingStream::new(Box::new(b), read.clone(), write.clone(), active.clone());
+        counted.write_all(&vec![0u8; cap]).await.unwrap();
+
+        assert!(
+            write.load(Ordering::Relaxed) >= FLUSH_THRESHOLD,
+            "global counter must be flushed at threshold, got {}",
+            write.load(Ordering::Relaxed)
+        );
     }
 }

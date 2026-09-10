@@ -13,7 +13,7 @@ use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
-use rfrp_common::util::udp::{read_udp_frame, write_udp_frame};
+use rfrp_common::util::udp::{read_udp_frame_into, write_udp_frame};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
@@ -130,12 +130,14 @@ async fn udp_bridge(
     req: &ReqWorkConn,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
+    // 复用下行帧缓冲，避免每包一次分配。
+    let mut frame_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
     loop {
         tokio::select! {
-            r = read_udp_frame(&mut work_stream) => {
+            r = read_udp_frame_into(&mut work_stream, &mut frame_buf) => {
                 match r {
-                    Ok(Some(d)) => {
-                        if let Err(e) = local.send(&d).await {
+                    Ok(Some(())) => {
+                        if let Err(e) = local.send(&frame_buf).await {
                             tracing::warn!(proxy = %req.proxy_name, error = %e, "udp send to local failed");
                             break;
                         }

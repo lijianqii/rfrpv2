@@ -54,9 +54,9 @@ impl ServerState {
         })
     }
 
-    /// 分配下一个 work_id（≥1）。
+    /// 分配下一个 work_id（≥1）。原子 RMW 已保证唯一性，Relaxed 足够。
     pub fn next_work_id(&self) -> u64 {
-        self.work_id.fetch_add(1, Ordering::SeqCst) + 1
+        self.work_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// 记录 proxy_name 归属的会话（run_id），注册成功后调用。

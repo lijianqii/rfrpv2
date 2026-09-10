@@ -11,6 +11,19 @@ pub async fn read_udp_frame<R>(r: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
+    let mut data = Vec::new();
+    match read_udp_frame_into(r, &mut data).await? {
+        Some(()) => Ok(Some(data)),
+        None => Ok(None),
+    }
+}
+
+/// 同 [`read_udp_frame`]，但把数据写入复用的 `buf`（清空后追加），
+/// 避免高频 UDP 转发下每包一次分配。EOF 返回 `Ok(None)`。
+pub async fn read_udp_frame_into<R>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<()>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     let mut filled = 0;
     while filled < 4 {
@@ -33,9 +46,10 @@ where
             format!("udp frame too large: {len}"),
         ));
     }
-    let mut data = vec![0u8; len];
-    r.read_exact(&mut data).await?;
-    Ok(Some(data))
+    buf.clear();
+    buf.resize(len, 0);
+    r.read_exact(buf).await?;
+    Ok(Some(()))
 }
 
 /// 向流上写入一个 UDP 帧（4 字节大端长度前缀 + 数据）。
@@ -72,6 +86,31 @@ mod tests {
         let (a, mut b) = duplex(1024);
         drop(a);
         assert!(read_udp_frame(&mut b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_into_reuses_buffer() {
+        // 复用缓冲：第二次读取覆盖第一次内容，不残留旧数据。
+        let (mut a, mut b) = duplex(1024);
+        let mut buf = Vec::new();
+        write_udp_frame(&mut a, b"first").await.unwrap();
+        read_udp_frame_into(&mut b, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, b"first");
+        write_udp_frame(&mut a, b"xy").await.unwrap();
+        read_udp_frame_into(&mut b, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, b"xy");
+        // EOF 返回 None。
+        drop(a);
+        assert!(read_udp_frame_into(&mut b, &mut buf)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

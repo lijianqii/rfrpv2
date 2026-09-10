@@ -9,7 +9,7 @@ use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, UDP_SESSION_TIMEOUT, WORK_CONN
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::send_with_timeout;
-use rfrp_common::util::udp::{read_udp_frame, write_udp_frame};
+use rfrp_common::util::udp::{read_udp_frame_into, write_udp_frame};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -247,6 +247,8 @@ pub async fn handle_udp_work_conn(
     tracing::info!(client = %pending.client, work_id, "udp work connection established");
     let mut rx = pending.rx;
     let mut stream = stream;
+    // 复用下行帧缓冲，避免每包一次分配。
+    let mut frame_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
 
     loop {
         tokio::select! {
@@ -262,15 +264,15 @@ pub async fn handle_udp_work_conn(
                     None => break,
                 }
             }
-            r = read_udp_frame(&mut stream) => {
+            r = read_udp_frame_into(&mut stream, &mut frame_buf) => {
                 match r {
-                    Ok(Some(d)) => {
+                    Ok(Some(())) => {
                         touch_session(&proxy, pending.client);
                         proxy
                             .metrics
                             .bytes_down
-                            .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = proxy.socket.send_to(&d, pending.client).await {
+                            .fetch_add(frame_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        if let Err(e) = proxy.socket.send_to(&frame_buf, pending.client).await {
                             tracing::warn!(work_id, error = %e, "udp send_to client error");
                         }
                     }
