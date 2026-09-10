@@ -320,3 +320,54 @@ async fn tcp_proxy_rapid_connect_disconnect_stays_usable() {
     srv.abort();
     cli.abort();
 }
+
+/// 回归：本地服务踢掉空闲预连接后，池中死连接必须被跳过。
+///
+/// 场景对应 sshd / RDP 服务对空闲预连接的超时关闭（README 中 `pool_size`
+/// 建议的根因）。修复前 `pool_size=1` 时用户连接会命中死连接并被立即重置；
+/// 修复后服务端出池前探活，跳过死连接并回退按需建立。
+#[tokio::test]
+async fn pooled_work_conn_skips_local_idle_closed_conn() {
+    // 本地服务：接受后 300ms 无数据即关闭（模拟 sshd/RDP 空闲超时）。
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(s);
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(300), r.read(&mut buf)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) => break,
+                        Ok(Ok(n)) => {
+                            if w.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break, // 空闲超时：关闭本地连接
+                    }
+                }
+            });
+        }
+    });
+
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    // pool_size=1：预连接会被本地服务关闭，池中留下死连接。
+    let mut proxy = tcp_proxy("p1", echo_port, remote);
+    proxy.pool_size = 1;
+    let cli = start_client(client_config(addr, vec![proxy], None)).await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
+
+    // 等池中预连接被本地服务踢掉，再发起用户连接。
+    for i in 0..3 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        expect_echo(remote, addr, format!("after-idle-{i}").as_bytes()).await;
+    }
+
+    srv.abort();
+    cli.abort();
+}

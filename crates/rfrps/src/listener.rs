@@ -9,10 +9,10 @@ use rfrp_common::config::ServerConfig;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::counting::CountingStream;
-use rfrp_common::util::stream::BoxedStream;
+use rfrp_common::util::stream::{BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use rfrp_common::{constants::*, error::Result};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 
@@ -168,6 +168,49 @@ async fn proxy_accept_loop(
     }
 }
 
+/// 从池中取出一个仍然存活的预热工作连接（跳过已被对端关闭的死连接）。
+///
+/// 本地服务常对空闲连接做超时踢除（sshd/RDP 均如此），池中预连接因此可能已死；
+/// 直接使用会让用户连接立即被重置（表现为 Connection reset by peer）。
+fn pop_live_pooled(session: &Session, proxy_name: &str) -> Option<BoxedStream> {
+    loop {
+        let work = {
+            let mut pools = session.pools.lock().unwrap();
+            pools.get_mut(proxy_name).and_then(|v| v.pop())
+        }?;
+        match probe_alive(work) {
+            Ok(work) => return Some(work),
+            Err(()) => {
+                tracing::debug!(%proxy_name, "discarded dead pooled work connection");
+                continue;
+            }
+        }
+    }
+}
+
+/// 非阻塞探活：无数据可读视为存活；EOF/错误视为已死；意外数据回灌后使用。
+///
+/// 使用 noop waker 做单次 poll，不注册唤醒（池取出路径本就在同步上下文中）。
+fn probe_alive(mut work: BoxedStream) -> std::result::Result<BoxedStream, ()> {
+    let mut one = [0u8; 1];
+    let mut buf = ReadBuf::new(&mut one);
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    match std::pin::Pin::new(&mut work).poll_read(&mut cx, &mut buf) {
+        std::task::Poll::Pending => Ok(work),
+        std::task::Poll::Ready(Ok(())) => {
+            if buf.filled().is_empty() {
+                Err(()) // EOF：对端已关闭
+            } else {
+                // 预连接不应有数据；出现则回灌，保证不丢字节
+                let data = buf.filled().to_vec();
+                Ok(Box::new(PrependStream::new(data, work)))
+            }
+        }
+        std::task::Poll::Ready(Err(_)) => Err(()),
+    }
+}
+
 /// 统一处理一条用户连接：优先命中预热池，否则登记 pending 并按需请求工作连接。
 /// 桥接与 ReqWorkConn 均放入独立任务，避免阻塞 accept 循环。
 pub(crate) fn dispatch_user_connection(
@@ -210,11 +253,9 @@ pub(crate) fn dispatch_user_connection(
         metrics.active_connections.clone(),
     ));
 
-    // 优先命中预热池（§8.2）。
-    let pooled = {
-        let mut pools = session.pools.lock().unwrap();
-        pools.get_mut(&proxy_name).and_then(|v| v.pop())
-    };
+    // 优先命中预热池（§8.2）。池中连接可能已被本地服务（sshd/RDP 等）
+    // 在空闲时关闭，出池前先探活，避免用户连接被死连接立即重置。
+    let pooled = pop_live_pooled(&session, &proxy_name);
     if let Some(work) = pooled {
         tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
         let pname = proxy_name.clone();
