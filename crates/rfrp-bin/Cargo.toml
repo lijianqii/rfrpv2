@@ -21,3 +21,6 @@ rfrpc = { path = "../rfrpc" }
 
 [dev-dependencies]
 libc = "0.2"
+
+[build-dependencies]
+embed-resource = "2"
