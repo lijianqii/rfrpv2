@@ -16,6 +16,9 @@ pub const WORK_ID_POOL_RESERVED: u64 = 0;
 
 // ---- 超时（秒）----
 
+/// 连接服务端（控制连接）的 TCP 建连超时：避免防火墙静默丢包时
+/// 长时间无进展（Linux 默认 SYN 重试约 2 分钟）。
+pub const CONNECT_TIMEOUT: u64 = 10;
 /// 控制面登录响应等待超时。
 pub const LOGIN_TIMEOUT: u64 = 10;
 /// 单个 NewProxy 注册响应等待超时。

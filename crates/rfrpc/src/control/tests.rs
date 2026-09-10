@@ -10,6 +10,10 @@ use tokio::io::{duplex, AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// 测试用心跳参数：足够长，避免干扰既有用例。
+const TEST_HB_INTERVAL: Duration = Duration::from_secs(3600);
+const TEST_HB_TIMEOUT: Duration = Duration::from_secs(3600);
+
 async fn send_msg<W: AsyncWrite + Unpin>(w: &mut FramedWrite<W, FrameCodec>, m: Message) {
     w.send(m.to_frame().unwrap()).await.unwrap();
 }
@@ -57,6 +61,8 @@ async fn newproxy_resp_routed_to_oneshot() {
         state,
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
 
     let (sr, sw) = split(server_end);
@@ -93,6 +99,8 @@ async fn heartbeat_responds() {
         default_state(),
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
 
     let (sr, sw) = split(server_end);
@@ -119,6 +127,8 @@ async fn reqworkconn_keeps_loop_alive() {
         default_state(),
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
 
     let (sr, sw) = split(server_end);
@@ -153,6 +163,8 @@ async fn close_exits() {
         default_state(),
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
 
     let (sr, sw) = split(server_end);
@@ -176,6 +188,8 @@ async fn control_loop_exits_on_shutdown() {
         default_state(),
         config,
         shutdown.clone(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
     // 未取消前应持续存活。
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -221,6 +235,8 @@ async fn login_resp_routed_to_state() {
         state,
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
 
     let (sr, sw) = split(server_end);
@@ -260,6 +276,8 @@ async fn newproxy_resp_err_routed_to_oneshot() {
         state,
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
     let (sr, sw) = split(server_end);
     let mut sr = FramedRead::new(sr, FrameCodec);
@@ -296,6 +314,8 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
         default_state(),
         config,
         CancellationToken::new(),
+        TEST_HB_INTERVAL,
+        TEST_HB_TIMEOUT,
     ));
     let (sr, sw) = split(server_end);
     let mut sr = FramedRead::new(sr, FrameCodec);
@@ -317,4 +337,68 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
     }
     send_msg(&mut sw, Message::Close(Close { reason: None })).await;
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn heartbeat_timeout_detects_dead_connection() {
+    // 半开连接（对端不回 HeartbeatResp）必须被心跳看门狗检测并退出控制循环，
+    // 否则客户端会永久卡住、无法重连（reader 不会返回）。
+    let (client_end, server_end) = duplex(8192);
+    let (_tx, rx) = mpsc::channel::<Message>(64);
+    let task = tokio::spawn(control_loop(
+        client_end,
+        rx,
+        default_state(),
+        ClientConfig::default(),
+        CancellationToken::new(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ));
+
+    let (sr, _sw) = split(server_end);
+    let mut sr = FramedRead::new(sr, FrameCodec);
+    // 消费 Login；随后应收到 Heartbeat，但故意不回应。
+    let _ = recv_msg(&mut sr).await;
+    let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut sr))
+        .await
+        .expect("client should send heartbeat");
+    assert!(matches!(hb, Message::Heartbeat(_)));
+
+    // 看门狗超时后控制循环应自行退出（供上层重连）。
+    let res = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("control loop must exit on heartbeat timeout");
+    assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn heartbeat_keeps_alive_when_peer_responds() {
+    // 对端正常回应心跳时，控制循环应持续存活（不误判断连）。
+    let (client_end, server_end) = duplex(8192);
+    let (_tx, rx) = mpsc::channel::<Message>(64);
+    let task = tokio::spawn(control_loop(
+        client_end,
+        rx,
+        default_state(),
+        ClientConfig::default(),
+        CancellationToken::new(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ));
+
+    let (sr, sw) = split(server_end);
+    let mut sr = FramedRead::new(sr, FrameCodec);
+    let mut sw = FramedWrite::new(sw, FrameCodec);
+    let _ = recv_msg(&mut sr).await; // Login
+                                     // 连续回应若干轮心跳。
+    for _ in 0..3 {
+        let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut sr))
+            .await
+            .expect("heartbeat");
+        if let Message::Heartbeat(h) = hb {
+            send_msg(&mut sw, Message::HeartbeatResp(HeartbeatResp { ts: h.ts })).await;
+        }
+    }
+    assert!(!task.is_finished(), "control loop must stay alive");
+    task.abort();
 }

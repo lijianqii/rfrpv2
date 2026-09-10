@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
-    LOGIN_TIMEOUT, MAX_RUN_ID_LEN, NEW_PROXY_TIMEOUT, RECONNECT_BACKOFF_INITIAL,
-    RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
+    CONNECT_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN,
+    NEW_PROXY_TIMEOUT, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
@@ -57,6 +57,10 @@ pub struct Client {
     config: ClientConfig,
     /// 缓存的客户端 TLS 配置（重建连接时复用，避免每次重连读 CA 文件）。
     tls: Option<ClientTls>,
+    /// 心跳发送间隔（控制连接保活/失联检测）。
+    heartbeat_interval: Duration,
+    /// 心跳响应等待超时：超时判定控制连接已死并触发重连。
+    heartbeat_timeout: Duration,
     /// 优雅退出令牌：信号或外部触发后停止重连并退出（§14.4）。
     shutdown: CancellationToken,
 }
@@ -76,8 +80,17 @@ impl Client {
         Ok(Self {
             config,
             tls,
+            heartbeat_interval: Duration::from_secs(HEARTBEAT_INTERVAL),
+            heartbeat_timeout: Duration::from_secs(HEARTBEAT_TIMEOUT),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// 覆盖心跳间隔与响应超时（主要用于测试：缩短失联检测时间）。
+    pub fn with_heartbeat(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self.heartbeat_timeout = timeout;
+        self
     }
 
     /// 返回可被外部触发的退出令牌（终止信号处理器与测试共用）。
@@ -148,16 +161,27 @@ impl Client {
     ) -> AnyResult<ConnectOutcome> {
         let server_addr = self.config.client.server_socket_addr()?;
         let tls = self.tls.clone();
-        let stream = match TcpStream::connect(server_addr).await {
-            Ok(s) => {
+        // 带超时建连：防火墙静默丢包时 connect 可能阻塞约 2 分钟（Linux），
+        // 期间无法感知失败、也无法进入退避重试。
+        let stream = match tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT),
+            TcpStream::connect(server_addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
                 if let Err(e) = configure_tcp_stream(&s) {
                     tracing::warn!(error = %e, "failed to configure control TCP stream");
                 }
                 s
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "connect failed");
                 return Err(anyhow::anyhow!(e));
+            }
+            Err(_) => {
+                tracing::warn!(server = %server_addr, "connect timeout");
+                return Err(anyhow::anyhow!("connect timeout"));
             }
         };
         tracing::info!(server = %server_addr, "connected to server");
@@ -194,6 +218,8 @@ impl Client {
             state.clone(),
             self.config.clone(),
             shutdown.clone(),
+            self.heartbeat_interval,
+            self.heartbeat_timeout,
         ));
 
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。

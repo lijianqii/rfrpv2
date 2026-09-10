@@ -150,3 +150,79 @@ async fn client_reconnects_and_recovers_multiple_proxies() {
     cli.abort();
     let _ = std::fs::remove_file(run_id_file);
 }
+
+/// 回归：控制连接**静默失联**（无 FIN/RST，如对端进程挂起、NAT/防火墙静默丢弃）
+/// 时，客户端必须通过心跳超时感知并重连。
+///
+/// 修复前 rfrpc 只被动响应服务端心跳、依赖 TCP EOF 感知断开；半开连接下
+/// reader 永久阻塞 → 客户端卡死、永不重连（Windows 未启用 keepalive 时尤甚）。
+#[tokio::test]
+async fn client_reconnects_after_silent_control_death() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    use futures::{SinkExt, StreamExt};
+    use rfrp_common::protocol::frame::FrameCodec;
+    use rfrp_common::protocol::msg::{LoginResp, Message};
+    use rfrpc::client::Client;
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    // 假服务端：回应 Login，但对 Heartbeat 一律不回应（TCP 连接保持不关）。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let conns_srv = conns.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            conns_srv.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (r, w) = tokio::io::split(s);
+                let mut r = FramedRead::new(r, FrameCodec);
+                let mut w = FramedWrite::new(w, FrameCodec);
+                while let Some(Ok(frame)) = r.next().await {
+                    if let Ok(Message::Login(_)) = Message::from_frame(&frame) {
+                        let resp = Message::LoginResp(LoginResp {
+                            ok: true,
+                            error: None,
+                            session_id: Some("fake".into()),
+                            work_conn_tls: Some(false),
+                        });
+                        let _ = w.send(resp.to_frame().unwrap()).await;
+                    }
+                    // 其余消息（Heartbeat）故意不回应，模拟静默失联。
+                }
+            });
+        }
+    });
+
+    // 缩短心跳以便快速验证：200ms 间隔 + 200ms 超时。
+    let cfg = client_config(
+        addr,
+        vec![],
+        Some(unique_run_id_file().to_string_lossy().to_string()),
+    );
+    let client = Client::new(cfg)
+        .unwrap()
+        .with_heartbeat(Duration::from_millis(200), Duration::from_millis(200));
+    let task = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+
+    // 首次连接 + 心跳超时后重连 ⇒ 至少 2 次连接。
+    let reconnected = retry_until(
+        || async {
+            if conns.load(Ordering::SeqCst) >= 2 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("not yet"))
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        reconnected,
+        "client must reconnect after silent control death (heartbeat timeout)"
+    );
+    task.abort();
+}

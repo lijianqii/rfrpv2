@@ -12,8 +12,12 @@ use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::{graceful_close, send_with_timeout, try_send};
+use std::time::Duration;
+
+use rfrp_common::util::now_ms;
 use tokio::io::split;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::ClientState;
@@ -25,6 +29,8 @@ pub async fn control_loop<S>(
     state: Arc<ClientState>,
     config: ClientConfig,
     shutdown: CancellationToken,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -94,6 +100,36 @@ where
         return Ok(());
     }
 
+    // 心跳看门狗（与服务端对称，§8.3）：周期发送 Heartbeat 并等待 HeartbeatResp，
+    // 超时判定控制连接已失效。半开连接（对端进程挂起、链路静默中断，无 FIN/RST）下
+    // reader 永远不会返回；若无此看门狗，客户端会永久卡住、无法重连
+    // （Windows 上 keepalive 未启用时尤为明显）。
+    let disconnect = Arc::new(Notify::new());
+    let pong = Arc::new(Notify::new());
+    let hb_tx = out_tx.clone();
+    let hb_pong = pong.clone();
+    let hb_disconnect = disconnect.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut iv = interval(heartbeat_interval);
+        iv.tick().await; // 消耗首次立即 tick，避免一建立就连发
+        loop {
+            iv.tick().await;
+            let ts = now_ms();
+            if !try_send(&hb_tx, Message::Heartbeat(Heartbeat { ts })) {
+                // 写通道满：跳过本轮，避免本地拥塞误判断连。
+                continue;
+            }
+            if tokio::time::timeout(heartbeat_timeout, hb_pong.notified())
+                .await
+                .is_err()
+            {
+                tracing::warn!("heartbeat timeout, control connection considered dead");
+                hb_disconnect.notify_one();
+                break;
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             frame = reader.next() => {
@@ -115,6 +151,10 @@ where
                             Message::Heartbeat(h) => {
                                 tracing::debug!(ts = h.ts, "heartbeat received; responding");
                                 try_send(&out_tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
+                            }
+                            Message::HeartbeatResp(_) => {
+                                // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
+                                pong.notify_one();
                             }
                             Message::LoginResp(r) => {
                                 // 路由到连接阶段，供 run() 区分致命 / 可恢复失败（§8.1）。
@@ -154,6 +194,10 @@ where
                     }
                 }
             }
+            _ = disconnect.notified() => {
+                tracing::warn!("control connection dead (heartbeat timeout), reconnecting");
+                break;
+            }
             _ = shutdown.cancelled() => {
                 tracing::info!("shutdown requested, exiting control loop");
                 break;
@@ -161,6 +205,10 @@ where
         }
     }
 
+    // 先停心跳任务并等其结束（释放 out_tx 克隆），再关写通道，
+    // 否则写任务收不到通道关闭信号、只能靠下面的超时强杀。
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
     // 给写任务机会刷出 Close 帧，超时再强杀。
     drop(out_tx);
     let done = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task).await;

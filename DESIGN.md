@@ -516,7 +516,7 @@ rfrp/
 
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
 > - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
-> - 超时（秒）：`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 60`、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
+> - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 60`、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`
 > - 上限：`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
 > - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`、`MAX_ERROR_LEN = 512`
@@ -672,7 +672,9 @@ User → rfrps:remote_port  (Listener 接收)
 - 心跳由**独立定时器驱动**，每 30s 固定发一次 `Heartbeat`，与业务消息流并行，**不依赖"控制连接空闲"**——即使持续有 NewProxy/ReqWorkConn 在传，心跳仍按 30s 周期发送。
 - **首版由 rfrps 主动发起心跳**（rfrps → rfrpc 方向）：rfrps 每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat`，随后在 `HEARTBEAT_TIMEOUT`(10s) 内等待对端 `HeartbeatResp`；超时未收到则判定对端已死，直接断开 TCP 并清理 Session（ping/pong 语义）。rfrpc 维持对 `Heartbeat` 的 `HeartbeatResp` 应答。
   - **实现要点（修复项）**：超时判定必须绑定"本次 Heartbeat 的回应"，而非"距上次收到 Resp 的间隔"。若用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在每次周期 tick 检查，会因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 而在首个周期即误判超时——误杀控制连接 → rfrpc 重连（复用 run_id）→ rfrps 去重清理旧 Session → 中止代理监听（代理端口 `Connection refused`）、回收在用工作连接（在途 SSH 等会话 `closed by remote host`）。改用 `Notify`：发送后 `timeout(HEARTBEAT_TIMEOUT, pong.notified())`，仅当该次心跳未收到回应立即断开。
-- （rfrpc → rfrps 主动心跳方向在 M2 未实现；rfrpc 侧通过 TCP EOF 感知服务端断连并触发重连。若后续需要双向主动心跳，对端需对等应答，语义同上。）
+- **双向主动心跳（已实现）**：rfrpc 同样每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat` 并在 `HEARTBEAT_TIMEOUT`(10s) 内等待 `HeartbeatResp`，超时即断开并进入重连。
+  - **原因**：仅靠 TCP EOF 无法感知**半开连接**——对端进程挂起、链路静默中断（NAT/防火墙丢弃表项）时不会产生 FIN/RST，reader 永久阻塞，客户端将卡死且永不重连（Windows 上未启用 TCP keepalive，尤其明显）。rfrps 早已响应 rfrpc 的 `Heartbeat`（`Message::Heartbeat` → `HeartbeatResp`），故客户端侧补上主动探测即可，语义与服务端一致。
+  - **误判防护**：写通道满时跳过本轮心跳（不等待回应），避免本地拥塞误判断连。
 - 断开后 rfrpc 按指数退避重连（1s → 2s → 4s → … → 30s 上限）。**此为全局唯一重连退避策略**（常量见 §7.1 `RECONNECT_BACKOFF_INITIAL` / `RECONNECT_BACKOFF_MAX`），§8.1 网络错误重连与 §8.5 rfrpc 离线后恢复均复用本策略。
 - 重连复用 `run_id`，rfrps 恢复原 Proxy 监听（若端口仍可用，冲突处理见 6.6）。
 
