@@ -65,6 +65,7 @@ fn client_config(
             tls_ca: Some(cert.to_string_lossy().to_string()),
             work_conn_tls,
             run_id_file: None,
+            status_addr: None,
         },
         proxies,
         log: ClientLogSection::default(),

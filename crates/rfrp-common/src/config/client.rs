@@ -51,6 +51,10 @@ pub struct ClientSection {
     pub work_conn_tls: bool,
     #[serde(default)]
     pub run_id_file: Option<String>,
+    /// 可选状态端点地址（如 `"127.0.0.1:7400"`）：提供 `/`、`/api/status`、`/metrics`。
+    /// 默认关闭；仅只读、无鉴权，建议绑定回环地址。
+    #[serde(default)]
+    pub status_addr: Option<String>,
 }
 
 impl ClientSection {
@@ -160,6 +164,10 @@ impl ClientConfig {
         }
         if self.client.token.is_empty() {
             return Err(config("client token must not be empty"));
+        }
+        if let Some(addr) = &self.client.status_addr {
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|e| config(format!("invalid status_addr '{addr}': {e}")))?;
         }
         if (self.client.tls_enable || self.client.work_conn_tls)
             && self

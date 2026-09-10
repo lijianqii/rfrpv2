@@ -31,6 +31,7 @@ fn client_state_with_resp(name: &str) -> (Arc<ClientState>, oneshot::Receiver<Ne
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let (otx, orx) = oneshot::channel();
     state.resps.lock().unwrap().insert(name.into(), otx);
@@ -46,6 +47,7 @@ fn default_state() -> Arc<ClientState> {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     })
 }
 
@@ -225,6 +227,7 @@ async fn login_resp_routed_to_state() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let (lotx, lorx) = oneshot::channel();
     state.login_tx.lock().unwrap().replace(lotx);

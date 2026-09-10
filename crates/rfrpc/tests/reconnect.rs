@@ -226,3 +226,98 @@ async fn client_reconnects_after_silent_control_death() {
     );
     task.abort();
 }
+
+/// 回归：注册返回可重试错误码（`port occupied`，如旧会话尚未释放端口）时，
+/// 客户端应在后台退避重试并最终注册成功，而不是"连上但代理不可用"。
+#[tokio::test]
+async fn client_retries_retryable_registration_failure() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    use futures::{SinkExt, StreamExt};
+    use rfrp_common::protocol::frame::FrameCodec;
+    use rfrp_common::protocol::msg::{LoginResp, Message, NewProxyResp};
+    use rfrpc::client::Client;
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    // 假服务端：第一次 NewProxy 回 "port occupied"，之后回 ok。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let registered = Arc::new(AtomicUsize::new(0));
+    let (attempts_srv, registered_srv) = (attempts.clone(), registered.clone());
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (attempts, registered) = (attempts_srv.clone(), registered_srv.clone());
+            tokio::spawn(async move {
+                let (r, w) = tokio::io::split(s);
+                let mut r = FramedRead::new(r, FrameCodec);
+                let mut w = FramedWrite::new(w, FrameCodec);
+                while let Some(Ok(frame)) = r.next().await {
+                    match Message::from_frame(&frame) {
+                        Ok(Message::Login(_)) => {
+                            let resp = Message::LoginResp(LoginResp {
+                                ok: true,
+                                error: None,
+                                session_id: Some("fake".into()),
+                                work_conn_tls: Some(false),
+                            });
+                            let _ = w.send(resp.to_frame().unwrap()).await;
+                        }
+                        Ok(Message::NewProxy(np)) => {
+                            let n = attempts.fetch_add(1, Ordering::SeqCst);
+                            let ok = n >= 1; // 首次拒绝，模拟端口被旧会话占用
+                            if ok {
+                                registered.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let resp = Message::NewProxyResp(NewProxyResp {
+                                proxy_name: np.proxy_name,
+                                ok,
+                                error: if ok {
+                                    None
+                                } else {
+                                    Some("port occupied".into())
+                                },
+                            });
+                            let _ = w.send(resp.to_frame().unwrap()).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let echo_port = spawn_echo().await;
+    let mut proxy = tcp_proxy("p1", echo_port, free_port());
+    proxy.pool_size = 0;
+    let cfg = client_config(
+        addr,
+        vec![proxy],
+        Some(unique_run_id_file().to_string_lossy().to_string()),
+    );
+    let client = Client::new(cfg).unwrap();
+    let task = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+
+    // 首次注册被拒 + 后台重试成功 ⇒ 至少 2 次尝试且 1 次成功。
+    let ok = retry_until(
+        || async {
+            if attempts.load(Ordering::SeqCst) >= 2 && registered.load(Ordering::SeqCst) >= 1 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("not yet"))
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        ok,
+        "client must retry retryable registration failure (attempts={}, registered={})",
+        attempts.load(Ordering::SeqCst),
+        registered.load(Ordering::SeqCst)
+    );
+    task.abort();
+}

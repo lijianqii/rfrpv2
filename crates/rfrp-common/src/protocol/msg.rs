@@ -70,6 +70,69 @@ pub struct NewProxyResp {
     pub error: Option<String>,
 }
 
+/// `NewProxyResp.error` 的稳定错误码（DESIGN §6.6）。
+///
+/// 小写英文标识符、**不含变量**（端口号/域名等细节只写服务端日志），
+/// 便于客户端按精确匹配分类处理（如对运行时冲突做重试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyError {
+    /// 代理类型非法。
+    InvalidType,
+    /// 字段缺失或格式错误（含缺失 remote_port / custom_domains）。
+    InvalidField,
+    /// `proxy_name` 已存在。
+    NameExists,
+    /// `remote_port` 超出 `allow_ports`。
+    PortNotAllowed,
+    /// `remote_port` 被占用（**可重试**：如旧会话尚未释放端口）。
+    PortOccupied,
+    /// vhost 域名与其他代理冲突（**可重试**）。
+    DomainConflict,
+    /// 其他内部错误（不可重试）。
+    Internal,
+}
+
+impl ProxyError {
+    /// 协议错误码字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidType => "invalid type",
+            Self::InvalidField => "invalid field",
+            Self::NameExists => "proxy_name exists",
+            Self::PortNotAllowed => "port not allowed",
+            Self::PortOccupied => "port occupied",
+            Self::DomainConflict => "domain conflict",
+            Self::Internal => "internal error",
+        }
+    }
+
+    /// 是否可重试（运行时冲突，端口/域名释放后可成功）。
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::PortOccupied | Self::DomainConflict)
+    }
+
+    /// 从错误码字符串解析（未知码返回 `None`）。
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::InvalidType,
+            Self::InvalidField,
+            Self::NameExists,
+            Self::PortNotAllowed,
+            Self::PortOccupied,
+            Self::DomainConflict,
+            Self::Internal,
+        ]
+        .into_iter()
+        .find(|e| e.as_str() == code)
+    }
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 心跳（双向）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Heartbeat {
@@ -287,5 +350,54 @@ mod tests {
         // 合法 msg_type，但 payload JSON 缺必填字段（结构体形状不匹配）-> 反序列化错误。
         let f = Frame::new(PROTOCOL_VERSION, MSG_HEARTBEAT, b"{}".to_vec());
         assert!(Message::from_frame(&f).is_err());
+    }
+}
+
+#[cfg(test)]
+mod proxy_error_tests {
+    use super::ProxyError;
+
+    #[test]
+    fn codes_match_design_contract() {
+        // DESIGN §6.6：小写英文标识符、不含变量，客户端按精确匹配分类。
+        assert_eq!(ProxyError::InvalidType.as_str(), "invalid type");
+        assert_eq!(ProxyError::InvalidField.as_str(), "invalid field");
+        assert_eq!(ProxyError::NameExists.as_str(), "proxy_name exists");
+        assert_eq!(ProxyError::PortNotAllowed.as_str(), "port not allowed");
+        assert_eq!(ProxyError::PortOccupied.as_str(), "port occupied");
+        assert_eq!(ProxyError::DomainConflict.as_str(), "domain conflict");
+        assert_eq!(ProxyError::Internal.as_str(), "internal error");
+    }
+
+    #[test]
+    fn retryable_classification() {
+        assert!(ProxyError::PortOccupied.is_retryable());
+        assert!(ProxyError::DomainConflict.is_retryable());
+        for e in [
+            ProxyError::InvalidType,
+            ProxyError::InvalidField,
+            ProxyError::NameExists,
+            ProxyError::PortNotAllowed,
+            ProxyError::Internal,
+        ] {
+            assert!(!e.is_retryable(), "{e} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn from_code_roundtrip_and_unknown() {
+        for e in [
+            ProxyError::InvalidType,
+            ProxyError::InvalidField,
+            ProxyError::NameExists,
+            ProxyError::PortNotAllowed,
+            ProxyError::PortOccupied,
+            ProxyError::DomainConflict,
+            ProxyError::Internal,
+        ] {
+            assert_eq!(ProxyError::from_code(e.as_str()), Some(e));
+        }
+        assert_eq!(ProxyError::from_code("boom"), None);
+        assert_eq!(ProxyError::from_code(""), None);
     }
 }

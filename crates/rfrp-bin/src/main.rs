@@ -113,6 +113,50 @@ fn init_logging(log: &LogSection, overrides: &LogOverrides) {
     );
 }
 
+/// 打印服务端启动摘要（版本与关键配置；不打印 token）。
+fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bind = %format!("{}:{}", cfg.server.bind_addr, cfg.server.bind_port),
+        tls = cfg.server.tls_enable,
+        work_conn_tls = cfg.server.work_conn_tls,
+        allow_ports = if cfg.proxy.allow_ports.trim().is_empty() {
+            "all"
+        } else {
+            cfg.proxy.allow_ports.as_str()
+        },
+        vhost_http = ?cfg.proxy.vhost_http_port,
+        vhost_https = ?cfg.proxy.vhost_https_port,
+        dashboard = cfg.dashboard.is_some(),
+        log_level = cfg.log.level.as_deref().unwrap_or("info"),
+        "rfrps starting"
+    );
+}
+
+/// 打印客户端启动摘要（版本、服务端地址、代理清单；不打印 token）。
+fn log_client_summary(cfg: &rfrp_common::config::ClientConfig) {
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        server = %format!("{}:{}", cfg.client.server_addr, cfg.client.server_port),
+        proxies = cfg.proxies.len(),
+        tls = cfg.client.tls_enable,
+        work_conn_tls = cfg.client.work_conn_tls,
+        run_id_file = ?cfg.client.run_id_file,
+        "rfrpc starting"
+    );
+    for p in &cfg.proxies {
+        tracing::info!(
+            name = %p.name,
+            kind = ?p.r#type,
+            local = %format!("{}:{}", p.local_ip, p.local_port),
+            remote_port = ?p.remote_port,
+            domains = ?p.custom_domains,
+            pool_size = p.pool_size,
+            "proxy configured"
+        );
+    }
+}
+
 /// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
 async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     let mut cfg = match rfrp_common::config::load_server_config(&args.config) {
@@ -141,6 +185,7 @@ async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         return ExitCode::FAILURE;
     }
     init_logging(&cfg.log, &log);
+    log_server_summary(&cfg);
 
     let server = match rfrps::Server::new(cfg).await {
         Ok(s) => s,
@@ -192,6 +237,7 @@ async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
         return ExitCode::FAILURE;
     }
     init_logging(&cfg.log, &log);
+    log_client_summary(&cfg);
 
     let client = match rfrpc::Client::new(cfg) {
         Ok(c) => c,

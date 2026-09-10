@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::DashboardSection;
+use rfrp_common::util::http::{read_request_head, write_response};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
@@ -101,25 +101,6 @@ async fn handle_request(
     }
 }
 
-/// 读取请求头（到 `\r\n\r\n` 为止），最大 8KB。
-async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(Some(buf));
-        }
-        if buf.len() > 8192 {
-            return Ok(Some(buf)); // 超限按整段处理，路径解析失败返回 /
-        }
-    }
-}
-
 fn authorized(head: &[u8], cfg: &DashboardSection) -> bool {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -172,18 +153,17 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         })
         .collect();
 
-    let udp_sessions: usize = state
-        .udp
-        .lock()
-        .unwrap()
-        .values()
-        .map(|p| p.sessions.lock().unwrap().len())
-        .sum();
+    drop(sessions);
+    let g = state.gauges();
 
     json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.metrics.uptime_secs(),
         "sessions": session_list,
-        "pending_work": state.pending.lock().unwrap().len(),
-        "udp_sessions": udp_sessions,
+        "pending_work": g.pending_work,
+        "udp_sessions": g.udp_sessions,
+        "proxies": g.proxies,
+        "pooled_work_conns": g.pooled_work_conns,
         "metrics": {
             "total_connections": state.metrics.total_connections.load(std::sync::atomic::Ordering::Relaxed),
             "active_connections": state.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),
@@ -194,12 +174,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
 }
 
 fn render_metrics(state: &Arc<ServerState>) -> String {
-    let mut text = state.metrics.render();
-    let sessions = state.sessions.lock().unwrap().len();
-    text.push_str(&format!(
-        "# TYPE rfrp_sessions gauge\nrfrp_sessions {sessions}\n"
-    ));
-    text
+    crate::metrics::render_prometheus(state)
 }
 
 fn render_html(state: &Arc<ServerState>) -> String {
@@ -228,42 +203,27 @@ fn render_html(state: &Arc<ServerState>) -> String {
         })
         .unwrap_or_default();
 
+    let g = state.gauges();
+    let uptime = state.metrics.uptime_secs();
     format!(
-        "<html><head><title>rfrp dashboard</title></head><body>\
-         <h1>rfrp dashboard</h1>\
+        "<html><head><title>rfrp dashboard</title>\
+         <meta http-equiv=\"refresh\" content=\"5\"></head><body>\
+         <h1>rfrp dashboard <small>v{}</small></h1>\
+         <p>uptime: {}s | sessions: {} | proxies: {} | pending work: {} | udp sessions: {} | pooled work conns: {}</p>\
          <h2>Metrics</h2><pre>{}</pre>\
          <h2>Sessions</h2>\
          <table border=1><tr><th>run_id</th><th>session_id</th><th>proxies</th></tr>{}</table>\
          </body></html>",
-        state.metrics.render(),
+        env!("CARGO_PKG_VERSION"),
+        uptime,
+        g.sessions,
+        g.proxies,
+        g.pending_work,
+        g.udp_sessions,
+        g.pooled_work_conns,
+        crate::metrics::render_prometheus(state),
         sessions_html
     )
-}
-
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &str,
-    extra_header: Option<&str>,
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        _ => "OK",
-    };
-    let mut resp = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    if let Some(h) = extra_header {
-        resp.push_str(h);
-        resp.push_str("\r\n");
-    }
-    resp.push_str("Connection: close\r\n\r\n");
-    resp.push_str(body);
-    stream.write_all(resp.as_bytes()).await
 }
 
 /// 简单的每 IP 请求限频（滑动窗口计数）。

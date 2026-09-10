@@ -46,6 +46,15 @@ pub const TCP_KEEPALIVE_INTERVAL: u64 = 30;
 /// TCP keepalive 探测间隔（秒）。
 pub const TCP_KEEPALIVE_PROBE_INTERVAL: u64 = 5;
 
+// ---- 代理注册重试（运行时冲突，DESIGN §6.6）----
+
+/// 注册失败（port occupied / domain conflict）后的首次重试延迟。
+pub const PROXY_REGISTER_RETRY_INITIAL: u64 = 2;
+/// 注册重试最大轮数（退避 2s→…→30s，约 2 分钟，覆盖旧会话释放端口的窗口）。
+pub const PROXY_REGISTER_RETRY_MAX: u32 = 8;
+/// 注册重试退避上限。
+pub const PROXY_REGISTER_RETRY_MAX_DELAY: u64 = 30;
+
 /// 重连退避初值。
 pub const RECONNECT_BACKOFF_INITIAL: u64 = 1;
 /// 重连退避上限。

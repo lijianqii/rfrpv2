@@ -251,7 +251,15 @@ where
                                 let result = listener::register_proxy(&np, &session, &state, &config).await;
                                 let (ok, error) = match result {
                                     Ok(()) => (true, None),
-                                    Err(e) => (false, Some(e.to_string())),
+                                    Err(e) => {
+                                        // 失败详情（端口占用、权限等）已由 register_proxy
+                                        // 记入服务端日志；对端只收到稳定错误码（§6.6）。
+                                        tracing::warn!(
+                                            session = %session_id, proxy = %np.proxy_name,
+                                            code = e.as_str(), "proxy registration failed"
+                                        );
+                                        (false, Some(e.as_str().to_string()))
+                                    }
                                 };
                                 if !send_with_timeout(&tx, Message::NewProxyResp(NewProxyResp {
                                     proxy_name: np.proxy_name,

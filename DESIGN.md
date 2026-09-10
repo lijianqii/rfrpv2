@@ -419,7 +419,9 @@ rfrps 收到 `NewProxy` 后按顺序校验，任一失败返回 `NewProxyResp{ok
 | 字段缺失/格式错误 | `"invalid field"` | 配置错误，记日志，不重试 |
 | 内部错误（如监听失败） | `"internal error"` | rfrpc 记日志，不重试 |
 
-> error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。rfrpc 收到 `ok=false` 时按上表分类：`"port occupied"` / `"domain conflict"` 在重连恢复场景保留 Proxy 条目待下次重试，其余视为配置错误跳过。
+> error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。
+>
+> **实现**（`rfrp_common::ProxyError` 为唯一来源）：rfrpc 收到 `ok=false` 时按上表分类——`"port occupied"` / `"domain conflict"` 交由后台任务退避重试（`PROXY_REGISTER_RETRY_*`，不阻塞控制循环、不影响其他 Proxy）；其余视为配置错误记 error 日志并跳过。服务端在 `register_proxy` 失败时记录 `code` 与详细原因，便于两端日志关联。
 
 #### 重连恢复冲突
 
@@ -469,6 +471,7 @@ rfrp/
 │   │       └── util/          # 通用工具
 │   │           ├── bridge.rs    # 双向桥接（32 KiB 缓冲）
 │   │           ├── control.rs   # 控制消息发送原语（try_send / 超时发送 / 优雅关闭）
+│   │           ├── http.rs      # 极简 HTTP 响应工具（Dashboard/客户端状态端点共用）
 │   │           ├── counting.rs  # 流量计数流包装（批量刷新）
 │   │           ├── stream.rs    # BoxedStream / PrependStream
 │   │           ├── tcp.rs       # TCP 参数（NODELAY/keepalive）
@@ -501,6 +504,8 @@ rfrp/
 │   │       ├── control/tests.rs
 │   │       ├── workconn.rs    # 工作连接：回连服务端 + 本地服务 + 桥接
 │   │       ├── workconn/tests.rs
+│   │       ├── metrics.rs     # 客户端指标（重连/工作连接/注册计数）
+│   │       ├── status.rs      # 可选状态端点（/、/api/status、/metrics）
 │   │       └── cli.rs         # CLI 参数覆盖配置
 │   └── rfrp-bin/              # 统一二进制入口
 │       └── src/
@@ -518,6 +523,7 @@ rfrp/
 > - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
 > - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 60`、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`
+> - 代理注册重试（秒）：`PROXY_REGISTER_RETRY_INITIAL = 2`、`PROXY_REGISTER_RETRY_MAX = 8`（轮）、`PROXY_REGISTER_RETRY_MAX_DELAY = 30`
 > - 上限：`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
 > - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`、`MAX_ERROR_LEN = 512`
 
@@ -714,8 +720,8 @@ User → rfrps:remote_port  (Listener 接收)
 **rfrps 监听 remote_port 失败：**
 
 - rfrps 在 NewProxy 校验通过后尝试 bind `remote_port`（TCP/UDP 类型），可能因权限不足（特权端口 <1024 非 root）、端口已被系统其他进程占用等原因失败。
-- bind 失败时，rfrps 返回 `NewProxyResp{ok:false, error:"internal error"}`，不区分具体原因（避免回显系统信息）；rfrps 侧日志记录详细 bind 错误。
-- rfrpc 收到 `"internal error"` 按 6.6 error 表处理：记日志，不重试该 Proxy，不中断其他 Proxy。
+- bind 失败时按错误类型返回稳定错误码（§6.6）：`AddrInUse` → `"port occupied"`（可重试）；权限不足等其他错误 → `"internal error"`（不可重试）。**具体原因只写 rfrps 侧日志**（含 io error 与端口），不回显给对端。
+- rfrpc 收到 `"port occupied"` 后按 §6.6 在后台退避重试（2s→…→30s，约 2 分钟，覆盖旧会话心跳超时释放端口的窗口）；`"internal error"` 等其他错误记日志且不重试，均不中断其他 Proxy。
 - HTTP/HTTPS 类型不涉及独立端口 bind（走共享 vhost 监听），无此场景。
 
 ### 8.6 UDP 代理
@@ -796,6 +802,7 @@ tls_server_name = "your.server.com"
 tls_ca = "./ca.pem"               # 可选；自签证书场景指定 CA/服务端证书，缺省使用系统/webpki 根证书
 work_conn_tls = true              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
+# status_addr = "127.0.0.1:7400"  # 可选状态端点（/、/api/status、/metrics）；默认关闭
 
 [[proxy]]
 name = "ssh"
@@ -835,6 +842,7 @@ CLI 参数 > 配置文件 > 默认值。
 - **proxy 唯一性**：客户端配置内 `[[proxy]]` 的 `name` 不重复，`remote_port` 不重复（同一客户端内）。服务端另有全局唯一校验，见 6.6。
 - **类型与字段匹配**：`type = http/https` 必须有 `custom_domains`；`type = tcp/udp` 必须有 `remote_port`。
 - **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时必须可解析为合法 IPv4/IPv6 地址（`std::net::IpAddr` 解析）。
+- **status_addr 格式**：客户端可选状态端点地址，提供时必须可解析为 `SocketAddr`（如 `127.0.0.1:7400`）。
 - **pool_size 通用**：`pool_size` 对所有代理类型（tcp/udp/http/https）生效，省略默认 1。类型为 u32，≥0；0 表示禁用预热纯按需（见 8.2）；建议上限 16（超过记警告但不拒绝，防止资源耗尽）。
 - **vhost 端口与 proxy 类型交叉**：`vhost_http_port` 配置但无 HTTP 类型 proxy、`vhost_https_port` 配置但无 HTTPS 类型 proxy——视为**配置冗余，不报错**（vhost 监听仍启动，只是无流量，方便后续动态添加 proxy）。反之，有 HTTP/HTTPS proxy 但未配对应 vhost 端口——启动**报错**（proxy 无法路由）。
 - **dashboard 段校验**（仅服务端，`[dashboard]` 段存在时）：
@@ -977,6 +985,7 @@ rfrp/
 ├── rust-toolchain.toml       # 工具链版本固定
 ├── Makefile                  # make ci / release / gen-cert 等入口
 ├── DESIGN.md                 # 设计文档（本文件）
+├── CHANGELOG.md              # 变更记录（Keep a Changelog）
 ├── README.md / LICENSE
 ├── docs/                     # 性能基线与平台说明
 │   ├── BENCHMARKS.md

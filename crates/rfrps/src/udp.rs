@@ -50,10 +50,19 @@ pub async fn register_udp_proxy(
     session: &Arc<Session>,
     state: &Arc<ServerState>,
     bind_addr: &str,
-) -> Result<JoinHandle<()>> {
-    let socket = UdpSocket::bind((bind_addr, remote_port))
-        .await
-        .map_err(|_| rfrp_common::Error::Config("internal error".into()))?;
+) -> std::result::Result<JoinHandle<()>, ProxyError> {
+    let socket = match UdpSocket::bind((bind_addr, remote_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            // 具体原因只写服务端日志（DESIGN §8.5）。
+            tracing::warn!(%proxy_name, remote_port, error = %e, "failed to bind udp proxy port");
+            return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
+                ProxyError::PortOccupied
+            } else {
+                ProxyError::Internal
+            });
+        }
+    };
     let proxy = Arc::new(UdpProxy {
         socket: Arc::new(socket),
         sessions: Mutex::new(HashMap::new()),

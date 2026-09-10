@@ -24,6 +24,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     let proxy = match state.proxies.get(&req.proxy_name) {
         Some(p) => p,
         None => {
+            state.metrics.inc_work_conn_failure();
             tracing::warn!(proxy = %req.proxy_name, "unknown proxy for work connection");
             return Ok(());
         }
@@ -36,13 +37,17 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         TcpStream::connect(state.server_addr),
     )
     .await
-    .map_err(|_| Error::Other("work connection connect timeout".into()))??;
+    .map_err(|_| {
+        state.metrics.inc_work_conn_failure();
+        Error::Other("work connection connect timeout".into())
+    })??;
     if let Err(e) = configure_tcp_stream(&work) {
         tracing::warn!(proxy = %req.proxy_name, error = %e, "failed to configure work TCP stream");
     }
     let use_tls = *state.work_conn_tls.lock().unwrap();
     let work: BoxedStream = if use_tls {
         let tls = state.tls.as_ref().ok_or_else(|| {
+            state.metrics.inc_work_conn_failure();
             Error::Other("work_conn_tls enabled but client TLS not initialized".into())
         })?;
         let tls_work = timeout(
@@ -50,7 +55,10 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             tls.connect(work),
         )
         .await
-        .map_err(|_| Error::Other("work connection TLS handshake timeout".into()))??;
+        .map_err(|_| {
+            state.metrics.inc_work_conn_failure();
+            Error::Other("work connection TLS handshake timeout".into())
+        })??;
         Box::new(tls_work)
     } else {
         Box::new(work)
@@ -63,6 +71,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         // UDP：本地用 UDP socket，工作连接上按长度前缀分帧（DESIGN §8.6）。
         let local = UdpSocket::bind("0.0.0.0:0").await?;
         if let Err(e) = local.connect(&local_addr).await {
+            state.metrics.inc_work_conn_failure();
             tracing::warn!(proxy = %req.proxy_name, error = %e, "local udp connect failed; closing work connection");
             return Ok(());
         }
@@ -76,6 +85,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             )
             .await?;
         let work_stream = framed.into_inner();
+        state.metrics.inc_work_conn();
         tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "udp work connection established");
         return udp_bridge(work_stream, local, &req).await;
     }
@@ -96,10 +106,12 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         }
         Ok(Err(e)) => {
             // 本地连不上：直接关闭工作连接（TCP FIN），服务端不会入池。
+            state.metrics.inc_work_conn_failure();
             tracing::warn!(proxy = %req.proxy_name, error = %e, "local connect failed; closing work connection");
             return Ok(());
         }
         Err(_) => {
+            state.metrics.inc_work_conn_failure();
             tracing::warn!(proxy = %req.proxy_name, "local connect timeout; closing work connection");
             return Ok(());
         }
@@ -117,6 +129,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     // 首帧之后为透传字节，取回原始流（明文或 TLS）。
     let work_stream = framed.into_inner();
 
+    state.metrics.inc_work_conn();
     tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "work connection established");
     let _ = bridge(work_stream, local).await;
     tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, "work bridge finished");

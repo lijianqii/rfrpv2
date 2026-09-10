@@ -18,6 +18,21 @@ pub struct PendingWork {
     pub user: Option<BoxedStream>,
 }
 
+/// 瞬时 gauge 快照（Dashboard/Prometheus 共用，避免各自重复遍历加锁）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gauges {
+    /// 活跃控制会话数。
+    pub sessions: usize,
+    /// 已注册代理总数（含 TCP/UDP/HTTP/HTTPS）。
+    pub proxies: usize,
+    /// 等待工作连接的用户连接数。
+    pub pending_work: usize,
+    /// UDP 活跃会话数（所有 UDP 代理求和）。
+    pub udp_sessions: usize,
+    /// 池中空闲工作连接数（所有会话求和）。
+    pub pooled_work_conns: usize,
+}
+
 /// 服务端共享状态（所有 accept 任务共享）。
 pub struct ServerState {
     /// 全局自增 work_id 生成器（从 1 开始，0 为保留值，见 DESIGN §6.2.1）。
@@ -52,6 +67,35 @@ impl ServerState {
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// 采样瞬时 gauge（会短暂持有 sessions/udp 等锁，均为短临界区）。
+    pub fn gauges(&self) -> Gauges {
+        let sessions = self.sessions.lock().unwrap();
+        let mut g = Gauges {
+            sessions: sessions.len(),
+            ..Default::default()
+        };
+        for s in sessions.values() {
+            g.proxies += s.proxies.lock().unwrap().len();
+            g.pooled_work_conns += s
+                .pools
+                .lock()
+                .unwrap()
+                .values()
+                .map(|v| v.len())
+                .sum::<usize>();
+        }
+        drop(sessions);
+        g.pending_work = self.pending.lock().unwrap().len();
+        g.udp_sessions = self
+            .udp
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.sessions.lock().unwrap().len())
+            .sum();
+        g
     }
 
     /// 分配下一个 work_id（≥1）。原子 RMW 已保证唯一性，Relaxed 足够。
@@ -123,6 +167,40 @@ mod tests {
         state.unindex_proxies(vec!["web".into(), "udp-x".into()]);
         assert!(state.session_for_proxy("web").is_none());
         assert!(state.session_for_proxy("udp-x").is_none());
+    }
+
+    #[tokio::test]
+    async fn gauges_count_sessions_proxies_and_pools() {
+        let state = ServerState::new();
+        let s1 = test_session("r1");
+        // 一个代理 + 两条池连接
+        s1.proxies.lock().unwrap().insert(
+            "web".into(),
+            crate::control::ProxyEntry {
+                handle: tokio::spawn(async {}),
+                kind: rfrp_common::protocol::msg::ProxyType::Tcp,
+            },
+        );
+        s1.pools
+            .lock()
+            .unwrap()
+            .insert("web".into(), vec![Box::new(tokio::io::duplex(8).0)]);
+        state.sessions.lock().unwrap().insert("r1".into(), s1);
+        state.pending.lock().unwrap().insert(
+            1,
+            PendingWork {
+                proxy_name: "web".into(),
+                session_id: "sid".into(),
+                user: None,
+            },
+        );
+
+        let g = state.gauges();
+        assert_eq!(g.sessions, 1);
+        assert_eq!(g.proxies, 1);
+        assert_eq!(g.pooled_work_conns, 1);
+        assert_eq!(g.pending_work, 1);
+        assert_eq!(g.udp_sessions, 0);
     }
 
     #[test]

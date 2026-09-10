@@ -84,7 +84,10 @@ async fn register_rejects_missing_remote_port() {
         remote_port: None,
         custom_domains: None,
     };
-    assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    let err = register_proxy(&np, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::InvalidField);
 }
 
 #[tokio::test]
@@ -99,7 +102,10 @@ async fn register_rejects_port_not_allowed() {
         remote_port: Some(18080),
         custom_domains: None,
     };
-    assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    let err = register_proxy(&np, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::PortNotAllowed);
 }
 
 #[tokio::test]
@@ -121,7 +127,10 @@ async fn register_ok_then_duplicate_name_rejected() {
         remote_port: Some(free_port()),
         custom_domains: None,
     };
-    assert!(register_proxy(&np2, &session, &state, &cfg).await.is_err());
+    let err = register_proxy(&np2, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::NameExists);
 }
 
 #[tokio::test]
@@ -138,8 +147,11 @@ async fn register_rejects_occupied_port() {
         remote_port: Some(port),
         custom_domains: None,
     };
-    // occupied 持有该端口直至 drop，注册应失败（内部错误）。
-    assert!(register_proxy(&np, &session, &state, &cfg).await.is_err());
+    // occupied 持有该端口直至 drop，注册应失败并返回可重试的 port occupied（§6.6）。
+    let err = register_proxy(&np, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::PortOccupied);
 }
 
 #[tokio::test]
@@ -285,8 +297,10 @@ async fn register_http_domain_conflict_rejected() {
         remote_port: None,
         custom_domains: Some(vec!["dev.example.com".into()]),
     };
-    let r = register_proxy(&np2, &session_b, &state, &cfg).await;
-    assert!(r.is_err(), "duplicate domain should be rejected");
+    let err = register_proxy(&np2, &session_b, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::DomainConflict);
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@ pub mod util;
 pub use error::{Error, Result};
 pub use protocol::frame::{Frame, FrameCodec};
 pub use protocol::msg::{
-    Close, Heartbeat, HeartbeatResp, Login, LoginResp, Message, NewProxy, NewProxyResp, ProxyType,
-    ReqWorkConn, StartWorkConn, MSG_CLOSE, MSG_HEARTBEAT, MSG_HEARTBEAT_RESP, MSG_LOGIN,
+    Close, Heartbeat, HeartbeatResp, Login, LoginResp, Message, NewProxy, NewProxyResp, ProxyError,
+    ProxyType, ReqWorkConn, StartWorkConn, MSG_CLOSE, MSG_HEARTBEAT, MSG_HEARTBEAT_RESP, MSG_LOGIN,
     MSG_LOGIN_RESP, MSG_NEW_PROXY, MSG_NEW_PROXY_RESP, MSG_REQ_WORK_CONN, MSG_START_WORK_CONN,
 };

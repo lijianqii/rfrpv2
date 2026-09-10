@@ -14,6 +14,8 @@ futures = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
+httparse = { workspace = true }
 
 [dev-dependencies]
 rfrps = { path = "../rfrps" }

@@ -8,6 +8,8 @@
 pub mod cli;
 pub mod client;
 pub mod control;
+pub mod metrics;
+pub mod status;
 pub mod workconn;
 
 pub use client::Client;

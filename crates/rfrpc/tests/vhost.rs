@@ -337,6 +337,7 @@ async fn http_vhost_with_tls_work_conn() {
             tls_ca: Some(ca.to_string_lossy().to_string()),
             work_conn_tls: true,
             run_id_file: None,
+            status_addr: None,
         },
         proxies: vec![proxy],
         log: rfrp_common::config::ClientLogSection::default(),

@@ -78,6 +78,7 @@ pub fn client_config(
             tls_ca: None,
             work_conn_tls: false,
             run_id_file,
+            status_addr: None,
         },
         proxies,
         log: ClientLogSection::default(),

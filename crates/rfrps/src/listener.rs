@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use rfrp_common::config::ServerConfig;
+use rfrp_common::constants::*;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::counting::CountingStream;
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
-use rfrp_common::{constants::*, error::Result};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
@@ -21,24 +21,33 @@ use crate::state::{PendingWork, ServerState};
 use crate::vhost::find_proxy_by_domain;
 use rfrp_common::util::control::{send_with_timeout, try_send};
 
+/// 端口是否在 `allow_ports` 允许范围内（fail-closed：配置解析失败视为不允许）。
+fn port_allowed(config: &ServerConfig, port: u16) -> bool {
+    config.proxy.is_port_allowed(port).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "invalid allow_ports config; rejecting proxy registration");
+        false
+    })
+}
+
 /// 注册代理：TCP 在 `remote_port` 起监听；HTTP 走共享 vhost 监听，仅登记域名。
 pub async fn register_proxy(
     np: &NewProxy,
     session: &Arc<Session>,
     state: &Arc<ServerState>,
     config: &ServerConfig,
-) -> Result<()> {
+) -> std::result::Result<(), ProxyError> {
     if matches!(np.r#type, ProxyType::Http | ProxyType::Https) {
         // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
-        let domains = np.custom_domains.as_ref().ok_or_else(|| {
-            rfrp_common::Error::Config("http/https proxy requires custom_domains".into())
-        })?;
+        let domains = np.custom_domains.as_ref().ok_or(ProxyError::InvalidField)?;
         // 域名全局唯一：与其他代理冲突则拒绝（DESIGN §6.6）。
+        // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
         for d in domains {
             if let Some((_, owner)) = find_proxy_by_domain(state, d) {
-                return Err(rfrp_common::Error::Config(format!(
-                    "domain conflict: {d} owned by {owner}"
-                )));
+                tracing::warn!(
+                    proxy = %np.proxy_name, domain = %d, owner = %owner,
+                    "vhost domain conflict, registration rejected"
+                );
+                return Err(ProxyError::DomainConflict);
             }
         }
         let mut map = session.proxy_domains.lock().unwrap();
@@ -58,16 +67,14 @@ pub async fn register_proxy(
         return Ok(());
     }
     if np.r#type == ProxyType::Udp {
-        let remote_port = np
-            .remote_port
-            .ok_or_else(|| rfrp_common::Error::Config("udp proxy requires remote_port".into()))?;
-        if !config.proxy.is_port_allowed(remote_port)? {
-            return Err(rfrp_common::Error::Config("port not allowed".into()));
+        let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
+        if !port_allowed(config, remote_port) {
+            return Err(ProxyError::PortNotAllowed);
         }
         {
             let proxies = session.proxies.lock().unwrap();
             if proxies.contains_key(&np.proxy_name) {
-                return Err(rfrp_common::Error::Config("proxy_name exists".into()));
+                return Err(ProxyError::NameExists);
             }
         }
         let handle = crate::udp::register_udp_proxy(
@@ -90,26 +97,34 @@ pub async fn register_proxy(
         return Ok(());
     }
     if np.r#type != ProxyType::Tcp {
-        return Err(rfrp_common::Error::Config("unsupported proxy type".into()));
+        return Err(ProxyError::InvalidType);
     }
-    let remote_port = np
-        .remote_port
-        .ok_or_else(|| rfrp_common::Error::Config("tcp proxy requires remote_port".into()))?;
-    if !config.proxy.is_port_allowed(remote_port)? {
-        return Err(rfrp_common::Error::Config("port not allowed".into()));
+    let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
+    if !port_allowed(config, remote_port) {
+        return Err(ProxyError::PortNotAllowed);
     }
     {
         let proxies = session.proxies.lock().unwrap();
         if proxies.contains_key(&np.proxy_name) {
-            return Err(rfrp_common::Error::Config("proxy_name exists".into()));
+            return Err(ProxyError::NameExists);
         }
     }
 
-    let listener = TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await;
-    let listener = match listener {
+    let listener = match TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await {
         Ok(l) => l,
-        // 端口占用/权限问题不回显具体原因（见 DESIGN §8.5）。
-        Err(_) => return Err(rfrp_common::Error::Config("internal error".into())),
+        Err(e) => {
+            // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
+            // 权限不足等归为不可重试的内部错误。
+            tracing::warn!(
+                proxy = %np.proxy_name, remote_port, error = %e,
+                "failed to bind proxy port"
+            );
+            return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
+                ProxyError::PortOccupied
+            } else {
+                ProxyError::Internal
+            });
+        }
     };
 
     let proxy_name = np.proxy_name.clone();

@@ -2,6 +2,7 @@
 pub mod bridge;
 pub mod control;
 pub mod counting;
+pub mod http;
 pub mod platform;
 pub mod signal;
 pub mod stream;
