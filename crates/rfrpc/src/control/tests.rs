@@ -405,3 +405,49 @@ async fn heartbeat_keeps_alive_when_peer_responds() {
     assert!(!task.is_finished(), "control loop must stay alive");
     task.abort();
 }
+
+#[tokio::test]
+async fn heartbeat_resp_updates_rtt_metric() {
+    // 客户端同样用 HeartbeatResp.ts 计算控制链路 RTT（rfrp_client_rtt_ms）。
+    let (client_end, server_end) = duplex(8192);
+    let (_tx, rx) = mpsc::channel::<Message>(64);
+    let state = default_state();
+    let task = tokio::spawn(control_loop(
+        client_end,
+        rx,
+        state.clone(),
+        ClientConfig::default(),
+        CancellationToken::new(),
+        Duration::from_millis(20),
+        Duration::from_millis(200),
+    ));
+
+    let (sr, sw) = split(server_end);
+    let mut sr = FramedRead::new(sr, FrameCodec);
+    let mut sw = FramedWrite::new(sw, FrameCodec);
+    let _ = recv_msg(&mut sr).await; // Login
+
+    let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut sr))
+        .await
+        .expect("heartbeat");
+    if let Message::Heartbeat(h) = hb {
+        send_msg(
+            &mut sw,
+            Message::HeartbeatResp(HeartbeatResp {
+                ts: h.ts.saturating_sub(50),
+            }),
+        )
+        .await;
+    }
+
+    let mut seen = 0;
+    for _ in 0..50 {
+        seen = state.metrics.rtt_ms();
+        if seen >= 50 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(seen >= 50, "rtt_ms should be >= 50, got {seen}");
+    task.abort();
+}

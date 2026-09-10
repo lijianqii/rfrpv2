@@ -48,10 +48,23 @@ pub fn load_server_tls(cert_path: &Path, key_path: &Path) -> Result<ServerConfig
         .map_err(|e| config(format!("invalid TLS key {}: {e}", key_path.display())))?
         .ok_or_else(|| config(format!("no private key found in {}", key_path.display())))?;
 
-    ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| config(format!("failed to build server TLS config: {e}")))
+        .map_err(|e| config(format!("failed to build server TLS config: {e}")))?;
+    enable_session_resumption(&mut cfg)?;
+    Ok(cfg)
+}
+
+/// 启用 TLS 1.3 会话票据（session ticket），使重复握手可恢复。
+///
+/// rustls 服务端默认 `ticketer = NeverProducesTickets`，即 **TLS 1.3 无法恢复会话**；
+/// 对频繁建立工作连接的场景（如 SSH + `pool_size = 0`），每次连接都要做完整握手
+/// （跨网 2 RTT）。启用票据后恢复握手只需 1 RTT。TLS 1.2 的会话缓存默认已启用。
+fn enable_session_resumption(cfg: &mut ServerConfig) -> Result<()> {
+    cfg.ticketer = rustls::crypto::ring::Ticketer::new()
+        .map_err(|e| config(format!("failed to init TLS ticketer: {e}")))?;
+    Ok(())
 }
 
 /// 从 PEM 文件加载客户端根证书；未指定 CA 时使用 webpki 内置根证书。
@@ -176,5 +189,17 @@ mod tests {
             ..Default::default()
         };
         assert!(ClientTls::new(&cfg).is_ok());
+    }
+
+    #[test]
+    fn server_tls_enables_tls13_session_resumption() {
+        // rustls 服务端默认不产生 TLS 1.3 票据；启用后 ticketer.enabled() 为 true。
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let cfg = load_server_tls(&dir.join("cert.pem"), &dir.join("key.pem"))
+            .expect("load example cert");
+        assert!(
+            cfg.ticketer.enabled(),
+            "TLS 1.3 session tickets must be enabled for resumption"
+        );
     }
 }

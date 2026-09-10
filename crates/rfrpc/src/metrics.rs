@@ -17,6 +17,8 @@ pub struct ClientMetrics {
     pub work_conns_total: AtomicU64,
     /// 工作连接建立失败次数（未知代理/建连失败/本地服务不可达等）。
     pub work_conn_failures_total: AtomicU64,
+    /// 最近一次控制链路 RTT（毫秒；0 = 尚未测得）。
+    pub rtt_ms: AtomicU64,
     /// 代理注册失败次数（含可重试与不可重试）。
     pub proxy_register_failures_total: AtomicU64,
     /// 后台重试后注册成功的代理数。
@@ -37,6 +39,7 @@ impl ClientMetrics {
             reconnects_total: AtomicU64::new(0),
             work_conns_total: AtomicU64::new(0),
             work_conn_failures_total: AtomicU64::new(0),
+            rtt_ms: AtomicU64::new(0),
             proxy_register_failures_total: AtomicU64::new(0),
             proxy_register_retry_success_total: AtomicU64::new(0),
         }
@@ -53,6 +56,16 @@ impl ClientMetrics {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// 记录控制链路 RTT（毫秒）。
+    pub fn set_rtt_ms(&self, ms: u64) {
+        self.rtt_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 最近一次控制链路 RTT（毫秒；0 = 未测得）。
+    pub fn rtt_ms(&self) -> u64 {
+        self.rtt_ms.load(Ordering::Relaxed)
     }
 
     pub fn inc_reconnect(&self) {
@@ -84,6 +97,9 @@ impl ClientMetrics {
             "# HELP rfrp_client_uptime_seconds Client process uptime in seconds.\n\
              # TYPE rfrp_client_uptime_seconds gauge\n\
              rfrp_client_uptime_seconds {}\n\
+             # HELP rfrp_client_rtt_ms Control connection round-trip time in milliseconds (0 = unknown).\n\
+             # TYPE rfrp_client_rtt_ms gauge\n\
+             rfrp_client_rtt_ms {}\n\
              # HELP rfrp_client_connected Whether the control connection is logged in (1/0).\n\
              # TYPE rfrp_client_connected gauge\n\
              rfrp_client_connected {}\n\
@@ -103,6 +119,7 @@ impl ClientMetrics {
              # TYPE rfrp_client_proxy_register_retry_success_total counter\n\
              rfrp_client_proxy_register_retry_success_total {}\n",
             self.uptime_secs(),
+            self.rtt_ms(),
             u8::from(self.is_connected()),
             self.reconnects_total.load(Ordering::Relaxed),
             self.work_conns_total.load(Ordering::Relaxed),

@@ -58,6 +58,7 @@ async fn status_endpoint_serves_status_and_metrics() {
     let body = get_with_retry(status_port, "/api/status", Duration::from_secs(5)).await;
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
     assert_eq!(json["connected"], true);
+    assert!(json["rtt_ms"].as_u64().is_some());
     assert_eq!(json["proxies"].as_array().unwrap().len(), 1);
     assert_eq!(json["proxies"][0]["name"], "p1");
     assert!(json["uptime_seconds"].as_u64().is_some());
@@ -68,6 +69,8 @@ async fn status_endpoint_serves_status_and_metrics() {
     assert!(metrics.contains("rfrp_client_connected 1"));
     assert!(metrics.contains("rfrp_client_work_conns_total"));
     assert!(metrics.contains("rfrp_client_reconnects_total"));
+    // RTT 指标存在（首个心跳往返前为 0）。
+    assert!(metrics.contains("rfrp_client_rtt_ms"), "{metrics}");
 
     // 状态页可访问。
     let html = get_with_retry(status_port, "/", Duration::from_secs(5)).await;

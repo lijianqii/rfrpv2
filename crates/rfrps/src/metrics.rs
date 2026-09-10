@@ -8,6 +8,8 @@ use std::time::Instant;
 pub struct Metrics {
     /// 进程启动时刻（用于 uptime 指标）。
     pub started: Instant,
+    /// 最近一次控制链路 RTT（毫秒；0 = 尚未测得）。
+    pub rtt_ms: AtomicU64,
     /// 累计接受的用户连接数。
     pub total_connections: Arc<AtomicU64>,
     /// 当前活跃用户连接数。
@@ -22,6 +24,7 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            rtt_ms: AtomicU64::new(0),
             total_connections: Arc::new(AtomicU64::new(0)),
             active_connections: Arc::new(AtomicI64::new(0)),
             bytes_up: Arc::new(AtomicU64::new(0)),
@@ -33,6 +36,16 @@ impl Default for Metrics {
 impl Metrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 记录控制链路 RTT（毫秒）。
+    pub fn set_rtt_ms(&self, ms: u64) {
+        self.rtt_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 最近一次控制链路 RTT（毫秒；0 = 未测得）。
+    pub fn rtt_ms(&self) -> u64 {
+        self.rtt_ms.load(Ordering::Relaxed)
     }
 
     /// 进程已运行秒数。
@@ -51,11 +64,15 @@ impl Metrics {
              # TYPE rfrp_bytes_up_total counter\n\
              rfrp_bytes_up_total {}\n\
              # TYPE rfrp_bytes_down_total counter\n\
-             rfrp_bytes_down_total {}\n",
+             rfrp_bytes_down_total {}\n\
+             # HELP rfrp_rtt_ms Control connection round-trip time in milliseconds (0 = unknown).\n\
+             # TYPE rfrp_rtt_ms gauge\n\
+             rfrp_rtt_ms {}\n",
             self.total_connections.load(Ordering::Relaxed),
             self.active_connections.load(Ordering::Relaxed),
             self.bytes_up.load(Ordering::Relaxed),
             self.bytes_down.load(Ordering::Relaxed),
+            self.rtt_ms(),
         )
     }
 }

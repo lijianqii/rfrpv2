@@ -633,3 +633,47 @@ async fn newproxy_invalid_name_rejected() {
     send_msg(&mut cw, Message::Close(Close { reason: None })).await;
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn heartbeat_resp_updates_rtt_metric() {
+    // HeartbeatResp 回传的 ts 用于计算控制链路 RTT，并写入 rfrp_rtt_ms 指标。
+    let (server_end, client_end) = duplex(8192);
+    let state = ServerState::new();
+    let task = tokio::spawn(handle_control_login(
+        login_frame("rttMetric"),
+        server_end,
+        state.clone(),
+        ServerConfig::default(),
+        Duration::from_millis(20),  // interval
+        Duration::from_millis(200), // timeout
+    ));
+    let (cr, cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    let mut cw = FramedWrite::new(cw, FrameCodec);
+    let _ = recv_msg(&mut cr).await; // LoginResp
+
+    // 等一个 Heartbeat，用「回退 50ms 的 ts」回应，使 RTT 可确定断言。
+    let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut cr))
+        .await
+        .expect("heartbeat");
+    if let Message::Heartbeat(h) = hb {
+        send_msg(
+            &mut cw,
+            Message::HeartbeatResp(HeartbeatResp {
+                ts: h.ts.saturating_sub(50),
+            }),
+        )
+        .await;
+    }
+
+    let mut seen = 0;
+    for _ in 0..50 {
+        seen = state.metrics.rtt_ms();
+        if seen >= 50 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(seen >= 50, "rtt_ms should be >= 50, got {seen}");
+    task.abort();
+}

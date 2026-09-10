@@ -164,6 +164,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         "udp_sessions": g.udp_sessions,
         "proxies": g.proxies,
         "pooled_work_conns": g.pooled_work_conns,
+        "rtt_ms": state.metrics.rtt_ms(),
         "metrics": {
             "total_connections": state.metrics.total_connections.load(std::sync::atomic::Ordering::Relaxed),
             "active_connections": state.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),

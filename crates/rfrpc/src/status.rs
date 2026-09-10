@@ -97,6 +97,7 @@ fn status_json(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> serde_json::
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": metrics.uptime_secs(),
         "connected": metrics.is_connected(),
+        "rtt_ms": metrics.rtt_ms(),
         "server": format!("{}:{}", cfg.client.server_addr, cfg.client.server_port),
         "tls": cfg.client.tls_enable,
         "work_conn_tls": cfg.client.work_conn_tls,

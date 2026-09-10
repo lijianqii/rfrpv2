@@ -92,6 +92,7 @@ rfrp_pending_work           等待工作连接的用户连接
 rfrp_udp_sessions           活跃 UDP 会话
 rfrp_pooled_work_conns      池中空闲工作连接
 rfrp_uptime_seconds         进程运行时长
+rfrp_rtt_ms                 控制链路 RTT（毫秒，0=未测得）
 ```
 
 ### 客户端状态端点（可选）
@@ -109,7 +110,7 @@ status_addr = "127.0.0.1:7400"   # 仅只读、无鉴权，务必绑回环
 | `GET /api/status` | JSON：连接状态、服务端地址、代理清单、指标 |
 | `GET /metrics` | Prometheus 文本 |
 
-客户端指标：`rfrp_client_uptime_seconds`、`rfrp_client_connected`、`rfrp_client_reconnects_total`、
+客户端指标：`rfrp_client_uptime_seconds`、`rfrp_client_rtt_ms`、`rfrp_client_connected`、`rfrp_client_reconnects_total`、
 `rfrp_client_work_conns_total`、`rfrp_client_work_conn_failures_total`、
 `rfrp_client_proxy_register_failures_total`、`rfrp_client_proxy_register_retry_success_total`。
 
@@ -150,15 +151,49 @@ cargo test --all
 
 ## 排障
 
+### 代理注册与端口
+
 - **代理注册被拒**：客户端日志会给出稳定错误码（`invalid type` / `invalid field` / `proxy_name exists` /
   `port not allowed` / `port occupied` / `domain conflict` / `internal error`）。`port occupied` 与
   `domain conflict` 为运行时冲突，客户端会自动退避重试（2s→30s，约 2 分钟）；其余为配置问题，需修正配置。
   服务端日志同时记录详细原因（端口、占用者等）。
-- **控制连接异常**：客户端每 30s 心跳、10s 未收到回应判定失联并重连（指数退避 1s→30s）；
-  已建立的数据连接（SSH/RDP 会话）在控制面重连期间不受影响。
 - **`remote_port` 无法绑定**：检查 `allow_ports` 是否放行、端口是否被其他进程占用、是否使用了特权端口（<1024）。
-- **Windows 空闲会话掉线**：见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md) 与下方 keepalive 说明；
-  SSH 客户端建议配置 `ServerAliveInterval 60`。
+
+### 控制连接与重连
+
+- **控制连接异常**：客户端每 30s 心跳、10s 未收到回应判定失联并重连（指数退避 1s→30s）；
+  已建立的数据连接（SSH/RDP 会话）在控制面重连期间**不受影响**（有集成测试覆盖）。
+- **RTT 观测**：`rfrp_rtt_ms` / `rfrp_client_rtt_ms` 给出控制链路往返时延，可用于判断链路质量与抖动。
+
+### 长连接与空闲会话（RDP/SSH）
+
+- **空闲会话被中间设备回收**：SSH 默认在空闲时不发送任何数据（RDP 协议自带保活），
+  若链路中间有 NAT/防火墙，表项过期（常见 30min–2h）后连接会被静默丢弃，表现为终端"卡住"。
+  对策：SSH 客户端配置 `ServerAliveInterval 60`（推荐，端到端有效）。
+- **TCP keepalive**：Linux 侧已启用（空闲 30s、探测间隔 5s）；Windows 侧因历史问题暂未启用，
+  见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md) 说明与下方注意事项。
+- **RDP 可选 UDP 传输**：rfrp 支持 UDP 代理。给 `3389` 同时配置 TCP 与 UDP 代理后，
+  RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。需自行验证 RDP 版本是否协商成功；
+  注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`）。
+
+### 日志与高延迟链路
+
+- **日志轮转**：`output = "file:/path"` 只追加、不轮转；建议交给 logrotate 或 journald，例如：
+
+  ```
+  /var/log/rfrp/*.log {
+      daily
+      rotate 7
+      compress
+      missingok
+      notifempty
+      copytruncate
+  }
+  ```
+
+- **高带宽时延积链路**：若跨洲/卫星链路跑不满带宽，可考虑启用 BBR
+  （`net.ipv4.tcp_congestion_control=bbr`，需内核支持）并适当增大 socket 缓冲；
+  这是系统级调优，与 rfrp 本身无关。
 
 ## License
 

@@ -21,6 +21,13 @@
   含连接状态、重连次数、工作连接与注册失败计数等指标。
 - **启动日志摘要**：server/client 启动时打印版本与关键配置（bind、TLS、代理清单、
   allow_ports、dashboard 等；不打印 token）。
+- **控制链路 RTT 指标**：由心跳 `ts` 回传计算，暴露 `rfrp_rtt_ms`（服务端）与
+  `rfrp_client_rtt_ms`（客户端），并纳入各自 `/api/status`。
+- **TLS 1.3 会话恢复**：服务端启用 rustls session ticket（默认不产生票据 → 无法恢复），
+  跨网场景下重复握手从 2 RTT 降到 1 RTT（对 `work_conn_tls` + `pool_size = 0` 的
+  SSH 场景收益明显）。
+- **发布包补全**：Linux tar 与 Windows zip 现包含配置模板、包内 README（快速开始 +
+  systemd 安装 + 校验）、LICENSE 与 systemd unit（Linux）。
 - 极简 HTTP 工具下沉到 `rfrp-common::util::http`，Dashboard 与客户端状态端点共用。
 
 ### Fixed
@@ -46,6 +53,8 @@
 - **UDP 下行帧缓冲复用**，高频转发下每包减少一次堆分配。
 - 客户端 `pool_size = 1` 现在对 SSH 等有状态服务安全（见 Fixed 第二条），
   原"SSH 建议 `pool_size = 0`"的限制解除。
+- README 排障补充：空闲会话保活（SSH `ServerAliveInterval`）、RDP UDP 传输可选方案、
+  logrotate 示例、高 BDP 链路（BBR）建议。
 - 模块与测试组织整理：`control/mod.rs` → `control.rs`，大模块测试拆到 `<module>/tests.rs`，
   `ServerState`/`PendingWork` 统一从 `state` 导入；四个 crate 补充 `description`。
 

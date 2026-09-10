@@ -10,6 +10,8 @@ use std::time::Duration;
 use common::*;
 use rfrp_common::config::ClientProxy;
 use rfrps::server::Server;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -320,4 +322,62 @@ async fn client_retries_retryable_registration_failure() {
         registered.load(Ordering::SeqCst)
     );
     task.abort();
+}
+
+/// 回归：控制面会话被替换（等价于控制连接重连）时，**已建立的数据连接必须继续可用**。
+///
+/// 对 RDP/SSH 长会话场景这是关键保证：桥接任务独立于控制会话，服务端清理旧会话
+/// 只回收监听任务/预热池/pending，不触碰在途桥接。用同 run_id 的第二个客户端
+/// 触发服务端会话替换来验证。
+#[tokio::test]
+async fn established_data_conn_survives_session_replacement() {
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let run_id = unique_run_id_file();
+
+    // 客户端 A：建立隧道并打通一条数据连接（模拟 SSH/RDP 会话）。
+    let cli_a = start_client(
+        addr,
+        vec![tcp_proxy("p1", echo_port, remote)],
+        run_id.clone(),
+    )
+    .await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
+
+    let mut data = TcpStream::connect((addr.ip(), remote)).await.unwrap();
+    data.write_all(b"before").await.unwrap();
+    let mut buf = [0u8; 6];
+    data.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"before");
+
+    // 客户端 B：同 run_id 登录 → 服务端替换 A 的会话（A 的控制连接被关闭并重连）。
+    let cli_b = start_client(
+        addr,
+        vec![tcp_proxy("p1", echo_port, remote)],
+        run_id.clone(),
+    )
+    .await;
+    // 等会话替换（及随之而来的控制面重连）发生。
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // 既有数据连接必须仍然可用。
+    for i in 0..3 {
+        let msg = format!("after-{i}");
+        data.write_all(msg.as_bytes())
+            .await
+            .expect("established data conn must still be writable");
+        let mut b = vec![0u8; msg.len()];
+        data.read_exact(&mut b)
+            .await
+            .expect("established data conn must still be readable");
+        assert_eq!(b, msg.as_bytes());
+    }
+
+    srv.abort();
+    cli_a.abort();
+    cli_b.abort();
 }

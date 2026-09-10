@@ -152,7 +152,11 @@ where
                                 tracing::debug!(ts = h.ts, "heartbeat received; responding");
                                 try_send(&out_tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
                             }
-                            Message::HeartbeatResp(_) => {
+                            Message::HeartbeatResp(h) => {
+                                // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
+                                let rtt = now_ms().saturating_sub(h.ts);
+                                state.metrics.set_rtt_ms(rtt);
+                                tracing::debug!(rtt_ms = rtt, "heartbeat response received");
                                 // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
                                 pong.notify_one();
                             }

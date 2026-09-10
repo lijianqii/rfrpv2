@@ -365,6 +365,10 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 ### 6.3 协议升级（TLS）
 
+> **会话恢复**：rfrps 启用 TLS 1.3 session ticket（rustls 默认 `NeverProducesTickets`，
+> 即默认无法恢复）；rfrpc 复用同一 `ClientConfig`（含内存会话缓存），因此重复握手
+> 可走恢复路径（跨网省 1 RTT）。TLS 1.2 的会话缓存为 rustls 默认启用。
+
 - 控制连接建立后，先进行 TLS 握手，再发送 `Login`。
 - 采用 **先 TLS 握手再登录** 的模型，避免明文泄露 token。
 - `tls_enable = false`（M1 测试期）时跳过 TLS 握手，建立 TCP 后直接发 Login；生产环境必须 `tls_enable = true`。
@@ -681,6 +685,9 @@ User → rfrps:remote_port  (Listener 接收)
 - **双向主动心跳（已实现）**：rfrpc 同样每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat` 并在 `HEARTBEAT_TIMEOUT`(10s) 内等待 `HeartbeatResp`，超时即断开并进入重连。
   - **原因**：仅靠 TCP EOF 无法感知**半开连接**——对端进程挂起、链路静默中断（NAT/防火墙丢弃表项）时不会产生 FIN/RST，reader 永久阻塞，客户端将卡死且永不重连（Windows 上未启用 TCP keepalive，尤其明显）。rfrps 早已响应 rfrpc 的 `Heartbeat`（`Message::Heartbeat` → `HeartbeatResp`），故客户端侧补上主动探测即可，语义与服务端一致。
   - **误判防护**：写通道满时跳过本轮心跳（不等待回应），避免本地拥塞误判断连。
+- **RTT 观测**：心跳 `Heartbeat.ts` 由对端原样回传，发出方据此计算控制链路 RTT
+  （`now - ts`），写入 `rfrp_rtt_ms`（rfrps）/ `rfrp_client_rtt_ms`（rfrpc），
+  用于链路质量与抖动观测。
 - 断开后 rfrpc 按指数退避重连（1s → 2s → 4s → … → 30s 上限）。**此为全局唯一重连退避策略**（常量见 §7.1 `RECONNECT_BACKOFF_INITIAL` / `RECONNECT_BACKOFF_MAX`），§8.1 网络错误重连与 §8.5 rfrpc 离线后恢复均复用本策略。
 - 重连复用 `run_id`，rfrps 恢复原 Proxy 监听（若端口仍可用，冲突处理见 6.6）。
 
@@ -1014,6 +1021,7 @@ rfrp/
 └── scripts/
     ├── toolchain-setup.sh    # Debian 开发机一键安装工具链
     ├── release.sh            # 在 Linux 上交叉编译并打包三产物
+    ├── release-readme.md     # 发布包内 README 模板（{{VERSION}}/{{PACKAGE}} 占位）
     ├── gen-self-signed-cert.sh  # 一键生成自签 TLS 证书（控制链路/vhost 通用）
     └── gen-windows-icon.py   # 生成 Windows 程序图标（PE 资源）
 ```
