@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "服务端：控制连接、端口监听、工作连接路由、Dashboard 与指标"
 
 [dependencies]
 rfrp-common = { path = "../rfrp-common" }

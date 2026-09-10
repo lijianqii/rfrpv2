@@ -32,3 +32,34 @@ pub fn apply_cli_overrides(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_cli_overrides_sets_fields() {
+        let mut cfg = ServerConfig::default();
+        apply_cli_overrides(
+            &mut cfg,
+            Some("0.0.0.0:8000".into()),
+            Some("token".into()),
+            Some(true),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(cfg.server.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.server.bind_port, 8000);
+        assert_eq!(cfg.server.token, "token");
+        assert!(cfg.server.tls_enable);
+        assert!(!cfg.server.work_conn_tls);
+    }
+
+    #[test]
+    fn apply_cli_overrides_rejects_bad_bind() {
+        let mut cfg = ServerConfig::default();
+        assert!(
+            apply_cli_overrides(&mut cfg, Some("not-an-addr".into()), None, None, None).is_err()
+        );
+    }
+}

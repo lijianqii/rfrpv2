@@ -1,7 +1,10 @@
 //! rfrps：服务端库（server 子命令逻辑）。
 //!
-//! 负责：控制连接处理、按代理类型监听公网端口、工作连接路由、双向桥接。
-//! 当前仅实现 TCP 代理；TLS 与 token 鉴权已在 M3 完成，UDP/HTTP/HTTPS 在 M4 扩展。
+//! 负责：控制连接处理（登录/心跳/会话清理）、按代理类型监听公网端口
+//! （TCP/UDP/HTTP/HTTPS vhost）、工作连接路由与池化、双向桥接、
+//! Dashboard 与 Prometheus 指标。
+//!
+//! 对外入口：[`Server`]（accept 循环 + 优雅退出），CLI 覆盖见 `cli` 模块。
 
 pub mod cli;
 pub mod control;

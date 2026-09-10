@@ -451,58 +451,68 @@ rfrp/
 ├── Cargo.toml                 # workspace 根
 ├── DESIGN.md
 ├── crates/
-│   ├── rfrp-common/           # 共享库（协议/配置/TLS 封装/错误/工具）
-│   │   ├── Cargo.toml
+│   ├── rfrp-common/           # 共享库（协议/配置/TLS/鉴权/错误/工具）
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── protocol/      # 帧编解码 + 消息类型
 │   │       │   ├── mod.rs
 │   │       │   ├── frame.rs
-│   │       │   └── msg.rs
-│   │       ├── config/        # 配置结构 + 解析
+│   │       │   └── frame/tests.rs
+│   │       ├── config/        # 配置结构 + 解析 + 校验
 │   │       │   ├── mod.rs
-│   │       │   ├── server.rs
-│   │       │   └── client.rs
-│   │       ├── crypto/        # TLS 封装（rustls）
-│   │       ├── auth/          # token 校验
-│   │       ├── constants.rs   # 集中定义协议/超时/上限等常量（避免 magic number）
+│   │       │   ├── server.rs / server/tests.rs
+│   │       │   └── client.rs / client/tests.rs
+│   │       ├── auth/mod.rs    # token 校验
+│   │       ├── crypto.rs      # TLS 封装（rustls）
+│   │       ├── constants.rs   # 协议/超时/上限等集中常量
 │   │       ├── error.rs       # 统一错误类型
 │   │       └── util/          # 通用工具
-│   │           └── platform.rs  # 平台差异封装（cfg windows/unix）
+│   │           ├── bridge.rs    # 双向桥接（32 KiB 缓冲）
+│   │           ├── control.rs   # 控制消息发送原语（try_send / 超时发送 / 优雅关闭）
+│   │           ├── counting.rs  # 流量计数流包装（批量刷新）
+│   │           ├── stream.rs    # BoxedStream / PrependStream
+│   │           ├── tcp.rs       # TCP 参数（NODELAY/keepalive）
+│   │           ├── udp.rs       # UDP 长度前缀分帧
+│   │           ├── signal.rs    # SIGINT/SIGTERM → CancellationToken
+│   │           └── platform.rs  # 平台差异（run_id 路径等）
 │   ├── rfrps/                 # 服务端库（server 子命令逻辑）
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── server.rs      # Server 主控
-│   │       ├── control/       # 控制连接处理
-│   │       ├── listener/      # 公网监听管理（per-proxy）
-│   │       ├── proxy/         # 代理实现
-│   │       │   ├── tcp.rs
-│   │       │   ├── udp.rs
-│   │       │   ├── http.rs
-│   │       │   └── https.rs
-│   │       ├── pool/          # 工作连接池（per-Proxy，预建/取用/补充，见 8.2）
-│   │       ├── session/       # 客户端会话表
-│   │       ├── router/        # 用户连接 → 工作连接路由
-│   │       ├── dashboard/     # 监控 API + Web
-│   │       └── metrics.rs
+│   │       ├── server.rs      # Server：accept 循环、TLS 探测、优雅退出
+│   │       ├── control.rs     # 控制连接：登录/心跳/NewProxy 分发
+│   │       ├── control/session.rs  # Session / ProxyEntry
+│   │       ├── control/tests.rs
+│   │       ├── listener.rs    # 代理注册 + 用户连接分发（池命中/按需）
+│   │       ├── listener/tests.rs
+│   │       ├── udp.rs         # UDP 代理：会话表 + 分帧桥接
+│   │       ├── udp/tests.rs
+│   │       ├── vhost.rs       # HTTP/HTTPS vhost：Host/SNI 路由
+│   │       ├── work.rs        # 工作连接：入池或与用户连接桥接
+│   │       ├── state.rs       # ServerState：会话表、pending、proxy 索引、指标
+│   │       ├── dashboard.rs   # Dashboard：Basic Auth + 状态 API + Prometheus
+│   │       ├── metrics.rs     # 计数器与渲染
+│   │       └── cli.rs         # CLI 参数覆盖配置
 │   ├── rfrpc/                 # 客户端库（client 子命令逻辑）
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── client.rs      # Client 主控
-│   │       ├── control/       # 控制连接 + 重连
-│   │       ├── heartbeat.rs
-│   │       ├── workconn/      # 工作连接建立（含按 pool_size 预建，池管理在 rfrps 侧）
-│   │       └── proxy/         # 本地回连（按代理类型分流）
-│   │           ├── tcp.rs     # TCP 桥接（字节流双向透传）
-│   │           ├── udp.rs     # UDP 会话 + 4字节长度前缀分帧（见 8.6）
-│   │           ├── http.rs    # HTTP 回连（复用 TCP 桥接）
-│   │           └── https.rs   # HTTPS 回连（复用 TCP 桥接）
+│   │       ├── client.rs      # Client：连接/登录/注册/重连主循环
+│   │       ├── client/tests.rs
+│   │       ├── control.rs     # 控制循环：NewProxyResp/ReqWorkConn/心跳
+│   │       ├── control/tests.rs
+│   │       ├── workconn.rs    # 工作连接：回连服务端 + 本地服务 + 桥接
+│   │       ├── workconn/tests.rs
+│   │       └── cli.rs         # CLI 参数覆盖配置
 │   └── rfrp-bin/              # 统一二进制入口
 │       └── src/
-│           ├── main.rs        # clap 子命令分发 → 调用 rfrps::run / rfrpc::run
+│           ├── main.rs        # 子命令分派 → run_server / run_client
 │           ├── cli.rs         # 子命令与参数定义
 │           └── logging.rs     # 日志初始化
 ```
+
+**测试组织约定**：单元测试与生产代码同目录；测试代码超过约 150 行时拆到
+`<module>/tests.rs`（`#[cfg(test)] mod tests;`），保持生产文件聚焦。
+集成测试放在各 crate 的 `tests/`（跨进程/跨模块端到端），性能基准在
+`crates/rfrp-common/benches/`。
 
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
 > - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
@@ -956,31 +966,45 @@ CLI 参数 > 配置文件 > 默认值。
 
 ## 13. 项目目录结构（落地后）
 
-详见 [第 7.1 节](#71-目录结构)。补充产物目录：
+源码模块结构见 [第 7.1 节](#71-目录结构)。仓库补充目录：
 
 ```
 rfrp/
+├── Cargo.toml / Cargo.lock   # workspace 定义与依赖锁
+├── rustfmt.toml              # 格式化约定（max_width = 100）
+├── rust-toolchain.toml       # 工具链版本固定
+├── Makefile                  # make ci / release / gen-cert 等入口
+├── DESIGN.md                 # 设计文档（本文件）
+├── README.md / LICENSE
+├── docs/                     # 性能基线与平台说明
+│   ├── BENCHMARKS.md
+│   └── WINDOWS_ANTIVIRUS.md
 ├── examples/                 # 示例配置
 │   ├── rfrp-server.toml
 │   └── rfrp-client.toml
-├── tests/                    # workspace 级集成测试（按代理类型分文件，随里程碑逐步添加）
-│   ├── tcp_proxy.rs          # M1：TCP 全链路
-│   ├── reconnect.rs          # M2：心跳、断线重连、Proxy 恢复
-│   ├── tls_auth.rs           # M3：TLS 控制链路 + token 鉴权
-│   ├── udp_proxy.rs          # M4：UDP 全链路
-│   └── vhost.rs              # M4：HTTP/HTTPS vhost 全链路
-├── benches/                  # 性能基准
-│   └── forward.rs
-├── .cargo/
-│   └── config.toml           # 交叉编译配置（musl-gcc、mingw-w64 链接器）
-├── deploy/
-│   └── systemd/              # systemd unit 文件
-│       ├── rfrp-server.service
-│       └── rfrp-client.service
+├── crates/
+│   ├── rfrp-common/benches/forward.rs     # 性能基准（帧/桥接/配置解析）
+│   ├── rfrp-common/tests/config_files.rs  # 示例配置加载
+│   ├── rfrps/tests/                       # 服务端端到端（dashboard、优雅退出）
+│   ├── rfrpc/tests/                       # 全链路集成测试
+│   │   ├── common/mod.rs                  #   共享脚手架
+│   │   ├── tcp_proxy.rs                   #   M1：TCP 全链路
+│   │   ├── reconnect.rs                   #   M2：心跳、断线重连、Proxy 恢复
+│   │   ├── tls_auth.rs                    #   M3：TLS 控制链路 + token 鉴权
+│   │   ├── udp_proxy.rs / vhost.rs        #   M4：UDP / HTTP(S) vhost 全链路
+│   │   ├── dashboard.rs / graceful_shutdown.rs / fatal_login.rs / chaos.rs
+│   │   ├── example_smoke.rs               #   示例配置真实链路冒烟
+│   │   └── certs/                         #   测试用证书
+│   └── rfrp-bin/tests/chaos.rs            # 进程级信号与退出码
+├── .cargo/config.toml        # 交叉编译配置（musl-gcc、mingw-w64 链接器）
+├── deploy/systemd/           # systemd unit 文件
+│   ├── rfrp-server.service
+│   └── rfrp-client.service
 └── scripts/
     ├── toolchain-setup.sh    # Debian 开发机一键安装工具链
     ├── release.sh            # 在 Linux 上交叉编译并打包三产物
-    └── gen-self-signed-cert.sh  # 一键生成自签 TLS 证书（控制链路/vhost 通用）
+    ├── gen-self-signed-cert.sh  # 一键生成自签 TLS 证书（控制链路/vhost 通用）
+    └── gen-windows-icon.py   # 生成 Windows 程序图标（PE 资源）
 ```
 
 **Linux 部署安装步骤（配合 systemd）：**
@@ -1046,7 +1070,7 @@ C:\rfrp\
 | config | 缺字段、类型错误、端口范围解析、`custom_domains` 数组长度边界（0/1/16/17 个元素）、`local_ip` 格式校验 | M0 |
 | auth | token 常量时间比对（相等/不等/长度差异） | M0 |
 | crypto | 证书加载、控制链路与工作连接 TLS 配置构建 | M3 |
-| proxy/tcp | 桥接缓冲、半关闭、大包分段、本地连接失败时工作连接关闭行为（rfrpc 侧 EOF 传播、rfrps 侧用户连接同步断开） | M1 |
+| workconn / bridge | 桥接缓冲、半关闭、大包分段、本地连接失败时工作连接关闭行为（rfrpc 侧 EOF 传播、rfrps 侧用户连接同步断开） | M1 |
 
 ### 14.2 集成测试
 
@@ -1507,8 +1531,10 @@ M6 发布与打包已完成：
 ### 17.21 架构/模块整理
 
 - 服务端拆分出 `state.rs`（`ServerState` / `PendingWork`）与 `cli.rs`（`apply_cli_overrides`），`server.rs` 只保留 `Server` 主控与连接分派。
-- 控制会话拆分为 `control/session.rs`（`Session` / `ProxyEntry`），`control/mod.rs` 保留主流程；`server.rs` 通过 `pub use` 保持 `ServerState`/`apply_cli_overrides` 的对外路径兼容。
+- 控制会话拆分为 `control/session.rs`（`Session` / `ProxyEntry`），`control.rs` 保留主流程。
 - 模块职责更单一：`listener`（代理注册/用户分发）、`work`（工作连接）、`udp`、`vhost`、`dashboard`、`metrics`、`control` 各自独立。
+- 分层清理：`ServerState`/`PendingWork` 统一从 `state` 模块导入，移除 `server.rs` 的历史转发 re-export；客户端 CLI 覆盖函数移至 `rfrpc::cli`，与 `rfrps::cli` 对称。
+- 测试组织统一：测试超过约 150 行的模块拆到 `<module>/tests.rs`，生产文件保持聚焦。
 
 ### 17.22 控制面背压死锁修复
 

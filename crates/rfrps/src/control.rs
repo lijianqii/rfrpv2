@@ -29,7 +29,7 @@ use tokio::sync::Notify;
 use tokio::time::interval;
 
 use crate::listener;
-use crate::server::ServerState;
+use crate::state::ServerState;
 
 mod session;
 pub use session::{ProxyEntry, Session};

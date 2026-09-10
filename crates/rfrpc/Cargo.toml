@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "客户端：控制连接、代理注册、工作连接池化与本地服务回连"
 
 [dependencies]
 rfrp-common = { path = "../rfrp-common" }

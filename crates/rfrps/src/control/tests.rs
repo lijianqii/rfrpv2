@@ -1,3 +1,5 @@
+//! 服务端控制连接单元测试。
+
 use super::*;
 use rfrp_common::constants::PROTOCOL_VERSION;
 use std::time::Duration;

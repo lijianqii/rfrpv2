@@ -12,7 +12,7 @@ use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::server::ServerState;
+use crate::state::ServerState;
 
 pub async fn handle_work_connection<S>(
     start_frame: Frame,

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::control::Session;
 use crate::listener::dispatch_user_connection;
-use crate::server::ServerState;
+use crate::state::ServerState;
 
 /// HTTP vhost accept 循环：读取请求头取 Host，路由到对应代理。
 pub async fn run_http_vhost(
@@ -223,7 +223,7 @@ pub(crate) fn find_proxy_by_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::ServerState;
+    use crate::state::ServerState;
     use tokio::sync::mpsc;
 
     fn test_session(domains: &[&str]) -> Arc<Session> {
@@ -278,7 +278,7 @@ mod tests {
 mod head_tests {
     use super::*;
     use crate::control::ProxyEntry;
-    use crate::server::ServerState;
+    use crate::state::ServerState;
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::mpsc;
 

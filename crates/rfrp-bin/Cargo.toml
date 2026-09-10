@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "命令行入口：server/client 子命令、配置加载与日志初始化"
 
 [[bin]]
 name = "rfrp"

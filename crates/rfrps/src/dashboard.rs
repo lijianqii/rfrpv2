@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::server::ServerState;
+use crate::state::ServerState;
 
 /// Dashboard HTTP 服务主循环。
 pub async fn run_dashboard(
@@ -376,7 +376,7 @@ mod authorized_tests {
 mod metrics_tests {
     use super::*;
     use crate::control::Session;
-    use crate::server::ServerState;
+    use crate::state::ServerState;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;

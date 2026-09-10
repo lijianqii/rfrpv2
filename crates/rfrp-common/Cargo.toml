@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "共享库：协议编解码、配置结构、TLS/鉴权、错误类型与通用工具"
 
 [dependencies]
 tokio = { workspace = true }
