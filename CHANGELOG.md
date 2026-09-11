@@ -26,12 +26,20 @@
 - **TLS 1.3 会话恢复**：服务端启用 rustls session ticket（默认不产生票据 → 无法恢复），
   跨网场景下重复握手从 2 RTT 降到 1 RTT（对 `work_conn_tls` + `pool_size = 0` 的
   SSH 场景收益明显）。
+- **服务端诊断能力**：`rfrp_accepted_total` / `rfrp_accept_errors_total` / `rfrp_accepting`
+  指标、`/healthz` 探活端点、每 5 分钟 `rfrps alive` 摘要日志——用于快速区分
+  "SYN 未到达"（网络/防火墙）与"应用层故障"。
 - **发布包补全**：Linux tar 与 Windows zip 现包含配置模板、包内 README（快速开始 +
   systemd 安装 + 校验）、LICENSE 与 systemd unit（Linux）。
 - 极简 HTTP 工具下沉到 `rfrp-common::util::http`，Dashboard 与客户端状态端点共用。
 
 ### Fixed
 
+- **accept 循环健壮性**：`accept()` 出错不再直接终止循环（瞬时错误退避重试），
+  连续失败达到阈值才以**非零退出码**退出，交由服务管理器重启；避免"进程仍在运行
+  却不再接受连接"的静默故障。
+- **首字节 peek 无超时**：连接后不发任何字节的对端（端口扫描、半开连接）此前会永久
+  挂住任务与套接字，现按首帧超时（10s）关闭。
 - **客户端静默失联后无法重连**：控制连接半开（对端进程挂起、NAT/防火墙静默丢弃，无
   FIN/RST）时客户端会永久卡住。新增客户端侧心跳看门狗（30s 发送、10s 超时）与控制连接
   建连超时（10s）。

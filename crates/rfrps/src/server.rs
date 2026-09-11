@@ -8,6 +8,7 @@ use std::time::Duration;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+    MAX_CONSECUTIVE_ACCEPT_ERRORS, SERVER_ALIVE_LOG_INTERVAL,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::Result;
@@ -167,11 +168,41 @@ impl Server {
                 crate::vhost::run_https_vhost(listener, tls, state, shutdown).await;
             });
         }
+        // 存活摘要：周期性输出计数，便于区分"进程卡死"与"网络不可达"
+        // （客户端连不上时，看 accepted_total 是否增长即可判断 SYN 是否到达）。
+        {
+            let state = self.state.clone();
+            let sd = shutdown.clone();
+            tasks.spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_secs(SERVER_ALIVE_LOG_INTERVAL));
+                iv.tick().await; // 消耗首次立即 tick
+                loop {
+                    tokio::select! {
+                        _ = iv.tick() => {
+                            let g = state.gauges();
+                            tracing::info!(
+                                uptime_secs = state.metrics.uptime_secs(),
+                                accepted_total = state.metrics.accepted_total.load(Ordering::Relaxed),
+                                accept_errors_total = state.metrics.accept_errors_total.load(Ordering::Relaxed),
+                                sessions = g.sessions,
+                                proxies = g.proxies,
+                                active_connections = state.metrics.active_connections.load(Ordering::Relaxed),
+                                "rfrps alive"
+                            );
+                        }
+                        _ = sd.cancelled() => break,
+                    }
+                }
+            });
+        }
+        let mut consecutive_accept_errors: u32 = 0;
         loop {
             tokio::select! {
                 res = self.listener.accept() => {
                     match res {
                         Ok((stream, peer)) => {
+                            consecutive_accept_errors = 0;
+                            self.state.metrics.inc_accepted();
                             if let Err(e) = configure_tcp_stream(&stream) {
                                 tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
                             }
@@ -180,14 +211,41 @@ impl Server {
                             let tls = tls.clone();
                             tracing::debug!(%peer, "accepted connection");
                             tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, state, config, tls).await {
+                                if let Err(e) = handle_connection(
+                                    stream,
+                                    state,
+                                    config,
+                                    tls,
+                                    Duration::from_secs(FIRST_FRAME_TIMEOUT),
+                                )
+                                .await
+                                {
                                     tracing::warn!("connection error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            tracing::warn!("accept error: {e}");
-                            break;
+                            // 瞬时错误（对端握手期重置、fd 耗尽等）不应终止 accept 循环：
+                            // 退避重试，避免"服务端仍在运行却不再接受连接"的静默故障。
+                            consecutive_accept_errors += 1;
+                            self.state.metrics.inc_accept_error();
+                            tracing::warn!(
+                                consecutive = consecutive_accept_errors,
+                                error = %e,
+                                "accept error; retrying"
+                            );
+                            if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                                tracing::error!(
+                                    consecutive = consecutive_accept_errors,
+                                    "accept loop failed repeatedly; exiting for supervisor restart"
+                                );
+                                sig.abort();
+                                return Err(rfrp_common::Error::Other(
+                                    "accept loop failed repeatedly".into(),
+                                ));
+                            }
+                            let backoff_ms = (consecutive_accept_errors as u64 * 100).min(1000);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         }
                     }
                 }
@@ -225,9 +283,18 @@ async fn handle_connection(
     state: Arc<ServerState>,
     config: Arc<ServerConfig>,
     tls: Option<ServerTls>,
+    first_frame_timeout: Duration,
 ) -> Result<()> {
+    // peek 也必须有超时：连接后不发任何字节的对端（端口扫描、半开连接）会
+    // 永久挂住一个任务与套接字；10s 内无首字节直接关闭。
     let mut first = [0u8; 1];
-    let n = stream.peek(&mut first).await?;
+    let n = match tokio::time::timeout(first_frame_timeout, stream.peek(&mut first)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::debug!("connection sent no first byte within timeout; closing");
+            return Ok(());
+        }
+    };
     if n == 0 {
         return Ok(());
     }
@@ -246,17 +313,15 @@ async fn handle_connection(
 
     let (frame, stream) = match maybe_tls {
         MaybeTls::Plain(s) => {
-            let (f, s) =
-                tokio::time::timeout(Duration::from_secs(FIRST_FRAME_TIMEOUT), read_one_frame(s))
-                    .await
-                    .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
+            let (f, s) = tokio::time::timeout(first_frame_timeout, read_one_frame(s))
+                .await
+                .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
             (f, Box::new(s) as BoxedStream)
         }
         MaybeTls::Tls(s) => {
-            let (f, s) =
-                tokio::time::timeout(Duration::from_secs(FIRST_FRAME_TIMEOUT), read_one_frame(*s))
-                    .await
-                    .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
+            let (f, s) = tokio::time::timeout(first_frame_timeout, read_one_frame(*s))
+                .await
+                .map_err(|_| rfrp_common::Error::Other("first frame timeout".into()))??;
             (f, Box::new(s) as BoxedStream)
         }
     };
@@ -299,4 +364,36 @@ async fn handle_connection(
 enum MaybeTls {
     Plain(TcpStream),
     Tls(Box<ServerTlsStream<TcpStream>>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_connection_is_dropped_by_peek_timeout() {
+        // 连接后不发任何字节的对端（端口扫描/半开连接）不得永久挂住任务与套接字。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap(); // 只连接，不发数据
+        let (server, _) = listener.accept().await.unwrap();
+
+        let state = ServerState::new();
+        let cfg = Arc::new(ServerConfig::default());
+        let started = std::time::Instant::now();
+        let res = handle_connection(
+            server,
+            state,
+            cfg,
+            None,
+            Duration::from_millis(150), // 测试用短超时
+        )
+        .await;
+        assert!(res.is_ok(), "silent connection should be closed cleanly");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must not hang: {:?}",
+            started.elapsed()
+        );
+    }
 }

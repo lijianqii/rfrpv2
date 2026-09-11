@@ -73,6 +73,12 @@ async fn handle_request(
         _ => "/".to_string(),
     };
 
+    // /healthz 免鉴权（仅暴露 up/down，供监控/负载均衡探活）。
+    if path == "/healthz" {
+        let (status, body) = health_response(state);
+        return write_response(&mut stream, status, "text/plain", body, None).await;
+    }
+
     if !authorized(&head, cfg) {
         return write_response(
             &mut stream,
@@ -98,6 +104,15 @@ async fn handle_request(
             write_response(&mut stream, 200, "text/plain; version=0.0.4", &body, None).await
         }
         _ => write_response(&mut stream, 404, "text/plain", "Not Found\n", None).await,
+    }
+}
+
+/// 健康检查响应：accept 循环正常返回 200，否则 503（供探活与告警）。
+fn health_response(state: &Arc<ServerState>) -> (u16, &'static str) {
+    if state.metrics.is_accepting() {
+        (200, "ok\n")
+    } else {
+        (503, "unhealthy: accept loop failing\n")
     }
 }
 
@@ -342,6 +357,16 @@ mod metrics_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio::sync::{mpsc, Notify};
+
+    #[test]
+    fn healthz_reflects_accept_state() {
+        let state = ServerState::new();
+        assert_eq!(health_response(&state).0, 200);
+        state.metrics.inc_accept_error();
+        assert_eq!(health_response(&state).0, 503);
+        state.metrics.inc_accepted();
+        assert_eq!(health_response(&state).0, 200);
+    }
 
     #[test]
     fn render_metrics_includes_session_gauge() {

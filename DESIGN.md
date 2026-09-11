@@ -685,6 +685,14 @@ User → rfrps:remote_port  (Listener 接收)
 - **双向主动心跳（已实现）**：rfrpc 同样每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat` 并在 `HEARTBEAT_TIMEOUT`(10s) 内等待 `HeartbeatResp`，超时即断开并进入重连。
   - **原因**：仅靠 TCP EOF 无法感知**半开连接**——对端进程挂起、链路静默中断（NAT/防火墙丢弃表项）时不会产生 FIN/RST，reader 永久阻塞，客户端将卡死且永不重连（Windows 上未启用 TCP keepalive，尤其明显）。rfrps 早已响应 rfrpc 的 `Heartbeat`（`Message::Heartbeat` → `HeartbeatResp`），故客户端侧补上主动探测即可，语义与服务端一致。
   - **误判防护**：写通道满时跳过本轮心跳（不等待回应），避免本地拥塞误判断连。
+- **accept 循环健壮性**：`accept()` 瞬时错误（握手期重置、fd 耗尽等）退避重试，
+  不终止循环；连续失败 `MAX_CONSECUTIVE_ACCEPT_ERRORS`(60) 次判定监听不可恢复，
+  以非零退出码退出交由服务管理器重启。指标 `rfrp_accepted_total` /
+  `rfrp_accept_errors_total` / `rfrp_accepting` 与 `/healthz` 用于区分
+  "SYN 未到达（网络/防火墙）"与"应用层故障"；每 `SERVER_ALIVE_LOG_INTERVAL`(300s)
+  输出一次 `rfrps alive` 摘要。
+- **首字节超时**：accept 后先 `peek` 首字节区分 TLS/明文，该 peek 与首帧读取共用
+  `FIRST_FRAME_TIMEOUT`(10s)，防止静默连接永久占用任务与套接字。
 - **RTT 观测**：心跳 `Heartbeat.ts` 由对端原样回传，发出方据此计算控制链路 RTT
   （`now - ts`），写入 `rfrp_rtt_ms`（rfrps）/ `rfrp_client_rtt_ms`（rfrpc），
   用于链路质量与抖动观测。

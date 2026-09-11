@@ -1,6 +1,6 @@
 //! 服务端运行指标（Prometheus 文本格式）。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,6 +10,12 @@ pub struct Metrics {
     pub started: Instant,
     /// 最近一次控制链路 RTT（毫秒；0 = 尚未测得）。
     pub rtt_ms: AtomicU64,
+    /// 主监听端口累计接受的 TCP 连接数（含控制/工作连接）。
+    pub accepted_total: AtomicU64,
+    /// accept 错误累计次数。
+    pub accept_errors_total: AtomicU64,
+    /// accept 循环当前是否正常（连续失败后置 false，恢复后置 true）。
+    pub accepting: AtomicBool,
     /// 累计接受的用户连接数。
     pub total_connections: Arc<AtomicU64>,
     /// 当前活跃用户连接数。
@@ -25,6 +31,9 @@ impl Default for Metrics {
         Self {
             started: Instant::now(),
             rtt_ms: AtomicU64::new(0),
+            accepted_total: AtomicU64::new(0),
+            accept_errors_total: AtomicU64::new(0),
+            accepting: AtomicBool::new(true),
             total_connections: Arc::new(AtomicU64::new(0)),
             active_connections: Arc::new(AtomicI64::new(0)),
             bytes_up: Arc::new(AtomicU64::new(0)),
@@ -36,6 +45,23 @@ impl Default for Metrics {
 impl Metrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 记录一次成功 accept。
+    pub fn inc_accepted(&self) {
+        self.accepted_total.fetch_add(1, Ordering::Relaxed);
+        self.accepting.store(true, Ordering::Relaxed);
+    }
+
+    /// 记录一次 accept 错误。
+    pub fn inc_accept_error(&self) {
+        self.accept_errors_total.fetch_add(1, Ordering::Relaxed);
+        self.accepting.store(false, Ordering::Relaxed);
+    }
+
+    /// accept 循环是否正常（供 /healthz 与指标使用）。
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Relaxed)
     }
 
     /// 记录控制链路 RTT（毫秒）。
@@ -67,12 +93,24 @@ impl Metrics {
              rfrp_bytes_down_total {}\n\
              # HELP rfrp_rtt_ms Control connection round-trip time in milliseconds (0 = unknown).\n\
              # TYPE rfrp_rtt_ms gauge\n\
-             rfrp_rtt_ms {}\n",
+             rfrp_rtt_ms {}\n\
+             # HELP rfrp_accepted_total Accepted TCP connections on the control port.\n\
+             # TYPE rfrp_accepted_total counter\n\
+             rfrp_accepted_total {}\n\
+             # HELP rfrp_accept_errors_total Accept errors.\n\
+             # TYPE rfrp_accept_errors_total counter\n\
+             rfrp_accept_errors_total {}\n\
+             # HELP rfrp_accepting Whether the accept loop is healthy (1/0).\n\
+             # TYPE rfrp_accepting gauge\n\
+             rfrp_accepting {}\n",
             self.total_connections.load(Ordering::Relaxed),
             self.active_connections.load(Ordering::Relaxed),
             self.bytes_up.load(Ordering::Relaxed),
             self.bytes_down.load(Ordering::Relaxed),
             self.rtt_ms(),
+            self.accepted_total.load(Ordering::Relaxed),
+            self.accept_errors_total.load(Ordering::Relaxed),
+            u8::from(self.is_accepting()),
         )
     }
 }

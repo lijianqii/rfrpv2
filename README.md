@@ -78,6 +78,7 @@ password = "change-me"      # 至少 6 位
 | `GET /` | 状态页（版本、uptime、会话/代理/池计数，5s 自动刷新） |
 | `GET /api/status` | JSON：会话与代理清单、pending、UDP 会话、池、指标 |
 | `GET /metrics` | Prometheus 文本 |
+| `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
 
 `/metrics` 指标：
 
@@ -93,6 +94,9 @@ rfrp_udp_sessions           活跃 UDP 会话
 rfrp_pooled_work_conns      池中空闲工作连接
 rfrp_uptime_seconds         进程运行时长
 rfrp_rtt_ms                 控制链路 RTT（毫秒，0=未测得）
+rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/工作连接）
+rfrp_accept_errors_total    accept 错误累计
+rfrp_accepting              accept 循环是否正常（1/0）
 ```
 
 ### 客户端状态端点（可选）
@@ -158,6 +162,42 @@ cargo test --all
   `domain conflict` 为运行时冲突，客户端会自动退避重试（2s→30s，约 2 分钟）；其余为配置问题，需修正配置。
   服务端日志同时记录详细原因（端口、占用者等）。
 - **`remote_port` 无法绑定**：检查 `allow_ports` 是否放行、端口是否被其他进程占用、是否使用了特权端口（<1024）。
+
+### 服务端连不上（客户端反复 `connect timeout`）
+
+客户端日志出现 `connect timeout` 说明 **TCP 三次握手未完成**（SYN 无响应），问题在
+网络/防火墙层而非 rfrp 协议层。服务端新增了判定依据：
+
+- 服务端每 5 分钟输出一条 `rfrps alive` 摘要（含 `accepted_total`）；
+- `/metrics` 暴露 `rfrp_accepted_total` / `rfrp_accept_errors_total` / `rfrp_accepting`；
+- `/healthz` 直接反映 accept 循环是否正常。
+
+**判定方法**：客户端重试期间观察 `rfrp_accepted_total`：
+
+| 现象 | 结论 |
+|---|---|
+| 计数**不增长** | SYN 未到达服务端 → 防火墙/网络配置文件/路由/中间设备 |
+| 计数**增长**但客户端仍超时 | 连接已到达服务端 → 检查服务端负载/accept 错误（`rfrp_accept_errors_total`） |
+
+Windows 常见原因与检查命令：
+
+```powershell
+# 服务端：是否在监听？网络配置文件是否被切成 Public（导致入站规则失效）？
+Get-NetTCPConnection -LocalPort <控制端口> -State Listen
+Get-NetConnectionProfile
+Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction
+Test-NetConnection 127.0.0.1 -Port <控制端口>     # 本机自测
+
+# 客户端：路由与源地址（多网卡/VPN 场景常见：SYN 从错误接口发出或路由丢失）
+Test-NetConnection <服务端IP> -Port <控制端口>
+Get-NetRoute -DestinationPrefix <服务端网段>
+Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
+```
+
+若为防火墙网络配置文件问题，可为 `rfrp.exe` 添加覆盖"公用网络"的入站规则，或把网络设为"专用"。
+
+> 另外建议：控制端口避免使用 `3389`（与 Windows RDP 冲突/混淆），并为服务端配置
+> systemd/nssm 等服务管理器自动重启（accept 循环持续失败会以非零退出码退出）。
 
 ### 控制连接与重连
 

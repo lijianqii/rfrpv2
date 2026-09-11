@@ -36,6 +36,12 @@ pub const WORK_CONN_TIMEOUT_RFRPS: u64 = 10;
 pub const WORK_CONN_TIMEOUT_RFRPC: u64 = 8;
 /// UDP 会话无活动超时清理。
 pub const UDP_SESSION_TIMEOUT: u64 = 60;
+/// 服务端 accept 连续失败达到该次数后判定监听不可恢复，退出进程
+/// 交由进程管理器（systemd/nssm）重启（约 1 分钟持续失败）。
+pub const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 60;
+/// 服务端存活摘要日志间隔（秒）：便于区分"进程卡死"与"网络不可达"。
+pub const SERVER_ALIVE_LOG_INTERVAL: u64 = 300;
+
 /// 优雅退出在途连接强制关闭超时。
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: u64 = 30;
 

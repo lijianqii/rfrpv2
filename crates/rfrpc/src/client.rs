@@ -211,11 +211,18 @@ impl Client {
                 return Err(anyhow::anyhow!(e));
             }
             Err(_) => {
-                tracing::warn!(server = %server_addr, "connect timeout");
+                tracing::warn!(
+                    server = %server_addr,
+                    "connect timeout (SYN 无响应：请检查服务端是否在监听、防火墙/网络配置文件、路由与源地址)"
+                );
                 return Err(anyhow::anyhow!("connect timeout"));
             }
         };
-        tracing::info!(server = %server_addr, "connected to server");
+        tracing::info!(
+            server = %server_addr,
+            local = %stream.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
+            "connected to server"
+        );
 
         // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
         let stream: BoxedStream = if self.config.client.tls_enable {
