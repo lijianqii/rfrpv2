@@ -97,6 +97,7 @@ async fn newproxy_heartbeat_close_flow() {
     let task = tokio::spawn(handle_control_login(
         login_frame("r1"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -147,6 +148,7 @@ async fn heartbeat_timeout_disconnects() {
     let task = tokio::spawn(handle_control_login(
         login_frame("r2"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_millis(30),
@@ -175,6 +177,7 @@ async fn heartbeat_keeps_alive_when_client_responds() {
     let task = tokio::spawn(handle_control_login(
         login_frame("hbAlive"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_millis(30), // interval
@@ -209,6 +212,7 @@ async fn non_login_first_frame_errors() {
     let res = handle_control_login(
         bad,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -228,6 +232,7 @@ async fn reconnect_same_run_id_replaces_old_session() {
     let t1 = tokio::spawn(handle_control_login(
         login_frame("rdup"),
         s1,
+        "127.0.0.1".parse().unwrap(),
         state.clone(),
         config.clone(),
         Duration::from_secs(30),
@@ -242,6 +247,7 @@ async fn reconnect_same_run_id_replaces_old_session() {
     let t2 = tokio::spawn(handle_control_login(
         login_frame("rdup"),
         s2,
+        "127.0.0.1".parse().unwrap(),
         state.clone(),
         config.clone(),
         Duration::from_secs(30),
@@ -284,6 +290,7 @@ async fn login_version_mismatch_rejected() {
     let task = tokio::spawn(handle_control_login(
         bad,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -320,6 +327,7 @@ async fn auth_failure_rejects_without_echo() {
     let task = tokio::spawn(handle_control_login(
         bad,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state.clone(),
         config,
         Duration::from_secs(30),
@@ -349,6 +357,7 @@ async fn control_loop_exits_on_shutdown() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rsd"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -380,6 +389,7 @@ async fn login_ok_returns_session_id_and_registers() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rOk"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state.clone(),
         config,
         Duration::from_secs(30),
@@ -410,6 +420,7 @@ async fn newproxy_rejection_routed_to_resp() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rRej"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -450,6 +461,7 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rIgn"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -487,6 +499,7 @@ async fn malformed_frame_breaks_control_loop() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rBad"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -517,6 +530,7 @@ async fn eof_closes_control_loop() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rEof"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -549,6 +563,7 @@ async fn login_invalid_run_id_rejected() {
     let task = tokio::spawn(handle_control_login(
         bad,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -581,6 +596,7 @@ async fn login_oversize_token_rejected() {
     let task = tokio::spawn(handle_control_login(
         bad,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -610,6 +626,7 @@ async fn newproxy_invalid_name_rejected() {
     let task = tokio::spawn(handle_control_login(
         login,
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state,
         config,
         Duration::from_secs(30),
@@ -648,6 +665,7 @@ async fn heartbeat_resp_updates_rtt_metric() {
     let task = tokio::spawn(handle_control_login(
         login_frame("rttMetric"),
         server_end,
+        "127.0.0.1".parse().unwrap(),
         state.clone(),
         ServerConfig::default(),
         Duration::from_millis(20),  // interval
@@ -682,4 +700,66 @@ async fn heartbeat_resp_updates_rtt_metric() {
     }
     assert!(seen >= 50, "rtt_ms should be >= 50, got {seen}");
     task.abort();
+}
+
+#[tokio::test]
+async fn login_rate_limited_after_repeated_failures() {
+    use std::net::IpAddr;
+
+    use rfrp_common::config::ServerSection;
+    use rfrp_common::constants::LOGIN_FAILURE_LIMIT;
+
+    let ip: IpAddr = "203.0.113.9".parse().unwrap();
+    let state = ServerState::new();
+    let cfg = ServerConfig {
+        server: ServerSection {
+            token: "right-token".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // 连续失败达到上限。
+    for _ in 0..LOGIN_FAILURE_LIMIT {
+        let (server_end, _client_end) = duplex(8192);
+        let task = tokio::spawn(handle_control_login(
+            login_frame("rl"),
+            server_end,
+            ip,
+            state.clone(),
+            cfg.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        ));
+        let _ = task.await;
+    }
+
+    // 达到上限后：即使携带正确 token 也应被限速拒绝（不回显原因）。
+    let mut login = Message::from_frame(&login_frame("rl")).unwrap();
+    if let Message::Login(l) = &mut login {
+        l.token = "right-token".into();
+    }
+    let (server_end, client_end) = duplex(8192);
+    let task = tokio::spawn(handle_control_login(
+        login.to_frame().unwrap(),
+        server_end,
+        ip,
+        state.clone(),
+        cfg,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, _cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    match recv_msg(&mut cr).await {
+        Message::LoginResp(r) => {
+            assert!(!r.ok, "rate-limited login must be rejected");
+            assert!(r.error.is_none(), "rate limit must not reveal the reason");
+        }
+        other => panic!("expected LoginResp, got {other:?}"),
+    }
+    let _ = task.await;
+
+    // 其他 IP 不受影响。
+    assert!(state.login_allowed("203.0.113.10".parse().unwrap()));
 }

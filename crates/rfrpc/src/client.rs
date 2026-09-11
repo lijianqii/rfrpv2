@@ -9,9 +9,9 @@ use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
     CONNECT_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN,
-    NEW_PROXY_TIMEOUT, PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX,
-    PROXY_REGISTER_RETRY_MAX_DELAY, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX,
-    WORK_ID_POOL_RESERVED,
+    MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT, PROXY_REGISTER_RETRY_INITIAL,
+    PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY, RECONNECT_BACKOFF_INITIAL,
+    RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
@@ -145,6 +145,7 @@ impl Client {
             }
             attempt += 1;
             tracing::debug!(attempt, "connection attempt");
+            let attempt_started = std::time::Instant::now();
             match self.connect_once(&run_id, &shutdown).await {
                 Ok(ConnectOutcome::Fatal(reason)) => {
                     sig.abort();
@@ -155,7 +156,10 @@ impl Client {
                         break;
                     }
                     self.metrics.inc_reconnect();
-                    if connected {
+                    // 仅"稳定连接"重置退避：会话刚建立即断开（抖动/被顶替）时保持退避增长，
+                    // 避免 1s 间隔的重连风暴。
+                    let lived = attempt_started.elapsed();
+                    if connected && lived >= Duration::from_secs(MIN_STABLE_CONNECTION_SECS) {
                         attempt = 0;
                         backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
                     }

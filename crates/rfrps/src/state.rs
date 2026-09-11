@@ -1,10 +1,12 @@
 //! 服务端共享状态与待处理工作连接。
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use rfrp_common::constants::MAX_ACTIVE_CONNECTIONS;
+use rfrp_common::constants::{LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS};
 use rfrp_common::util::stream::BoxedStream;
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +49,8 @@ pub struct ServerState {
     pub proxy_index: Mutex<HashMap<String, String>>,
     /// UDP 代理运行状态（proxy_name -> UdpProxy）。
     pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
+    /// 登录失败计数（IP -> (失败次数, 窗口起点)），用于登录限速（防 token 穷举）。
+    pub login_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// 运行指标（连接数/流量）。
     pub metrics: Arc<Metrics>,
     /// 最大并发用户连接数（防 DoS 兜底，测试可调小）。
@@ -63,10 +67,46 @@ impl ServerState {
             sessions: Mutex::new(HashMap::new()),
             proxy_index: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
+            login_failures: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// 该 IP 当前是否允许尝试登录（窗口内失败次数未超限）。
+    pub fn login_allowed(&self, ip: IpAddr) -> bool {
+        let mut m = self.login_failures.lock().unwrap();
+        let window = Duration::from_secs(LOGIN_FAILURE_WINDOW);
+        match m.get(&ip) {
+            Some((count, start)) if start.elapsed() < window => *count < LOGIN_FAILURE_LIMIT,
+            Some(_) => {
+                m.remove(&ip);
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// 记录一次登录失败；条目过多时清理过期项（防内存增长）。
+    pub fn record_login_failure(&self, ip: IpAddr) {
+        let window = Duration::from_secs(LOGIN_FAILURE_WINDOW);
+        let mut m = self.login_failures.lock().unwrap();
+        match m.get_mut(&ip) {
+            Some((count, start)) if start.elapsed() < window => *count += 1,
+            Some(e) => *e = (1, Instant::now()),
+            None => {
+                m.insert(ip, (1, Instant::now()));
+            }
+        }
+        if m.len() > 4096 {
+            m.retain(|_, (_, start)| start.elapsed() < window);
+        }
+    }
+
+    /// 登录成功后清除该 IP 的失败计数。
+    pub fn clear_login_failures(&self, ip: IpAddr) {
+        self.login_failures.lock().unwrap().remove(&ip);
     }
 
     /// 采样瞬时 gauge（会短暂持有 sessions/udp 等锁，均为短临界区）。
@@ -146,6 +186,23 @@ mod tests {
             stop: Arc::new(tokio::sync::Notify::new()),
             pools: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[test]
+    fn login_rate_limit_blocks_after_failures() {
+        let state = ServerState::new();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(state.login_allowed(ip));
+        for _ in 0..LOGIN_FAILURE_LIMIT {
+            assert!(state.login_allowed(ip), "still under the limit");
+            state.record_login_failure(ip);
+        }
+        assert!(!state.login_allowed(ip), "must block after limit reached");
+        // 成功登录清除计数后恢复。
+        state.clear_login_failures(ip);
+        assert!(state.login_allowed(ip));
+        // 其他 IP 不受影响。
+        assert!(state.login_allowed("203.0.113.8".parse().unwrap()));
     }
 
     #[test]

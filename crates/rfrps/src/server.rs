@@ -288,6 +288,10 @@ async fn handle_connection(
     tls: Option<ServerTls>,
     first_frame_timeout: Duration,
 ) -> Result<()> {
+    let peer_ip = stream
+        .peer_addr()
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     // peek 也必须有超时：连接后不发任何字节的对端（端口扫描、半开连接）会
     // 永久挂住一个任务与套接字；10s 内无首字节直接关闭。
     let mut first = [0u8; 1];
@@ -354,6 +358,7 @@ async fn handle_connection(
             control::handle_control_login(
                 frame,
                 stream,
+                peer_ip,
                 state,
                 (*config).clone(),
                 Duration::from_secs(HEARTBEAT_INTERVAL),

@@ -424,6 +424,7 @@ rfrps 收到 `NewProxy` 后按顺序校验，任一失败返回 `NewProxyResp{ok
 | custom_domains 冲突 | `"domain conflict"` | 运行时冲突，可重试；rfrpc 记日志，不中断其他 Proxy |
 | 字段缺失/格式错误 | `"invalid field"` | 配置错误，记日志，不重试 |
 | 内部错误（如监听失败） | `"internal error"` | rfrpc 记日志，不重试 |
+| 会话代理数超限 | `"too many proxies"` | 配置错误，记日志，不重试 |
 
 > error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。
 >
@@ -528,9 +529,10 @@ rfrp/
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
 > - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
 > - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 60`、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
-> - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`
+> - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
+> - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP）
 > - 代理注册重试（秒）：`PROXY_REGISTER_RETRY_INITIAL = 2`、`PROXY_REGISTER_RETRY_MAX = 8`（轮）、`PROXY_REGISTER_RETRY_MAX_DELAY = 30`
-> - 上限：`MAX_PENDING_UDP_SESSIONS = 256`、`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
+> - 上限：`MAX_PENDING_UDP_SESSIONS = 256`、`MAX_PROXIES_PER_SESSION = 128`、`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
 > - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`、`MAX_ERROR_LEN = 512`
 
 ### 7.2 职责边界

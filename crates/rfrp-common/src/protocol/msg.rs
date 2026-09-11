@@ -86,6 +86,8 @@ pub enum ProxyError {
     InvalidField,
     /// `proxy_name` 已存在。
     NameExists,
+    /// 会话内代理数超过上限。
+    TooManyProxies,
     /// `remote_port` 超出 `allow_ports`。
     PortNotAllowed,
     /// `remote_port` 被占用（**可重试**：如旧会话尚未释放端口）。
@@ -103,6 +105,7 @@ impl ProxyError {
             Self::InvalidType => "invalid type",
             Self::InvalidField => "invalid field",
             Self::NameExists => "proxy_name exists",
+            Self::TooManyProxies => "too many proxies",
             Self::PortNotAllowed => "port not allowed",
             Self::PortOccupied => "port occupied",
             Self::DomainConflict => "domain conflict",
@@ -121,6 +124,7 @@ impl ProxyError {
             Self::InvalidType,
             Self::InvalidField,
             Self::NameExists,
+            Self::TooManyProxies,
             Self::PortNotAllowed,
             Self::PortOccupied,
             Self::DomainConflict,

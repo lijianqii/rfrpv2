@@ -439,3 +439,30 @@ async fn pending_work_conn_proxy_name_mismatch_rejected() {
         "pending entry must be preserved on mismatch"
     );
 }
+
+#[tokio::test]
+async fn register_rejects_beyond_proxy_limit() {
+    // 单会话代理数上限：认证客户端也不得无限占用端口/内存。
+    let state = ServerState::new();
+    let session = test_session();
+    let cfg = test_config("");
+    for i in 0..MAX_PROXIES_PER_SESSION {
+        session.proxies.lock().unwrap().insert(
+            format!("p{i}"),
+            ProxyEntry {
+                handle: tokio::spawn(async {}),
+                kind: ProxyType::Tcp,
+            },
+        );
+    }
+    let np = NewProxy {
+        proxy_name: "extra".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    let err = register_proxy(&np, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::TooManyProxies);
+}

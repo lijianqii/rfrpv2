@@ -75,6 +75,14 @@ pub const RECONNECT_BACKOFF_MAX: u64 = 30;
 
 // ---- 上限 ----
 
+/// 单个会话可注册的代理数上限（防认证客户端耗尽端口/内存）。
+pub const MAX_PROXIES_PER_SESSION: usize = 128;
+/// 登录失败限速：窗口内允许的最大失败次数（超出后拒绝该 IP 的登录尝试）。
+pub const LOGIN_FAILURE_LIMIT: u32 = 10;
+/// 登录失败限速窗口（秒）。
+pub const LOGIN_FAILURE_WINDOW: u64 = 60;
+/// 连接存活时间低于该秒数视为"短命连接"，不重置重连退避（防抖动重连风暴）。
+pub const MIN_STABLE_CONNECTION_SECS: u64 = 60;
 /// 单个代理 custom_domains 元素上限。
 pub const MAX_CUSTOM_DOMAINS: usize = 16;
 /// 工作连接池默认大小。

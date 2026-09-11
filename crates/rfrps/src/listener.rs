@@ -36,6 +36,11 @@ pub async fn register_proxy(
     state: &Arc<ServerState>,
     config: &ServerConfig,
 ) -> std::result::Result<(), ProxyError> {
+    // 会话内代理数上限：认证客户端也不得无限占用端口/内存。
+    if session.proxies.lock().unwrap().len() >= MAX_PROXIES_PER_SESSION {
+        tracing::warn!(proxy = %np.proxy_name, "proxy limit per session reached");
+        return Err(ProxyError::TooManyProxies);
+    }
     if matches!(np.r#type, ProxyType::Http | ProxyType::Https) {
         // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
         let domains = np.custom_domains.as_ref().ok_or(ProxyError::InvalidField)?;

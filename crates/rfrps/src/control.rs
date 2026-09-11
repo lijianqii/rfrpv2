@@ -8,6 +8,7 @@
 //! `HeartbeatResp`，经 `Notify` 通知控制循环断开并清理 Session。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,6 +60,7 @@ where
 pub async fn handle_control_login<S>(
     login_frame: Frame,
     stream: S,
+    peer_ip: std::net::IpAddr,
     state: Arc<ServerState>,
     config: ServerConfig,
     heartbeat_interval: Duration,
@@ -67,6 +69,13 @@ pub async fn handle_control_login<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // 登录失败限速（防 token 穷举）：超限直接拒绝，且不区分失败原因。
+    if !state.login_allowed(peer_ip) {
+        tracing::warn!(%peer_ip, "login rate limited; rejecting attempt");
+        reject_login(stream, None).await?;
+        return Ok(());
+    }
+
     let login = Message::from_frame(&login_frame)?;
     let (run_id, version, token) = match login {
         Message::Login(l) => (l.run_id, l.version, l.token),
@@ -94,10 +103,12 @@ where
 
     // M3：token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
-        tracing::warn!(run_id = %run_id, "login rejected: token mismatch");
+        state.record_login_failure(peer_ip);
+        tracing::warn!(run_id = %run_id, %peer_ip, "login rejected: token mismatch");
         reject_login(stream, None).await?;
         return Ok(());
     }
+    state.clear_login_failures(peer_ip);
 
     let session_id = uuid::Uuid::new_v4().to_string();
     // 工作连接鉴权令牌：per-session 随机值，不写日志、不经 Dashboard 暴露。
@@ -203,8 +214,12 @@ where
     // 语义，避免“心跳间隔 > 超时阈值”时误判断连（客户端仅在收到 Heartbeat 时回应）。
     let disconnect = Arc::new(Notify::new());
     let pong = Arc::new(Notify::new());
+    // 记录对端回传的最近心跳 ts：以"本轮是否被回应"判定超时，
+    // 避免 Notify 许可残留（无等待者时 notify_one 会存许可）导致漏检一轮。
+    let pong_ts = Arc::new(AtomicU64::new(0));
     let hb_tx = tx.clone();
     let hb_pong = pong.clone();
+    let hb_pong_ts = pong_ts.clone();
     let hb_disconnect = disconnect.clone();
     let session_id_hb = session_id.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -219,10 +234,24 @@ where
                 continue;
             }
             // 等待对端心跳回应；超时则判定断连（§8.3）。
-            if tokio::time::timeout(heartbeat_timeout, hb_pong.notified())
-                .await
-                .is_err()
-            {
+            // 等待本轮心跳被回应（pong_ts 必须推进到本轮 ts）。
+            let deadline = tokio::time::Instant::now() + heartbeat_timeout;
+            let mut timed_out = false;
+            loop {
+                if hb_pong_ts.load(Ordering::Relaxed) >= ts {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero()
+                    || tokio::time::timeout(remaining, hb_pong.notified())
+                        .await
+                        .is_err()
+                {
+                    timed_out = true;
+                    break;
+                }
+            }
+            if timed_out {
                 tracing::warn!(session = %session_id_hb, "heartbeat timeout, disconnecting");
                 hb_disconnect.notify_one();
                 break;
@@ -285,6 +314,7 @@ where
                                 // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
                                 let rtt = now_ms().saturating_sub(h.ts);
                                 state.metrics.set_rtt_ms(rtt);
+                                pong_ts.store(h.ts, Ordering::Relaxed);
                                 tracing::debug!(session = %session_id, rtt_ms = rtt, "heartbeat response received");
                                 // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
                                 pong.notify_one();

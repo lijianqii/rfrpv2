@@ -12,6 +12,7 @@ use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::{graceful_close, send_with_timeout, try_send};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rfrp_common::util::now_ms;
@@ -106,8 +107,11 @@ where
     // （Windows 上 keepalive 未启用时尤为明显）。
     let disconnect = Arc::new(Notify::new());
     let pong = Arc::new(Notify::new());
+    // 记录对端回传的最近心跳 ts：以"本轮是否被回应"判定超时，避免 Notify 许可残留漏检。
+    let pong_ts = Arc::new(AtomicU64::new(0));
     let hb_tx = out_tx.clone();
     let hb_pong = pong.clone();
+    let hb_pong_ts = pong_ts.clone();
     let hb_disconnect = disconnect.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut iv = interval(heartbeat_interval);
@@ -119,10 +123,24 @@ where
                 // 写通道满：跳过本轮，避免本地拥塞误判断连。
                 continue;
             }
-            if tokio::time::timeout(heartbeat_timeout, hb_pong.notified())
-                .await
-                .is_err()
-            {
+            // 等待本轮心跳被回应（pong_ts 必须推进到本轮 ts）。
+            let deadline = tokio::time::Instant::now() + heartbeat_timeout;
+            let mut timed_out = false;
+            loop {
+                if hb_pong_ts.load(Ordering::Relaxed) >= ts {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero()
+                    || tokio::time::timeout(remaining, hb_pong.notified())
+                        .await
+                        .is_err()
+                {
+                    timed_out = true;
+                    break;
+                }
+            }
+            if timed_out {
                 tracing::warn!("heartbeat timeout, control connection considered dead");
                 hb_disconnect.notify_one();
                 break;
@@ -156,6 +174,7 @@ where
                                 // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
                                 let rtt = now_ms().saturating_sub(h.ts);
                                 state.metrics.set_rtt_ms(rtt);
+                                pong_ts.store(h.ts, Ordering::Relaxed);
                                 tracing::debug!(rtt_ms = rtt, "heartbeat response received");
                                 // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
                                 pong.notify_one();

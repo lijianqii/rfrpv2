@@ -42,6 +42,12 @@
   服务端校验 token 与代理所属会话一致，并校验 pending 的会话/代理归属。**协议版本升到 2：
   客户端与服务端需同时升级**（旧客户端登录将收到 version mismatch 致命错误）。
 
+### Security
+
+- **登录失败限速**：按来源 IP 统计，窗口（60s）内失败达到 `LOGIN_FAILURE_LIMIT`(10) 次后
+  拒绝该 IP 的后续登录（不区分失败原因），防 token 穷举；成功登录清除计数。
+- **单会话代理数上限** `MAX_PROXIES_PER_SESSION`(128)，新增错误码 `too many proxies`。
+
 ### Fixed
 
 - **慢速连接（slowloris）防护**：控制口 TLS 握手、HTTPS vhost 握手、vhost/Dashboard/
@@ -50,6 +56,10 @@
 - **UDP 待配对会话上限**：单代理上限 `MAX_PENDING_UDP_SESSIONS`(256)，超限丢包并计入
   `rfrp_udp_dropped_total`；此前伪造源地址可将每个 UDP 包放大为一次工作连接请求。
 - **Dashboard 限频表不再无限增长**：超过 4096 条目时清理过期项（此前随不同源 IP 持续增长）。
+- **重连风暴**：连接存活时间不足 `MIN_STABLE_CONNECTION_SECS`(60s) 时不再重置重连退避，
+  避免"建立即断开"场景下的 1s 间隔无限重连。
+- **心跳 pong 判定**：改用回传 ts 的时间戳判定（`pong_ts >= 本轮 ts`），消除 `Notify`
+  许可残留导致的"漏检一轮"（此前最坏延迟一个心跳周期才检测到失联）。
 - **JoinSet 未回收已完成任务**：accept 循环只 spawn 不 join，已完成任务条目持续累积
   （实测约 257 B/连接），长期运行内存持续增长；现运行期持续回收。
 - **accept 循环健壮性**：`accept()` 出错不再直接终止循环（瞬时错误退避重试），
