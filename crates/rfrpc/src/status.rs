@@ -66,6 +66,16 @@ async fn handle_request(
         _ => "/".to_string(),
     };
 
+    // /healthz：隧道健康检查（控制连接已登录 → 200；否则 503），供监控/守护进程使用。
+    if path == "/healthz" {
+        let (status, body) = if metrics.is_connected() {
+            (200, "ok\n")
+        } else {
+            (503, "unhealthy: control connection down\n")
+        };
+        return write_response(&mut stream, status, "text/plain", body, None).await;
+    }
+
     match path.as_str() {
         "/" => {
             let body = render_html(cfg, metrics);

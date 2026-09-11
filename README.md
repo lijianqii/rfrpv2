@@ -114,6 +114,7 @@ status_addr = "127.0.0.1:7400"   # 仅只读、无鉴权，务必绑回环
 | `GET /` | 状态页（版本、连接状态、uptime、代理清单，5s 自动刷新） |
 | `GET /api/status` | JSON：连接状态、服务端地址、代理清单、指标 |
 | `GET /metrics` | Prometheus 文本 |
+| `GET /healthz` | 隧道健康检查：控制连接已登录返回 `200 ok`，否则 `503` |
 
 客户端指标：`rfrp_client_uptime_seconds`、`rfrp_client_rtt_ms`、`rfrp_client_connected`、`rfrp_client_reconnects_total`、
 `rfrp_client_work_conns_total`、`rfrp_client_work_conn_failures_total`、

@@ -41,8 +41,10 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let mut w = FramedWrite::new(stream, FrameCodec);
-    let _ = w
-        .send(
+    // 拒绝响应也要有超时：对端不读时不得挂住任务（单帧通常可入缓冲，此处仅兜底）。
+    let _ = tokio::time::timeout(
+        Duration::from_secs(rfrp_common::util::control::CONTROL_SEND_TIMEOUT),
+        w.send(
             Message::LoginResp(LoginResp {
                 ok: false,
                 error: error.map(String::from),
@@ -51,8 +53,9 @@ where
                 work_conn_token: None,
             })
             .to_frame()?,
-        )
-        .await;
+        ),
+    )
+    .await;
     Ok(())
 }
 

@@ -72,6 +72,10 @@ async fn status_endpoint_serves_status_and_metrics() {
     // RTT 指标存在（首个心跳往返前为 0）。
     assert!(metrics.contains("rfrp_client_rtt_ms"), "{metrics}");
 
+    // /healthz：连接正常应为 200 ok。
+    let health = get_with_retry(status_port, "/healthz", Duration::from_secs(5)).await;
+    assert_eq!(health, "ok\n");
+
     // 状态页可访问。
     let html = get_with_retry(status_port, "/", Duration::from_secs(5)).await;
     assert!(html.contains("rfrp client"));
