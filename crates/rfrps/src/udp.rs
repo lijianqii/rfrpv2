@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, UDP_SESSION_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS};
+use rfrp_common::constants::{
+    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, UDP_SESSION_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS,
+};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::send_with_timeout;
@@ -161,6 +163,17 @@ async fn handle_datagram(
         if let Some(tx) = tx {
             let _ = tx.send(data.to_vec()).await;
         }
+        return;
+    }
+
+    // 待配对会话上限：伪造源地址可制造大量 pending，并把每个包放大为一次
+    // 工作连接请求（客户端 → 服务端 + 本地服务），超限直接丢弃。
+    if proxy.pending_by_id.lock().unwrap().len() >= MAX_PENDING_UDP_SESSIONS {
+        proxy.metrics.inc_udp_dropped();
+        tracing::debug!(
+            proxy = %proxy_name, %peer,
+            "udp pending session limit reached; dropping datagram"
+        );
         return;
     }
 

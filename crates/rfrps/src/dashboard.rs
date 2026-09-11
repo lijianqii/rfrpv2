@@ -57,7 +57,12 @@ async fn handle_request(
     limiter: &RateLimiter,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
-    let head = match read_request_head(&mut stream).await? {
+    let head = match read_request_head(
+        &mut stream,
+        std::time::Duration::from_secs(rfrp_common::constants::HTTP_HEAD_TIMEOUT),
+    )
+    .await?
+    {
         Some(h) => h,
         None => return Ok(()),
     };
@@ -272,11 +277,18 @@ impl RateLimiter {
                 false
             }
         } else {
+            // 条目只增不减会随不同源 IP 持续增长（IPv6 轮换尤甚）：超过阈值时清理过期项。
+            if m.len() >= RATE_LIMITER_MAX_ENTRIES {
+                m.retain(|_, (_, start)| now.duration_since(*start) < self.window);
+            }
             m.insert(ip, (1, now));
             true
         }
     }
 }
+
+/// 限频表条目上限：达到后先清理过期项再插入。
+const RATE_LIMITER_MAX_ENTRIES: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -357,6 +369,23 @@ mod metrics_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio::sync::{mpsc, Notify};
+
+    #[test]
+    fn rate_limiter_evicts_expired_entries() {
+        let rl = RateLimiter::new(1, Duration::from_millis(10));
+        let now = Instant::now();
+        // 塞满超过阈值的历史条目（均已过期）。
+        for i in 0..(RATE_LIMITER_MAX_ENTRIES + 1) {
+            let ip = std::net::IpAddr::from(std::net::Ipv4Addr::from(i as u32 + 1));
+            let _ = rl.allow(ip, now - Duration::from_secs(1));
+        }
+        // 新请求触发清理：表大小应回落到阈值附近，而不是继续增长。
+        let _ = rl.allow(
+            std::net::IpAddr::from(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            now,
+        );
+        assert!(rl.inner.lock().unwrap().len() < RATE_LIMITER_MAX_ENTRIES);
+    }
 
     #[test]
     fn healthz_reflects_accept_state() {

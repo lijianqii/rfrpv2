@@ -8,7 +8,7 @@ use std::time::Duration;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
-    MAX_CONSECUTIVE_ACCEPT_ERRORS, SERVER_ALIVE_LOG_INTERVAL,
+    MAX_CONSECUTIVE_ACCEPT_ERRORS, SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::Result;
@@ -305,7 +305,19 @@ async fn handle_connection(
 
     let maybe_tls = if let Some(tls) = tls {
         if looks_like_tls {
-            MaybeTls::Tls(Box::new(tls.accept(stream).await?))
+            // 半截 TLS 握手（发送 ClientHello 后停住）不得长期占用任务与套接字。
+            match tokio::time::timeout(
+                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
+                tls.accept(stream),
+            )
+            .await
+            {
+                Ok(r) => MaybeTls::Tls(Box::new(r?)),
+                Err(_) => {
+                    tracing::debug!("TLS handshake timeout; closing");
+                    return Ok(());
+                }
+            }
         } else {
             MaybeTls::Plain(stream)
         }

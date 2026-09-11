@@ -2,7 +2,9 @@
 //! 把已读请求头连同剩余流一起桥接。
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use rfrp_common::constants::{HTTP_HEAD_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
 use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
@@ -75,17 +77,25 @@ pub async fn run_https_vhost(
                         let tls = tls.clone();
                         let state = state.clone();
                         tokio::spawn(async move {
-                            match tls.accept(stream).await {
-                                Ok(tls_stream) => {
+                            let accepted = tokio::time::timeout(
+                                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
+                                tls.accept(stream),
+                            )
+                            .await;
+                            match accepted {
+                                Err(_) => {
+                                    tracing::debug!(%peer, "vhost TLS handshake timeout; closing");
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(%peer, error = %e, "vhost TLS accept failed");
+                                }
+                                Ok(Ok(tls_stream)) => {
                                     let sni = tls_stream
                                         .get_ref()
                                         .1
                                         .server_name()
                                         .map(|s| s.to_string());
                                     let _ = handle_https_connection(sni, tls_stream, state).await;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%peer, error = %e, "vhost TLS accept failed");
                                 }
                             }
                         });
@@ -164,8 +174,21 @@ where
 {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 8192];
+    // 整体截止时间：慢速请求（slowloris）不得长期占用任务与套接字。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(HTTP_HEAD_TIMEOUT);
     loop {
-        let n = stream.read(&mut tmp).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::debug!("vhost request head timeout, closing");
+            return Ok(None);
+        }
+        let n = match tokio::time::timeout(remaining, stream.read(&mut tmp)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                tracing::debug!("vhost request head timeout, closing");
+                return Ok(None);
+            }
+        };
         if n == 0 {
             return Ok(None); // 对端关闭
         }

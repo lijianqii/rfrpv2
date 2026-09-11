@@ -44,6 +44,12 @@
 
 ### Fixed
 
+- **慢速连接（slowloris）防护**：控制口 TLS 握手、HTTPS vhost 握手、vhost/Dashboard/
+  客户端状态端点的请求头读取统一加 10s 整体超时（`TLS_HANDSHAKE_TIMEOUT` /
+  `HTTP_HEAD_TIMEOUT`），此前连接后不发数据会长期占用任务与套接字。
+- **UDP 待配对会话上限**：单代理上限 `MAX_PENDING_UDP_SESSIONS`(256)，超限丢包并计入
+  `rfrp_udp_dropped_total`；此前伪造源地址可将每个 UDP 包放大为一次工作连接请求。
+- **Dashboard 限频表不再无限增长**：超过 4096 条目时清理过期项（此前随不同源 IP 持续增长）。
 - **JoinSet 未回收已完成任务**：accept 循环只 spawn 不 join，已完成任务条目持续累积
   （实测约 257 B/连接），长期运行内存持续增长；现运行期持续回收。
 - **accept 循环健壮性**：`accept()` 出错不再直接终止循环（瞬时错误退避重试），

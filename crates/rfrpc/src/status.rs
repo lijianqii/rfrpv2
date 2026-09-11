@@ -50,7 +50,12 @@ async fn handle_request(
     cfg: &ClientConfig,
     metrics: &Arc<ClientMetrics>,
 ) -> std::io::Result<()> {
-    let head = match read_request_head(&mut stream).await? {
+    let head = match read_request_head(
+        &mut stream,
+        std::time::Duration::from_secs(rfrp_common::constants::HTTP_HEAD_TIMEOUT),
+    )
+    .await?
+    {
         Some(h) => h,
         None => return Ok(()),
     };

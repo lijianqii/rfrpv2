@@ -174,3 +174,54 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
         .expect("channel alive");
     assert_eq!(first, b"first");
 }
+
+#[tokio::test]
+async fn datagram_dropped_when_pending_limit_reached() {
+    // 待配对会话达到上限时，新来源的数据包直接丢弃（防伪造源放大为工作连接请求）。
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let (session, mut ctl_rx) = test_session();
+    let state = ServerState::new();
+
+    for i in 0..MAX_PENDING_UDP_SESSIONS {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let client: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 20000 + i as u16));
+        proxy.pending_by_id.lock().unwrap().insert(
+            i as u64 + 1,
+            PendingUdp {
+                client,
+                tx,
+                rx,
+                created: Instant::now(),
+            },
+        );
+        proxy
+            .pending_client
+            .lock()
+            .unwrap()
+            .insert(client, i as u64 + 1);
+    }
+
+    let peer: SocketAddr = "127.0.0.1:65500".parse().unwrap();
+    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop-me").await;
+
+    assert_eq!(
+        proxy.pending_by_id.lock().unwrap().len(),
+        MAX_PENDING_UDP_SESSIONS,
+        "no new pending entry beyond the limit"
+    );
+    assert!(
+        !proxy.pending_client.lock().unwrap().contains_key(&peer),
+        "dropped peer must not be registered"
+    );
+    assert!(
+        ctl_rx.try_recv().is_err(),
+        "no work conn request for dropped datagram"
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}

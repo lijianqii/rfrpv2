@@ -14,6 +14,8 @@ pub struct Metrics {
     pub accepted_total: AtomicU64,
     /// accept 错误累计次数。
     pub accept_errors_total: AtomicU64,
+    /// UDP 因待配对会话达到上限而丢弃的包数。
+    pub udp_dropped_total: AtomicU64,
     /// accept 循环当前是否正常（连续失败后置 false，恢复后置 true）。
     pub accepting: AtomicBool,
     /// 累计接受的用户连接数。
@@ -33,6 +35,7 @@ impl Default for Metrics {
             rtt_ms: AtomicU64::new(0),
             accepted_total: AtomicU64::new(0),
             accept_errors_total: AtomicU64::new(0),
+            udp_dropped_total: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             total_connections: Arc::new(AtomicU64::new(0)),
             active_connections: Arc::new(AtomicI64::new(0)),
@@ -57,6 +60,11 @@ impl Metrics {
     pub fn inc_accept_error(&self) {
         self.accept_errors_total.fetch_add(1, Ordering::Relaxed);
         self.accepting.store(false, Ordering::Relaxed);
+    }
+
+    /// 记录一次因 UDP pending 上限而丢弃的包。
+    pub fn inc_udp_dropped(&self) {
+        self.udp_dropped_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// accept 循环是否正常（供 /healthz 与指标使用）。
@@ -100,6 +108,9 @@ impl Metrics {
              # HELP rfrp_accept_errors_total Accept errors.\n\
              # TYPE rfrp_accept_errors_total counter\n\
              rfrp_accept_errors_total {}\n\
+             # HELP rfrp_udp_dropped_total UDP datagrams dropped (pending session limit).\n\
+             # TYPE rfrp_udp_dropped_total counter\n\
+             rfrp_udp_dropped_total {}\n\
              # HELP rfrp_accepting Whether the accept loop is healthy (1/0).\n\
              # TYPE rfrp_accepting gauge\n\
              rfrp_accepting {}\n",
@@ -110,6 +121,7 @@ impl Metrics {
             self.rtt_ms(),
             self.accepted_total.load(Ordering::Relaxed),
             self.accept_errors_total.load(Ordering::Relaxed),
+            self.udp_dropped_total.load(Ordering::Relaxed),
             u8::from(self.is_accepting()),
         )
     }

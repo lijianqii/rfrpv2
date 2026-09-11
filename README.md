@@ -97,6 +97,7 @@ rfrp_rtt_ms                 控制链路 RTT（毫秒，0=未测得）
 rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/工作连接）
 rfrp_accept_errors_total    accept 错误累计
 rfrp_accepting              accept 循环是否正常（1/0）
+rfrp_udp_dropped_total      UDP 因待配对会话达上限而丢弃的包数
 ```
 
 ### 客户端状态端点（可选）
@@ -215,6 +216,15 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
 - **RDP 可选 UDP 传输**：rfrp 支持 UDP 代理。给 `3389` 同时配置 TCP 与 UDP 代理后，
   RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。需自行验证 RDP 版本是否协商成功；
   注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`）。
+
+### 资源与慢速连接防护
+
+- **慢速连接（slowloris）**：控制口 TLS 握手、HTTPS vhost 握手、vhost/Dashboard/状态端点
+  的请求头读取均有 10s 整体超时（`TLS_HANDSHAKE_TIMEOUT` / `HTTP_HEAD_TIMEOUT`），
+  连接后不发数据不会长期占用资源。
+- **UDP 放大防护**：单个 UDP 代理的待配对会话上限 `MAX_PENDING_UDP_SESSIONS`(256)，
+  超限丢包并计入 `rfrp_udp_dropped_total`（伪造源地址无法把 1 个 UDP 包放大成大量工作连接）。
+- **连接累积**：accept 循环持续回收已完成任务（避免按连接数累积内存）。
 
 ### 日志与高延迟链路
 

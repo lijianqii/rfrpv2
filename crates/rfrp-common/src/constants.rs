@@ -28,6 +28,10 @@ pub const LOGIN_TIMEOUT: u64 = 10;
 pub const NEW_PROXY_TIMEOUT: u64 = 10;
 /// 服务端等待连接首帧（Login/StartWorkConn）的超时。
 pub const FIRST_FRAME_TIMEOUT: u64 = 10;
+/// TLS 握手超时（控制口与 HTTPS vhost）：防止半截握手长期占用任务与套接字。
+pub const TLS_HANDSHAKE_TIMEOUT: u64 = 10;
+/// HTTP 请求头读取总超时（Dashboard/状态端点/vhost）：防慢速请求（slowloris）。
+pub const HTTP_HEAD_TIMEOUT: u64 = 10;
 
 /// 心跳发送间隔。
 pub const HEARTBEAT_INTERVAL: u64 = 30;
@@ -77,6 +81,8 @@ pub const MAX_CUSTOM_DOMAINS: usize = 16;
 pub const POOL_SIZE_DEFAULT: u32 = 1;
 /// 池大小告警阈值（超过记警告但不拒绝）。
 pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
+/// 单个 UDP 代理同时允许的待配对会话上限（超出直接丢弃，防伪造源放大/耗尽）。
+pub const MAX_PENDING_UDP_SESSIONS: usize = 256;
 /// 单个 UDP 包最大字节数（IPv4 UDP payload 上限）。
 pub const MAX_UDP_PACKET_SIZE: usize = 65507;
 

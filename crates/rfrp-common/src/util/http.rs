@@ -3,6 +3,8 @@
 //! 只实现"读取请求头 + 写一个 `Connection: close` 响应"这两件事，
 //! 足以支撑状态页/JSON/指标三类只读端点，不引入完整 HTTP 栈。
 
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// 请求头上限（超过后按已读内容处理，解析失败按 `/` 处理）。
@@ -10,15 +12,27 @@ pub const MAX_REQUEST_HEAD: usize = 8192;
 
 /// 读取 HTTP 请求头（读到 `\r\n\r\n` 或超过 [`MAX_REQUEST_HEAD`]）。
 ///
-/// 返回 `Ok(None)` 表示对端在发送完整请求头前关闭。
-pub async fn read_request_head<R>(stream: &mut R) -> std::io::Result<Option<Vec<u8>>>
+/// `timeout` 为**整体截止时间**：慢速请求（slowloris）超过后返回 `Ok(None)`。
+/// 返回 `Ok(None)` 也表示对端在发送完整请求头前关闭。
+pub async fn read_request_head<R>(
+    stream: &mut R,
+    timeout: Duration,
+) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let n = stream.read(&mut tmp).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let n = match tokio::time::timeout(remaining, stream.read(&mut tmp)).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(None),
+        };
         if n == 0 {
             return Ok(None);
         }
@@ -76,7 +90,10 @@ mod tests {
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\nBODY")
             .await
             .unwrap();
-        let head = read_request_head(&mut server).await.unwrap().unwrap();
+        let head = read_request_head(&mut server, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(head.starts_with(b"GET /metrics"));
         // 读到请求头终止符即返回（允许把同批到达的后续字节一并读入，调用方按需忽略）。
         assert!(head.windows(4).any(|w| w == b"\r\n\r\n"));
@@ -86,7 +103,10 @@ mod tests {
     async fn eof_before_head_returns_none() {
         let (client, mut server) = duplex(64);
         drop(client);
-        assert!(read_request_head(&mut server).await.unwrap().is_none());
+        assert!(read_request_head(&mut server, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -94,8 +114,27 @@ mod tests {
         let (mut client, mut server) = duplex(64 * 1024);
         let payload = vec![b'a'; MAX_REQUEST_HEAD + 100];
         client.write_all(&payload).await.unwrap();
-        let head = read_request_head(&mut server).await.unwrap().unwrap();
+        let head = read_request_head(&mut server, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(head.len() > MAX_REQUEST_HEAD);
+    }
+
+    #[tokio::test]
+    async fn slow_request_head_times_out() {
+        // 只发一半请求头后停住：整体超时后应返回 None（防 slowloris）。
+        let (mut client, mut server) = duplex(4096);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let head = read_request_head(&mut server, Duration::from_millis(150))
+            .await
+            .unwrap();
+        assert!(head.is_none(), "incomplete head must time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
