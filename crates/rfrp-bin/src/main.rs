@@ -120,6 +120,7 @@ fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
         bind = %format!("{}:{}", cfg.server.bind_addr, cfg.server.bind_port),
         tls = cfg.server.tls_enable,
         work_conn_tls = cfg.server.work_conn_tls,
+        tcp_keepalive_secs = cfg.server.tcp_keepalive_secs.unwrap_or(30),
         allow_ports = if cfg.proxy.allow_ports.trim().is_empty() {
             "all"
         } else {
@@ -141,6 +142,7 @@ fn log_client_summary(cfg: &rfrp_common::config::ClientConfig) {
         proxies = cfg.proxies.len(),
         tls = cfg.client.tls_enable,
         work_conn_tls = cfg.client.work_conn_tls,
+        tcp_keepalive_secs = cfg.client.tcp_keepalive_secs.unwrap_or(30),
         run_id_file = ?cfg.client.run_id_file,
         "rfrpc starting"
     );
@@ -186,6 +188,9 @@ async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     }
     init_logging(&cfg.log, &log);
     log_server_summary(&cfg);
+    rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
+        cfg.server.tcp_keepalive_secs,
+    ));
 
     let server = match rfrps::Server::new(cfg).await {
         Ok(s) => s,
@@ -238,6 +243,9 @@ async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
     }
     init_logging(&cfg.log, &log);
     log_client_summary(&cfg);
+    rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
+        cfg.client.tcp_keepalive_secs,
+    ));
 
     let client = match rfrpc::Client::new(cfg) {
         Ok(c) => c,

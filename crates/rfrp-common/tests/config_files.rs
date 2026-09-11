@@ -58,8 +58,9 @@ fn server_example_parses_with_sections() {
 
     // [proxy] 段
     assert_eq!(cfg.proxy.allow_ports, "6000-6100,7001-7010");
-    assert_eq!(cfg.proxy.vhost_http_port, Some(80));
-    assert_eq!(cfg.proxy.vhost_https_port, Some(443));
+    // 示例使用非特权端口，避免非 root 环境开箱即失败。
+    assert_eq!(cfg.proxy.vhost_http_port, Some(8080));
+    assert_eq!(cfg.proxy.vhost_https_port, Some(8443));
     assert!(
         cfg.proxy
             .vhost_tls_cert

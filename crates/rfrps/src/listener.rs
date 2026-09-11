@@ -9,7 +9,7 @@ use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::*;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
-use rfrp_common::util::counting::CountingStream;
+use rfrp_common::util::counting::{CountingStream, ExtraCounters};
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
@@ -266,12 +266,24 @@ pub(crate) fn dispatch_user_connection(
     metrics
         .total_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let user = Box::new(CountingStream::new(
-        user,
-        metrics.bytes_up.clone(),
-        metrics.bytes_down.clone(),
-        metrics.active_connections.clone(),
-    ));
+    // 每代理统计（Dashboard/每代理指标）。
+    let stats = state.proxy_stats_for(&proxy_name);
+    stats
+        .connections_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let user = Box::new(
+        CountingStream::new(
+            user,
+            metrics.bytes_up.clone(),
+            metrics.bytes_down.clone(),
+            metrics.active_connections.clone(),
+        )
+        .with_extra(ExtraCounters {
+            read: stats.bytes_up.clone(),
+            write: stats.bytes_down.clone(),
+            active: stats.active_connections.clone(),
+        }),
+    );
 
     // 优先命中预热池（§8.2）。池中连接可能已被本地服务（sshd/RDP 等）
     // 在空闲时关闭，出池前先探活，避免用户连接被死连接立即重置。

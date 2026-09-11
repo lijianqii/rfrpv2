@@ -4,9 +4,11 @@
 //! 仅只读、无鉴权：默认应绑定回环地址；绑定非回环时启动会打印警告。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rfrp_common::config::ClientConfig;
 use rfrp_common::util::http::{read_request_head, write_response};
+use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -20,15 +22,18 @@ pub async fn run_status_server(
     metrics: Arc<ClientMetrics>,
     shutdown: CancellationToken,
 ) {
+    // 与 Dashboard 对称的每 IP 限频（端点默认关闭且建议绑回环，此处仅兜底防刷）。
+    let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _peer)) => {
+                    Ok((stream, peer)) => {
                         let cfg = cfg.clone();
                         let metrics = metrics.clone();
+                        let limiter = limiter.clone();
                         tokio::spawn(async move {
-                            let _ = handle_request(stream, &cfg, &metrics).await;
+                            let _ = handle_request(stream, &cfg, &metrics, &limiter, peer).await;
                         });
                     }
                     Err(e) => {
@@ -49,7 +54,12 @@ async fn handle_request(
     mut stream: TcpStream,
     cfg: &ClientConfig,
     metrics: &Arc<ClientMetrics>,
+    limiter: &RateLimiter,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
+    if !limiter.allow(peer.ip(), Instant::now()) {
+        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
+    }
     let head = match read_request_head(
         &mut stream,
         std::time::Duration::from_secs(rfrp_common::constants::HTTP_HEAD_TIMEOUT),

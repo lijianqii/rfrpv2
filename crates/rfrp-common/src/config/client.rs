@@ -51,6 +51,10 @@ pub struct ClientSection {
     pub work_conn_tls: bool,
     #[serde(default)]
     pub run_id_file: Option<String>,
+    /// TCP keepalive 空闲时间（秒）；0 = 禁用。缺省 30。
+    /// 用于空闲长连接（SSH/RDP）的断线感知；Windows 亦生效。
+    #[serde(default)]
+    pub tcp_keepalive_secs: Option<u64>,
     /// 可选状态端点地址（如 `"127.0.0.1:7400"`）：提供 `/`、`/api/status`、`/metrics`。
     /// 默认关闭；仅只读、无鉴权，建议绑定回环地址。
     #[serde(default)]
@@ -164,6 +168,13 @@ impl ClientConfig {
         }
         if self.client.token.is_empty() {
             return Err(config("client token must not be empty"));
+        }
+        if let Some(secs) = self.client.tcp_keepalive_secs {
+            if secs > 3600 {
+                return Err(config(format!(
+                    "tcp_keepalive_secs {secs} out of range 0-3600"
+                )));
+            }
         }
         if let Some(addr) = &self.client.status_addr {
             addr.parse::<std::net::SocketAddr>()

@@ -821,6 +821,7 @@ tls_server_name = "your.server.com"
 tls_ca = "./ca.pem"               # 可选；自签证书场景指定 CA/服务端证书，缺省使用系统/webpki 根证书
 work_conn_tls = true              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
+tcp_keepalive_secs = 30           # TCP keepalive 空闲秒数；0 = 禁用（默认 30，Windows 亦生效）
 # status_addr = "127.0.0.1:7400"  # 可选状态端点（/、/api/status、/metrics）；默认关闭
 
 [[proxy]]
@@ -861,6 +862,7 @@ CLI 参数 > 配置文件 > 默认值。
 - **proxy 唯一性**：客户端配置内 `[[proxy]]` 的 `name` 不重复，`remote_port` 不重复（同一客户端内）。服务端另有全局唯一校验，见 6.6。
 - **类型与字段匹配**：`type = http/https` 必须有 `custom_domains`；`type = tcp/udp` 必须有 `remote_port`。
 - **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时必须可解析为合法 IPv4/IPv6 地址（`std::net::IpAddr` 解析）。
+- **tcp_keepalive_secs 范围**：0–3600（0 = 禁用 keepalive）。
 - **status_addr 格式**：客户端可选状态端点地址，提供时必须可解析为 `SocketAddr`（如 `127.0.0.1:7400`）。
 - **pool_size 通用**：`pool_size` 对所有代理类型（tcp/udp/http/https）生效，省略默认 1。类型为 u32，≥0；0 表示禁用预热纯按需（见 8.2）；建议上限 16（超过记警告但不拒绝，防止资源耗尽）。
 - **vhost 端口与 proxy 类型交叉**：`vhost_http_port` 配置但无 HTTP 类型 proxy、`vhost_https_port` 配置但无 HTTPS 类型 proxy——视为**配置冗余，不报错**（vhost 监听仍启动，只是无流量，方便后续动态添加 proxy）。反之，有 HTTP/HTTPS proxy 但未配对应 vhost 端口——启动**报错**（proxy 无法路由）。

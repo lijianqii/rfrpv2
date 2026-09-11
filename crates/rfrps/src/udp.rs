@@ -96,7 +96,10 @@ async fn run_udp_listener(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
-    let mut sweep_iv = tokio::time::interval(Duration::from_secs(UDP_SESSION_TIMEOUT));
+    // 清理周期取超时的 1/4：使会话/待配对项的实际存活时间接近配置超时
+    // （周期等于超时时，最坏会存活 2× 超时）。
+    let sweep_period = Duration::from_secs((UDP_SESSION_TIMEOUT / 4).max(1));
+    let mut sweep_iv = tokio::time::interval(sweep_period);
     sweep_iv.tick().await; // 消耗首次立即 tick
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
     loop {

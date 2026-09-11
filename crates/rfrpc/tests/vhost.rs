@@ -45,6 +45,7 @@ fn vhost_server_config(http_port: Option<u16>, https_port: Option<u16>) -> Serve
             tls_cert: None,
             tls_key: None,
             work_conn_tls: false,
+            tcp_keepalive_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -313,6 +314,7 @@ async fn http_vhost_with_tls_work_conn() {
             tls_cert: Some(cert.to_string_lossy().to_string()),
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
+            tcp_keepalive_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -337,6 +339,7 @@ async fn http_vhost_with_tls_work_conn() {
             tls_ca: Some(ca.to_string_lossy().to_string()),
             work_conn_tls: true,
             run_id_file: None,
+            tcp_keepalive_secs: None,
             status_addr: None,
         },
         proxies: vec![proxy],

@@ -26,6 +26,7 @@ fn server_config(dashboard_port: u16) -> ServerConfig {
             tls_cert: None,
             tls_key: None,
             work_conn_tls: false,
+            tcp_keepalive_secs: None,
         },
         dashboard: Some(DashboardSection {
             addr: format!("127.0.0.1:{dashboard_port}"),

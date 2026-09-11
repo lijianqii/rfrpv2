@@ -98,6 +98,10 @@ rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/�
 rfrp_accept_errors_total    accept 错误累计
 rfrp_accepting              accept 循环是否正常（1/0）
 rfrp_udp_dropped_total      UDP 因待配对会话达上限而丢弃的包数
+rfrp_proxy_bytes_up_total{proxy="…"}     每代理上行字节
+rfrp_proxy_bytes_down_total{proxy="…"}   每代理下行字节
+rfrp_proxy_connections_total{proxy="…"}  每代理累计连接数
+rfrp_proxy_active_connections{proxy="…"} 每代理活跃连接数
 ```
 
 ### 客户端状态端点（可选）
@@ -153,7 +157,11 @@ cargo test --all
 
 - **Windows 杀毒软件误报**：rfrp 是内网穿透/反代工具，与 frp、nps、ngrok 等同类，Windows 安全软件可能将其归类为 `HackTool`/`RiskWare` 风险工具。二进制已嵌入版本信息/清单/图标以降低启发式误报，但无法消除功能特征归类；加入信任区或代码签名可解决，详见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md)。
 - **`pool_size` 与有状态服务**：预热会建立一条空闲本地连接，sshd/RDP 等服务可能将其超时踢除。服务端出池前会探活并跳过死连接（自动回退按需建立），因此 `pool_size = 1` 可安全使用；若日志频繁出现 `discarded dead pooled work connection`，说明本地服务踢除较快，预热收益有限但不影响功能。
-- **Windows 下 TCP keepalive 已禁用**：Windows 上通过 socket2 设置 keepalive 可能导致空闲连接约 30s 后被系统主动断开；当前 Windows 仅启用 `TCP_NODELAY`，Linux 保留 keepalive。
+- **TCP keepalive 默认启用**（空闲 30s 后探测、间隔 5s，Linux/Windows 一致）：用于空闲长连接（SSH/RDP）在 NAT/防火墙表项过期后的断线感知。可用 `tcp_keepalive_secs` 调整（0 = 禁用）：
+  ```toml
+  [client]            # 或 [server]
+  tcp_keepalive_secs = 30
+  ```
 
 ## 排障
 
@@ -212,8 +220,8 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
 - **空闲会话被中间设备回收**：SSH 默认在空闲时不发送任何数据（RDP 协议自带保活），
   若链路中间有 NAT/防火墙，表项过期（常见 30min–2h）后连接会被静默丢弃，表现为终端"卡住"。
   对策：SSH 客户端配置 `ServerAliveInterval 60`（推荐，端到端有效）。
-- **TCP keepalive**：Linux 侧已启用（空闲 30s、探测间隔 5s）；Windows 侧因历史问题暂未启用，
-  见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md) 说明与下方注意事项。
+- **TCP keepalive**：默认启用（空闲 30s、探测间隔 5s，Linux/Windows 一致），可用
+  `tcp_keepalive_secs` 调整或设为 0 关闭。
 - **RDP 可选 UDP 传输**：rfrp 支持 UDP 代理。给 `3389` 同时配置 TCP 与 UDP 代理后，
   RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。需自行验证 RDP 版本是否协商成功；
   注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`）。

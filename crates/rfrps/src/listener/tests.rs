@@ -25,6 +25,7 @@ fn test_config(allow_ports: &str) -> ServerConfig {
             tls_cert: None,
             tls_key: None,
             work_conn_tls: false,
+            tcp_keepalive_secs: None,
         },
         dashboard: None,
         proxy,

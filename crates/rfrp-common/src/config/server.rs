@@ -35,6 +35,10 @@ pub struct ServerSection {
     /// 是否要求工作连接走 TLS。默认 true（见 DESIGN §6.5）。
     #[serde(default = "default_true")]
     pub work_conn_tls: bool,
+    /// TCP keepalive 空闲时间（秒）；0 = 禁用。缺省 30。
+    /// 用于空闲长连接（SSH/RDP）的断线感知；Windows 亦生效。
+    #[serde(default)]
+    pub tcp_keepalive_secs: Option<u64>,
 }
 
 impl Default for ServerSection {
@@ -47,6 +51,7 @@ impl Default for ServerSection {
             tls_cert: None,
             tls_key: None,
             work_conn_tls: default_true(),
+            tcp_keepalive_secs: None,
         }
     }
 }
@@ -193,6 +198,13 @@ impl ServerConfig {
             })?;
             ensure_file_exists(cert, "tls_cert")?;
             ensure_file_exists(key, "tls_key")?;
+        }
+        if let Some(secs) = self.server.tcp_keepalive_secs {
+            if secs > 3600 {
+                return Err(config(format!(
+                    "tcp_keepalive_secs {secs} out of range 0-3600"
+                )));
+            }
         }
         // allow_ports 格式必须可解析。
         let _ = self.proxy.parse_allow_ports()?;

@@ -151,6 +151,7 @@ async fn udp_proxy_with_tls_work_conn() {
             tls_cert: Some(cert.to_string_lossy().to_string()),
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
+            tcp_keepalive_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -174,6 +175,7 @@ async fn udp_proxy_with_tls_work_conn() {
             tls_ca: Some(ca.to_string_lossy().to_string()),
             work_conn_tls: true,
             run_id_file: None,
+            tcp_keepalive_secs: None,
             status_addr: None,
         },
         proxies: vec![udp_proxy(echo_port, remote)],

@@ -44,6 +44,12 @@
 
 ### Added
 
+- **每代理流量指标**：`rfrp_proxy_bytes_up_total` / `rfrp_proxy_bytes_down_total` /
+  `rfrp_proxy_connections_total` / `rfrp_proxy_active_connections`（带 `proxy` 标签），
+  Dashboard 状态页与 `/api/status` 同步展示每代理表格。
+- **TCP keepalive 可配置且 Windows 生效**：新增 `[server]/[client] tcp_keepalive_secs`
+  （默认 30，0 = 禁用）。Windows 此前完全禁用 keepalive，现统一同时设置空闲时间与探测间隔
+  （历史问题的根因是只设空闲时间未设间隔），空闲 SSH/RDP 会话在 NAT 表项过期后可由内核探测发现。
 - 客户端状态端点新增 `/healthz`（控制连接正常 200，否则 503），供监控/守护进程使用。
 
 ### Security
@@ -54,6 +60,12 @@
 
 ### Fixed
 
+- **UDP 会话清理周期**：由"等于会话超时"改为超时的 1/4，使会话/待配对项实际存活时间接近
+  配置超时（此前最坏可达 2× 超时）。
+- **客户端状态端点限频**：与 Dashboard 一致（每 IP 100 次/分钟）；限频器下沉到
+  `rfrp-common::util::ratelimit` 供两端共用。
+- **示例配置 vhost 端口**：由 80/443 改为 8080/8443，避免非特权环境开箱即失败。
+- 新增 `make bench` 入口。
 - **慢速连接（slowloris）防护**：控制口 TLS 握手、HTTPS vhost 握手、vhost/Dashboard/
   客户端状态端点的请求头读取统一加 10s 整体超时（`TLS_HANDSHAKE_TIMEOUT` /
   `HTTP_HEAD_TIMEOUT`），此前连接后不发数据会长期占用任务与套接字。

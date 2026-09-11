@@ -236,6 +236,35 @@ fn proxy_array_not_silently_dropped() {
 }
 
 #[test]
+fn tcp_keepalive_secs_range_validated() {
+    let base = r#"
+        [client]
+        server_addr = "s.example.com"
+        server_port = 7000
+        token = "secret"
+        work_conn_tls = false
+
+        [[proxy]]
+        name = "ssh"
+        type = "tcp"
+        local_port = 22
+        remote_port = 6000
+    "#;
+    let cfg = |secs: u64| -> ClientConfig {
+        let mut c: ClientConfig = toml::from_str(base).unwrap();
+        c.client.tcp_keepalive_secs = Some(secs);
+        c
+    };
+    assert!(cfg(3600).validate().is_ok());
+    assert!(cfg(0).validate().is_ok(), "0 = disable is valid");
+    assert!(cfg(30).validate().is_ok());
+    assert!(
+        cfg(3601).validate().is_err(),
+        "out of range must be rejected"
+    );
+}
+
+#[test]
 fn malformed_toml_errors() {
     let r = toml::from_str::<ClientConfig>("this = = = not valid toml");
     assert!(r.is_err());

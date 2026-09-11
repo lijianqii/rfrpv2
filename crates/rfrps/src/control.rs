@@ -407,6 +407,7 @@ fn cleanup(session: &Session, state: &ServerState) {
         .filter(|(_, e)| e.kind == ProxyType::Udp)
         .map(|(n, _)| n.clone())
         .collect();
+    state.remove_proxy_stats(&proxy_names);
     state.unindex_proxies(proxy_names);
     for (_, entry) in session.proxies.lock().unwrap().drain() {
         entry.handle.abort();

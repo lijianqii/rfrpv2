@@ -20,6 +20,14 @@ const FLUSH_THRESHOLD: u64 = 256 * 1024;
 /// 及时反映到监控，而不是等到连接关闭（监控滞后 ≤ 1s）。
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 一组额外计数目标（与主计数器同时累加），用于每代理统计等。
+#[derive(Clone)]
+pub struct ExtraCounters {
+    pub read: Arc<AtomicU64>,
+    pub write: Arc<AtomicU64>,
+    pub active: Arc<AtomicI64>,
+}
+
 /// 统计读/写字节数，并在 drop 时递减活跃连接数。
 ///
 /// 计数在本地累计，达到 `FLUSH_THRESHOLD` 或超过 `FLUSH_INTERVAL` 时批量
@@ -29,6 +37,8 @@ pub struct CountingStream {
     read: Arc<AtomicU64>,
     write: Arc<AtomicU64>,
     active: Arc<AtomicI64>,
+    /// 可选的额外计数目标（如每代理统计）。
+    extra: Option<ExtraCounters>,
     pending_read: u64,
     pending_write: u64,
     last_flush: Instant,
@@ -46,20 +56,34 @@ impl CountingStream {
             read,
             write,
             active,
+            extra: None,
             pending_read: 0,
             pending_write: 0,
             last_flush: Instant::now(),
         }
     }
 
-    /// 把本地累计的读写字节数写入全局计数器。
+    /// 附加一组计数目标（与主计数器同时累加），用于每代理统计。
+    pub fn with_extra(mut self, extra: ExtraCounters) -> Self {
+        extra.active.fetch_add(1, Ordering::Relaxed);
+        self.extra = Some(extra);
+        self
+    }
+
+    /// 把本地累计的读写字节数写入全局计数器（含可选的额外目标）。
     fn flush(&mut self) {
         if self.pending_read > 0 {
             self.read.fetch_add(self.pending_read, Ordering::Relaxed);
+            if let Some(e) = &self.extra {
+                e.read.fetch_add(self.pending_read, Ordering::Relaxed);
+            }
             self.pending_read = 0;
         }
         if self.pending_write > 0 {
             self.write.fetch_add(self.pending_write, Ordering::Relaxed);
+            if let Some(e) = &self.extra {
+                e.write.fetch_add(self.pending_write, Ordering::Relaxed);
+            }
             self.pending_write = 0;
         }
         self.last_flush = Instant::now();
@@ -83,6 +107,9 @@ impl Drop for CountingStream {
     fn drop(&mut self) {
         self.flush();
         self.active.fetch_sub(1, Ordering::Relaxed);
+        if let Some(e) = &self.extra {
+            e.active.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -188,6 +215,47 @@ mod tests {
         let mut one = [0u8; 1];
         counted.read_exact(&mut one).await.unwrap();
         assert_eq!(read.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn extra_counters_accumulate_and_decrement() {
+        let (mut a, b) = duplex(1024);
+        let g_read = Arc::new(AtomicU64::new(0));
+        let g_write = Arc::new(AtomicU64::new(0));
+        let g_active = Arc::new(AtomicI64::new(0));
+        let e_read = Arc::new(AtomicU64::new(0));
+        let e_write = Arc::new(AtomicU64::new(0));
+        let e_active = Arc::new(AtomicI64::new(0));
+        let mut counted = CountingStream::new(
+            Box::new(b),
+            g_read.clone(),
+            g_write.clone(),
+            g_active.clone(),
+        )
+        .with_extra(ExtraCounters {
+            read: e_read.clone(),
+            write: e_write.clone(),
+            active: e_active.clone(),
+        });
+        g_active.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            e_active.load(Ordering::Relaxed),
+            1,
+            "extra active incremented"
+        );
+
+        a.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        counted.read_exact(&mut buf).await.unwrap();
+        drop(counted);
+
+        assert_eq!(g_read.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            e_read.load(Ordering::Relaxed),
+            5,
+            "extra read mirrors global"
+        );
+        assert_eq!(e_active.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

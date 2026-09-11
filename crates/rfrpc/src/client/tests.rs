@@ -39,6 +39,7 @@ fn cfg_for(path: &std::path::Path) -> ClientConfig {
     ClientConfig {
         client: ClientSection {
             run_id_file: Some(path.to_string_lossy().to_string()),
+            tcp_keepalive_secs: None,
             status_addr: None,
             ..Default::default()
         },

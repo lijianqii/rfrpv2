@@ -10,7 +10,7 @@ use rfrp_common::constants::{LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTI
 use rfrp_common::util::stream::BoxedStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ProxyStats};
 
 /// 一条等待工作连接到达的「待处理」项。工作连接到达后取出 `user` 与之桥接。
 pub struct PendingWork {
@@ -51,6 +51,8 @@ pub struct ServerState {
     pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
     /// 登录失败计数（IP -> (失败次数, 窗口起点)），用于登录限速（防 token 穷举）。
     pub login_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// 每代理累计统计（proxy_name -> 计数）；会话清理时移除。
+    pub proxy_stats: Mutex<HashMap<String, Arc<ProxyStats>>>,
     /// 运行指标（连接数/流量）。
     pub metrics: Arc<Metrics>,
     /// 最大并发用户连接数（防 DoS 兜底，测试可调小）。
@@ -68,10 +70,29 @@ impl ServerState {
             proxy_index: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
+            proxy_stats: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// 取（或创建）某代理的统计计数器。
+    pub fn proxy_stats_for(&self, proxy_name: &str) -> Arc<ProxyStats> {
+        self.proxy_stats
+            .lock()
+            .unwrap()
+            .entry(proxy_name.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 移除若干代理的统计（会话清理时调用）。
+    pub fn remove_proxy_stats(&self, names: &[String]) {
+        let mut m = self.proxy_stats.lock().unwrap();
+        for n in names {
+            m.remove(n);
+        }
     }
 
     /// 该 IP 当前是否允许尝试登录（窗口内失败次数未超限）。

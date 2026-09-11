@@ -28,6 +28,30 @@ pub struct Metrics {
     pub bytes_down: Arc<AtomicU64>,
 }
 
+/// 单个代理的累计统计（每代理指标与 Dashboard 用）。
+/// 计数用 `Arc<Atomic*>`，便于与全局指标一起共享给 `CountingStream`。
+pub struct ProxyStats {
+    /// 上行字节（外部 → 本地）。
+    pub bytes_up: Arc<AtomicU64>,
+    /// 下行字节（本地 → 外部）。
+    pub bytes_down: Arc<AtomicU64>,
+    /// 累计用户连接数。
+    pub connections_total: Arc<AtomicU64>,
+    /// 当前活跃用户连接数。
+    pub active_connections: Arc<AtomicI64>,
+}
+
+impl Default for ProxyStats {
+    fn default() -> Self {
+        Self {
+            bytes_up: Arc::new(AtomicU64::new(0)),
+            bytes_down: Arc::new(AtomicU64::new(0)),
+            connections_total: Arc::new(AtomicU64::new(0)),
+            active_connections: Arc::new(AtomicI64::new(0)),
+        }
+    }
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Self {
@@ -157,7 +181,69 @@ pub fn render_prometheus(state: &crate::state::ServerState) -> String {
         g.udp_sessions,
         g.pooled_work_conns,
     ));
+    // 每代理指标（标签为代理名；名字已在注册时校验，无空白/斜杠）。
+    let mut stats: Vec<(String, Arc<ProxyStats>)> = state
+        .proxy_stats
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    stats.sort_by(|a, b| a.0.cmp(&b.0));
+    if !stats.is_empty() {
+        out.push_str(
+            "# HELP rfrp_proxy_bytes_up_total Bytes from external users to local service (per proxy).\n\
+             # TYPE rfrp_proxy_bytes_up_total counter\n",
+        );
+        for (name, st) in &stats {
+            out.push_str(&format!(
+                "rfrp_proxy_bytes_up_total{{proxy=\"{}\"}} {}\n",
+                escape_label(name),
+                st.bytes_up.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP rfrp_proxy_bytes_down_total Bytes from local service to external users (per proxy).\n\
+             # TYPE rfrp_proxy_bytes_down_total counter\n",
+        );
+        for (name, st) in &stats {
+            out.push_str(&format!(
+                "rfrp_proxy_bytes_down_total{{proxy=\"{}\"}} {}\n",
+                escape_label(name),
+                st.bytes_down.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP rfrp_proxy_connections_total User connections accepted (per proxy).\n\
+             # TYPE rfrp_proxy_connections_total counter\n",
+        );
+        for (name, st) in &stats {
+            out.push_str(&format!(
+                "rfrp_proxy_connections_total{{proxy=\"{}\"}} {}\n",
+                escape_label(name),
+                st.connections_total.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP rfrp_proxy_active_connections Active user connections (per proxy).\n\
+             # TYPE rfrp_proxy_active_connections gauge\n",
+        );
+        for (name, st) in &stats {
+            out.push_str(&format!(
+                "rfrp_proxy_active_connections{{proxy=\"{}\"}} {}\n",
+                escape_label(name),
+                st.active_connections.load(Ordering::Relaxed)
+            ));
+        }
+    }
     out
+}
+
+/// Prometheus 标签值转义（反斜杠、双引号、换行）。
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -208,5 +294,49 @@ mod tests {
         assert!(text.contains("rfrp_bytes_down_total 2048"));
         assert!(text.contains("# TYPE rfrp_connections_total counter"));
         assert!(text.contains("# TYPE rfrp_active_connections gauge"));
+    }
+}
+
+#[cfg(test)]
+mod proxy_stats_tests {
+    use super::*;
+
+    #[test]
+    fn per_proxy_metrics_render_with_labels() {
+        let state = crate::state::ServerState::new();
+        let st = state.proxy_stats_for("ssh-61");
+        st.bytes_up.fetch_add(100, Ordering::Relaxed);
+        st.bytes_down.fetch_add(200, Ordering::Relaxed);
+        st.connections_total.fetch_add(3, Ordering::Relaxed);
+        st.active_connections.fetch_add(1, Ordering::Relaxed);
+
+        let text = render_prometheus(&state);
+        assert!(
+            text.contains("rfrp_proxy_bytes_up_total{proxy=\"ssh-61\"} 100"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rfrp_proxy_bytes_down_total{proxy=\"ssh-61\"} 200"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rfrp_proxy_connections_total{proxy=\"ssh-61\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rfrp_proxy_active_connections{proxy=\"ssh-61\"} 1"),
+            "{text}"
+        );
+
+        // 会话清理后指标消失。
+        state.remove_proxy_stats(&["ssh-61".to_string()]);
+        let text = render_prometheus(&state);
+        assert!(!text.contains("rfrp_proxy_bytes_up_total{"), "{text}");
+    }
+
+    #[test]
+    fn label_escaping() {
+        assert_eq!(escape_label("a\"b"), "a\\\"b");
+        assert_eq!(escape_label("a\\b"), "a\\\\b");
     }
 }

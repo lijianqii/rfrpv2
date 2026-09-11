@@ -28,7 +28,11 @@ ci: fmt-check clippy build test
 clean:
 	cargo clean
 
-.PHONY: gen-cert release
+.PHONY: bench gen-cert release
+
+# 性能基准（Criterion）
+bench:
+	cargo bench -p rfrp-common --bench forward
 
 # 生成 examples 下的自签证书
 gen-cert:

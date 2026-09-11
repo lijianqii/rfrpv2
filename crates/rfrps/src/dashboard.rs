@@ -1,14 +1,14 @@
 //! Dashboard：Basic Auth + 状态 API + Prometheus 指标。
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::DashboardSection;
 use rfrp_common::util::http::{read_request_head, write_response};
+use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -176,6 +176,28 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
     drop(sessions);
     let g = state.gauges();
 
+    // 每代理累计统计（按名字排序，便于阅读与测试）。
+    let mut proxy_stats: Vec<(String, Arc<crate::metrics::ProxyStats>)> = state
+        .proxy_stats
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    proxy_stats.sort_by(|a, b| a.0.cmp(&b.0));
+    let proxy_stats: Vec<serde_json::Value> = proxy_stats
+        .iter()
+        .map(|(name, st)| {
+            json!({
+                "name": name,
+                "bytes_up": st.bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                "bytes_down": st.bytes_down.load(std::sync::atomic::Ordering::Relaxed),
+                "connections_total": st.connections_total.load(std::sync::atomic::Ordering::Relaxed),
+                "active_connections": st.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+            })
+        })
+        .collect();
+
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.metrics.uptime_secs(),
@@ -185,6 +207,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         "proxies": g.proxies,
         "pooled_work_conns": g.pooled_work_conns,
         "rtt_ms": state.metrics.rtt_ms(),
+        "proxy_stats": proxy_stats,
         "metrics": {
             "total_connections": state.metrics.total_connections.load(std::sync::atomic::Ordering::Relaxed),
             "active_connections": state.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),
@@ -226,12 +249,40 @@ fn render_html(state: &Arc<ServerState>) -> String {
 
     let g = state.gauges();
     let uptime = state.metrics.uptime_secs();
+    let mut stats_rows: Vec<(String, u64, u64, u64, i64)> = state
+        .proxy_stats
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, st)| {
+            (
+                k.clone(),
+                st.bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                st.bytes_down.load(std::sync::atomic::Ordering::Relaxed),
+                st.connections_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                st.active_connections
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect();
+    stats_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let proxy_table: String = stats_rows
+        .iter()
+        .map(|(name, up, down, total, active)| {
+            format!(
+                "<tr><td>{name}</td><td>{up}</td><td>{down}</td><td>{total}</td><td>{active}</td></tr>"
+            )
+        })
+        .collect();
     format!(
         "<html><head><title>rfrp dashboard</title>\
          <meta http-equiv=\"refresh\" content=\"5\"></head><body>\
          <h1>rfrp dashboard <small>v{}</small></h1>\
          <p>uptime: {}s | sessions: {} | proxies: {} | pending work: {} | udp sessions: {} | pooled work conns: {}</p>\
          <h2>Metrics</h2><pre>{}</pre>\
+         <h2>Proxies</h2>\
+         <table border=1><tr><th>name</th><th>bytes_up</th><th>bytes_down</th><th>connections</th><th>active</th></tr>{}</table>\
          <h2>Sessions</h2>\
          <table border=1><tr><th>run_id</th><th>session_id</th><th>proxies</th></tr>{}</table>\
          </body></html>",
@@ -243,77 +294,9 @@ fn render_html(state: &Arc<ServerState>) -> String {
         g.udp_sessions,
         g.pooled_work_conns,
         crate::metrics::render_prometheus(state),
+        proxy_table,
         sessions_html
     )
-}
-
-/// 简单的每 IP 请求限频（滑动窗口计数）。
-struct RateLimiter {
-    inner: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,
-    max: u32,
-    window: Duration,
-}
-
-impl RateLimiter {
-    fn new(max: u32, window: Duration) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            max,
-            window,
-        }
-    }
-
-    fn allow(&self, ip: std::net::IpAddr, now: Instant) -> bool {
-        let mut m = self.inner.lock().unwrap();
-        if let Some((count, start)) = m.get_mut(&ip) {
-            if now.duration_since(*start) >= self.window {
-                *count = 1;
-                *start = now;
-                true
-            } else if *count < self.max {
-                *count += 1;
-                true
-            } else {
-                false
-            }
-        } else {
-            // 条目只增不减会随不同源 IP 持续增长（IPv6 轮换尤甚）：超过阈值时清理过期项。
-            if m.len() >= RATE_LIMITER_MAX_ENTRIES {
-                m.retain(|_, (_, start)| now.duration_since(*start) < self.window);
-            }
-            m.insert(ip, (1, now));
-            true
-        }
-    }
-}
-
-/// 限频表条目上限：达到后先清理过期项再插入。
-const RATE_LIMITER_MAX_ENTRIES: usize = 4096;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rate_limiter_blocks_after_limit_and_resets() {
-        let limiter = RateLimiter::new(3, Duration::from_secs(60));
-        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let now = Instant::now();
-        assert!(limiter.allow(ip, now));
-        assert!(limiter.allow(ip, now));
-        assert!(limiter.allow(ip, now));
-        assert!(
-            !limiter.allow(ip, now),
-            "4th request in window should be blocked"
-        );
-
-        // 窗口过后重置。
-        assert!(limiter.allow(ip, now + Duration::from_secs(61)));
-
-        // 不同 IP 不受影响。
-        let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
-        assert!(limiter.allow(other, now));
-    }
 }
 
 #[cfg(test)]
@@ -369,23 +352,6 @@ mod metrics_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio::sync::{mpsc, Notify};
-
-    #[test]
-    fn rate_limiter_evicts_expired_entries() {
-        let rl = RateLimiter::new(1, Duration::from_millis(10));
-        let now = Instant::now();
-        // 塞满超过阈值的历史条目（均已过期）。
-        for i in 0..(RATE_LIMITER_MAX_ENTRIES + 1) {
-            let ip = std::net::IpAddr::from(std::net::Ipv4Addr::from(i as u32 + 1));
-            let _ = rl.allow(ip, now - Duration::from_secs(1));
-        }
-        // 新请求触发清理：表大小应回落到阈值附近，而不是继续增长。
-        let _ = rl.allow(
-            std::net::IpAddr::from(std::net::Ipv4Addr::new(9, 9, 9, 9)),
-            now,
-        );
-        assert!(rl.inner.lock().unwrap().len() < RATE_LIMITER_MAX_ENTRIES);
-    }
 
     #[test]
     fn healthz_reflects_accept_state() {

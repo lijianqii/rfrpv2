@@ -4,6 +4,7 @@ pub mod control;
 pub mod counting;
 pub mod http;
 pub mod platform;
+pub mod ratelimit;
 pub mod signal;
 pub mod stream;
 pub mod tcp;

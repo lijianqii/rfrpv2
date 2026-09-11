@@ -8,7 +8,8 @@ token = "shared-secret"          # 鉴权 token
 tls_enable = true                 # 控制链路 TLS 总开关（M3 起默认开启）
 tls_cert = "/home/harrison/workspace/rust/rfrpv2/examples/cert.pem"          # 控制链路证书（已随示例生成）
 tls_key  = "/home/harrison/workspace/rust/rfrpv2/examples/key.pem"
-work_conn_tls = true              # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+work_conn_tls = true
+tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）              # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps<->rfrpc 控制连接
@@ -27,8 +28,8 @@ allow_ports = "6000-6100,7001-7010"
 # 注意：80/443 为特权端口（<1024），Linux 下需 root 运行或通过 setcap 授权：
 #   sudo setcap 'cap_net_bind_service=+ep' /path/to/rfrp
 # 非特权场景可改用 8080/8443 等高位端口
-vhost_http_port  = 80
-vhost_https_port = 443
+vhost_http_port  = 8080           # 默认 80 需要 root/特权；非特权环境请用 >=1024 的端口
+vhost_https_port = 8443           # 同上（默认 443 需要特权）
 # HTTPS vhost 证书（可与控制链路证书不同）
 vhost_tls_cert = "/home/harrison/workspace/rust/rfrpv2/examples/vhost-cert.pem"
 vhost_tls_key  = "/home/harrison/workspace/rust/rfrpv2/examples/vhost-key.pem"
