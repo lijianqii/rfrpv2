@@ -31,6 +31,7 @@ fn client_state_with_resp(name: &str) -> (Arc<ClientState>, oneshot::Receiver<Ne
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let (otx, orx) = oneshot::channel();
@@ -47,6 +48,7 @@ fn default_state() -> Arc<ClientState> {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     })
 }
@@ -227,6 +229,7 @@ async fn login_resp_routed_to_state() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let (lotx, lorx) = oneshot::channel();
@@ -253,6 +256,7 @@ async fn login_resp_routed_to_state() {
             error: Some("auth failed".into()),
             session_id: None,
             work_conn_tls: None,
+            work_conn_token: None,
         }),
     )
     .await;
@@ -329,6 +333,7 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
         Message::StartWorkConn(StartWorkConn {
             proxy_name: "p".into(),
             work_id: 7,
+            work_conn_token: None,
         }),
     )
     .await;

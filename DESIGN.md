@@ -313,7 +313,8 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 | `session_id` | string (UUID v4) | rfrps 登录时生成 | 仅用于日志关联，后续消息不携带 |
 | `work_id` | u64 单调递增（0 为保留值） | rfrps 生成，随 ReqWorkConn 下发给 rfrpc | 工作连接内部索引与日志关联，rfrpc 在 StartWorkConn 中透传回传。**`work_id=0` 为池化预备标识**（见 8.2）：rfrpc 预建池化工作连接时填 0，rfrps 据此放入空闲池而非绑定用户连接；非零值由 rfrps 在 ReqWorkConn 中下发，用于按需建立时关联用户连接 |
 | `ts` | u64 (Unix 毫秒) | 发送方 | 心跳时间戳，用于超时判断 |
-| `version` | u8 | 双方 | 协议版本，当前 = 1 |
+| `version` | u8 | 双方 | 协议版本，当前 = 2（v2 起工作连接需鉴权，见 §8.2） |
+| `work_conn_token` | string (UUID v4) | rfrps 登录成功时生成，经 `LoginResp` 下发 | **工作连接鉴权令牌**（v2）：rfrpc 在 `StartWorkConn` 中回传，rfrps 校验其与代理所属会话一致，防止未认证连接注入预热池或劫持 pending。仅下发给已登录客户端，不写日志、不经 Dashboard 暴露 |
 | `type` | string 枚举 | rfrpc | 代理类型，小写：`"tcp"` / `"udp"` / `"http"` / `"https"` |
 | `proxy_name` | string | rfrpc 注册时指定 | Proxy 全局唯一标识，后续消息引用 |
 | `remote_port` | u16 (JSON number) | rfrpc NewProxy 携带 | TCP/UDP 必填，HTTP/HTTPS 忽略（可省略） |
@@ -377,7 +378,8 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 - 帧头 `Version` 与 `Login.version` 字段**必须一致**，否则服务端拒绝并返回 `LoginResp{ok:false, error:"version mismatch"}`。
 - 客户端发送的帧头 Version 即其声明版本；服务端支持的最高版本若 ≥ 客户端版本则接受，否则拒绝。
-- 首版仅支持 Version=1，未来版本通过 `Login.version` 字段协商降级（首版不实现降级逻辑）。
+- 当前版本为 **2**；v1 与 v2 不兼容（v2 强制工作连接鉴权），因此不实现降级：版本不符即拒绝登录，客户端按致命错误处理并提示升级。
+- 未来版本通过 `Login.version` 字段协商降级。
 
 ### 6.5 工作连接加密
 

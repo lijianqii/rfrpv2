@@ -23,6 +23,7 @@ async fn fatal_login_exits_without_reconnect() {
                 error: Some("auth failed".into()),
                 session_id: None,
                 work_conn_tls: None,
+                work_conn_token: None,
             })
             .to_frame()
             .unwrap(),
@@ -77,6 +78,7 @@ async fn fatal_login_version_mismatch_exits_without_reconnect() {
                 error: Some("version mismatch".into()),
                 session_id: None,
                 work_conn_tls: None,
+                work_conn_token: None,
             })
             .to_frame()
             .unwrap(),

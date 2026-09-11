@@ -43,7 +43,7 @@ fn partial_payload_returns_none() {
 #[test]
 fn version_mismatch_rejected() {
     let mut buf = BytesMut::new();
-    buf.put_slice(&[0x02, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    buf.put_slice(&[PROTOCOL_VERSION + 1, 0x01, 0x00, 0x00, 0x00, 0x00]);
     let err = FrameCodec.decode(&mut buf).unwrap_err();
     assert!(matches!(err, Error::Protocol(_)));
 }
@@ -162,7 +162,7 @@ async fn read_one_frame_version_mismatch_errors() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut client = TcpStream::connect(addr).await.unwrap();
-    let header = [0x02, 0x01, 0x00, 0x00, 0x00, 0x00]; // 版本 0x02 不符
+    let header = [PROTOCOL_VERSION + 1, 0x01, 0x00, 0x00, 0x00, 0x00]; // 版本不符
     client.write_all(&header).await.unwrap();
     drop(client);
     let (server, _peer) = listener.accept().await.unwrap();

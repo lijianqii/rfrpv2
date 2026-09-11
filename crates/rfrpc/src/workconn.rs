@@ -75,11 +75,13 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             tracing::warn!(proxy = %req.proxy_name, error = %e, "local udp connect failed; closing work connection");
             return Ok(());
         }
+        let work_conn_token = state.work_conn_token.lock().unwrap().clone();
         framed
             .send(
                 Message::StartWorkConn(StartWorkConn {
                     proxy_name: req.proxy_name.clone(),
                     work_id: req.work_id,
+                    work_conn_token,
                 })
                 .to_frame()?,
             )
@@ -117,11 +119,13 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         }
     };
 
+    let work_conn_token = state.work_conn_token.lock().unwrap().clone();
     framed
         .send(
             Message::StartWorkConn(StartWorkConn {
                 proxy_name: req.proxy_name.clone(),
                 work_id: req.work_id,
+                work_conn_token,
             })
             .to_frame()?,
         )

@@ -22,6 +22,9 @@ pub struct ProxyEntry {
 pub struct Session {
     pub run_id: String,
     pub session_id: String,
+    /// 工作连接鉴权令牌（登录时随机生成，仅经 LoginResp 下发给该客户端）。
+    /// 工作连接建立时校验，防止未认证连接注入预热池或劫持 pending（DESIGN §8.2）。
+    pub work_conn_token: String,
     /// 出站控制消息通道（监听任务发 ReqWorkConn，本任务转交写任务）。
     pub tx: mpsc::Sender<Message>,
     /// 已注册代理（proxy_name -> 监听任务句柄 + 类型）。

@@ -33,8 +33,19 @@
   systemd 安装 + 校验）、LICENSE 与 systemd unit（Linux）。
 - 极简 HTTP 工具下沉到 `rfrp-common::util::http`，Dashboard 与客户端状态端点共用。
 
+### Security
+
+- **工作连接鉴权（协议 v2，破坏性变更）**：此前工作连接无任何鉴权——任何能访问控制端口的人
+  都可以 `StartWorkConn{proxy_name:<受害代理>, work_id:0}` 把连接注入预热池，使下一个用户连接
+  被桥接到攻击者（中间人，可窃取 SSH/RDP 凭据）；也可凭顺序自增的 `work_id` 认领他人的待处理
+  用户连接。现 `LoginResp` 下发 per-session 随机 `work_conn_token`，`StartWorkConn` 必须携带，
+  服务端校验 token 与代理所属会话一致，并校验 pending 的会话/代理归属。**协议版本升到 2：
+  客户端与服务端需同时升级**（旧客户端登录将收到 version mismatch 致命错误）。
+
 ### Fixed
 
+- **JoinSet 未回收已完成任务**：accept 循环只 spawn 不 join，已完成任务条目持续累积
+  （实测约 257 B/连接），长期运行内存持续增长；现运行期持续回收。
 - **accept 循环健壮性**：`accept()` 出错不再直接终止循环（瞬时错误退避重试），
   连续失败达到阈值才以**非零退出码**退出，交由服务管理器重启；避免"进程仍在运行
   却不再接受连接"的静默故障。

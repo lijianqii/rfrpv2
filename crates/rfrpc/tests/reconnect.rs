@@ -188,6 +188,7 @@ async fn client_reconnects_after_silent_control_death() {
                             error: None,
                             session_id: Some("fake".into()),
                             work_conn_tls: Some(false),
+                            work_conn_token: None,
                         });
                         let _ = w.send(resp.to_frame().unwrap()).await;
                     }
@@ -263,6 +264,7 @@ async fn client_retries_retryable_registration_failure() {
                                 error: None,
                                 session_id: Some("fake".into()),
                                 work_conn_tls: Some(false),
+                                work_conn_token: None,
                             });
                             let _ = w.send(resp.to_frame().unwrap()).await;
                         }

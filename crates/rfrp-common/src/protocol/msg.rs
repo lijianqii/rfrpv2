@@ -48,6 +48,10 @@ pub struct LoginResp {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_conn_tls: Option<bool>,
+    /// 工作连接鉴权令牌（per-session 随机值，仅下发给已登录客户端）。
+    /// `StartWorkConn` 必须携带，服务端据此校验工作连接归属（DESIGN §6.2.1/§8.2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_conn_token: Option<String>,
 }
 
 /// 注册单个代理（C→S）。DESIGN §6.2。
@@ -157,6 +161,9 @@ pub struct ReqWorkConn {
 pub struct StartWorkConn {
     pub proxy_name: String,
     pub work_id: u64,
+    /// 工作连接鉴权令牌（来自 `LoginResp.work_conn_token`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_conn_token: Option<String>,
 }
 
 /// 主动关闭通知（双向，控制连接层）。`reason` 可选。
@@ -260,6 +267,7 @@ mod tests {
             error: None,
             session_id: None,
             work_conn_tls: None,
+            work_conn_token: None,
         });
         let json = String::from_utf8(m.to_frame().unwrap().payload).unwrap();
         assert!(!json.contains("session_id"));
@@ -274,6 +282,7 @@ mod tests {
             error: Some("version mismatch".into()),
             session_id: None,
             work_conn_tls: None,
+            work_conn_token: None,
         });
         let json = String::from_utf8(m.to_frame().unwrap().payload).unwrap();
         assert!(json.contains("version mismatch"));
@@ -317,6 +326,7 @@ mod tests {
         roundtrip(Message::StartWorkConn(StartWorkConn {
             proxy_name: "ssh".into(),
             work_id: 7,
+            work_conn_token: None,
         }));
         roundtrip(Message::Close(Close {
             reason: Some("shutdown".into()),

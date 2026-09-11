@@ -47,6 +47,7 @@ where
                 error: error.map(String::from),
                 session_id: None,
                 work_conn_tls: None,
+                work_conn_token: None,
             })
             .to_frame()?,
         )
@@ -99,10 +100,13 @@ where
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
+    // 工作连接鉴权令牌：per-session 随机值，不写日志、不经 Dashboard 暴露。
+    let work_conn_token = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = mpsc::channel::<Message>(256);
     let session = Arc::new(Session {
         run_id,
         session_id: session_id.clone(),
+        work_conn_token: work_conn_token.clone(),
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
         proxy_domains: Mutex::new(HashMap::new()),
@@ -184,6 +188,7 @@ where
             error: None,
             session_id: Some(session_id.clone()),
             work_conn_tls: Some(config.server.work_conn_tls),
+            work_conn_token: Some(work_conn_token),
         }),
     )
     .await

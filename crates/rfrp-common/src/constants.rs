@@ -2,8 +2,11 @@
 //!
 //! 各数值与 DESIGN.md §7.1 `rfrp-common::constants` 一节保持一致。
 
-/// 协议版本号（DESIGN §6.4）。首版仅支持 1。
-pub const PROTOCOL_VERSION: u8 = 1;
+/// 协议版本号（DESIGN §6.4）。
+///
+/// v2：工作连接鉴权——`LoginResp` 下发 per-session `work_conn_token`，
+/// `StartWorkConn` 必须携带并由服务端校验（防止未认证连接注入池/劫持 pending）。
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// 帧头长度：Version(1) + MsgType(1) + Length(4)。
 pub const FRAME_HEADER_LEN: usize = 6;

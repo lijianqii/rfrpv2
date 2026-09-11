@@ -139,6 +139,7 @@ mod tests {
         Arc::new(crate::control::Session {
             run_id: run_id.into(),
             session_id: "sid".into(),
+            work_conn_token: "tok".into(),
             tx,
             proxies: Mutex::new(HashMap::new()),
             proxy_domains: Mutex::new(HashMap::new()),

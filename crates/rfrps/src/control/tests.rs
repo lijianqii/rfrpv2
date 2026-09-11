@@ -39,6 +39,7 @@ async fn cleanup_clears_proxy_domains() {
     let session = Arc::new(Session {
         run_id: "r".into(),
         session_id: "s".into(),
+        work_conn_token: "tok".into(),
         tx,
         proxies: Mutex::new(HashMap::new()),
         proxy_domains: Mutex::new(HashMap::new()),
@@ -463,6 +464,7 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
         Message::StartWorkConn(StartWorkConn {
             proxy_name: "p".into(),
             work_id: 5,
+            work_conn_token: None,
         }),
     )
     .await;
@@ -494,9 +496,13 @@ async fn malformed_frame_breaks_control_loop() {
     let mut cr = FramedRead::new(cr, FrameCodec);
     let mut cw = FramedWrite::new(cw, FrameCodec);
     assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
-    cw.send(Frame::new(0x02, MSG_HEARTBEAT, b"{}".to_vec()))
-        .await
-        .unwrap();
+    cw.send(Frame::new(
+        PROTOCOL_VERSION.wrapping_add(1),
+        MSG_HEARTBEAT,
+        b"{}".to_vec(),
+    ))
+    .await
+    .unwrap();
     let r = tokio::time::timeout(Duration::from_secs(3), task).await;
     assert!(r.is_ok(), "control loop must break on malformed frame");
     r.unwrap().unwrap().unwrap();

@@ -44,6 +44,8 @@ pub struct ClientState {
     pub tls: Option<ClientTls>,
     /// 工作连接实际是否使用 TLS（由服务端 LoginResp 偏好覆盖，DESIGN §6.5）。
     pub work_conn_tls: Mutex<bool>,
+    /// 工作连接鉴权令牌（来自 LoginResp，随 StartWorkConn 上送）。
+    pub work_conn_token: Mutex<Option<String>>,
     /// 进程级运行指标（跨重连累计）。
     pub metrics: Arc<ClientMetrics>,
 }
@@ -245,6 +247,7 @@ impl Client {
             login_tx: Mutex::new(None),
             tls,
             work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
+            work_conn_token: Mutex::new(None),
             metrics: self.metrics.clone(),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
@@ -268,6 +271,7 @@ impl Client {
                     *state.work_conn_tls.lock().unwrap() = resp
                         .work_conn_tls
                         .unwrap_or(self.config.client.work_conn_tls);
+                    *state.work_conn_token.lock().unwrap() = resp.work_conn_token.clone();
                     self.metrics.set_connected(true);
                 }
                 if !resp.ok {

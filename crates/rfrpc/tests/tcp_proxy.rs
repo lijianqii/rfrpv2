@@ -371,3 +371,49 @@ async fn pooled_work_conn_skips_local_idle_closed_conn() {
     srv.abort();
     cli.abort();
 }
+
+/// 安全回归：未认证的工作连接不得注入预热池（否则下一个用户连接会被桥接到攻击者）。
+#[tokio::test]
+async fn unauthenticated_work_conn_cannot_poison_pool() {
+    use rfrp_common::protocol::frame::FrameCodec;
+    use rfrp_common::protocol::msg::{Message, StartWorkConn};
+    use tokio_util::codec::Encoder;
+
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let mut proxy = tcp_proxy("p1", echo_port, remote);
+    proxy.pool_size = 1; // 池存在，攻击者才有注入目标
+    let cli = start_client(client_config(addr, vec![proxy], None)).await;
+    assert!(
+        wait_for_proxy(addr, remote, Duration::from_secs(5)).await,
+        "proxy should become ready"
+    );
+
+    // 攻击者直连控制口，尝试把无 token 的工作连接塞进池。
+    let mut attacker = TcpStream::connect(addr).await.unwrap();
+    let frame = Message::StartWorkConn(StartWorkConn {
+        proxy_name: "p1".into(),
+        work_id: 0,
+        work_conn_token: None,
+    })
+    .to_frame()
+    .unwrap();
+    let mut buf = tokio_util::bytes::BytesMut::new();
+    FrameCodec.encode(frame, &mut buf).unwrap();
+    attacker.write_all(&buf).await.unwrap();
+
+    // 服务端应拒绝并关闭该连接。
+    let mut b = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(3), attacker.read(&mut b))
+        .await
+        .expect("server must close injected work conn")
+        .unwrap();
+    assert_eq!(n, 0, "injected work conn must be closed");
+
+    // 用户连接必须仍到达真实 echo 服务（池未被污染）。
+    expect_echo(remote, addr, b"not-poisoned").await;
+
+    srv.abort();
+    cli.abort();
+}

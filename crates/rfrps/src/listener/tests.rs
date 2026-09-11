@@ -37,6 +37,7 @@ fn test_session() -> Arc<Session> {
     Arc::new(Session {
         run_id: "r".into(),
         session_id: "s".into(),
+        work_conn_token: "tok".into(),
         tx,
         proxies: Mutex::new(HashMap::new()),
         proxy_domains: Mutex::new(HashMap::new()),
@@ -180,6 +181,7 @@ async fn pooled_work_connection_registered() {
     let frame = Message::StartWorkConn(StartWorkConn {
         proxy_name: "ssh".into(),
         work_id: WORK_ID_POOL_RESERVED,
+        work_conn_token: Some(session.work_conn_token.clone()),
     })
     .to_frame()
     .unwrap();
@@ -337,4 +339,103 @@ async fn pending_work_conn_cleaned_after_timeout() {
     // 超时后 pending 项被移除（用户侧连接被关闭）。
     tokio::time::sleep(Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS + 2)).await;
     assert!(!state.pending.lock().unwrap().contains_key(&42));
+}
+
+#[tokio::test]
+async fn pooled_work_conn_without_token_rejected() {
+    // 未携带 work_conn_token 的工作连接不得进入预热池（防池注入/中间人）。
+    let state = ServerState::new();
+    let session = test_session();
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    let np = NewProxy {
+        proxy_name: "ssh".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+
+    for token in [None, Some("wrong-token".to_string())] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+        let frame = Message::StartWorkConn(StartWorkConn {
+            proxy_name: "ssh".into(),
+            work_id: WORK_ID_POOL_RESERVED,
+            work_conn_token: token,
+        })
+        .to_frame()
+        .unwrap();
+        assert!(handle_work_connection(frame, server, state.clone())
+            .await
+            .is_ok());
+    }
+
+    let pooled = session
+        .pools
+        .lock()
+        .unwrap()
+        .get("ssh")
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert_eq!(pooled, 0, "unauthenticated work conns must not be pooled");
+}
+
+#[tokio::test]
+async fn pending_work_conn_proxy_name_mismatch_rejected() {
+    // 合法 token 但 proxy_name 与 pending 项不一致：不得认领该用户连接。
+    let state = ServerState::new();
+    let session = test_session();
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    for name in ["p1", "p2"] {
+        let np = NewProxy {
+            proxy_name: name.into(),
+            r#type: ProxyType::Tcp,
+            remote_port: Some(free_port()),
+            custom_domains: None,
+        };
+        assert!(register_proxy(&np, &session, &state, &cfg).await.is_ok());
+    }
+
+    // 伪造一个属于 p1 的待处理用户连接。
+    let (user, _other) = tokio::io::duplex(64);
+    state.pending.lock().unwrap().insert(
+        7,
+        PendingWork {
+            proxy_name: "p1".into(),
+            session_id: session.session_id.clone(),
+            user: Some(Box::new(user)),
+        },
+    );
+
+    // 用 p2 的名字 + 合法 token 认领 work_id=7 → 应被拒绝且 pending 保留。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _client = TcpStream::connect(addr).await.unwrap();
+    let (server, _peer) = listener.accept().await.unwrap();
+    let frame = Message::StartWorkConn(StartWorkConn {
+        proxy_name: "p2".into(),
+        work_id: 7,
+        work_conn_token: Some(session.work_conn_token.clone()),
+    })
+    .to_frame()
+    .unwrap();
+    assert!(handle_work_connection(frame, server, state.clone())
+        .await
+        .is_ok());
+    assert!(
+        state.pending.lock().unwrap().contains_key(&7),
+        "pending entry must be preserved on mismatch"
+    );
 }

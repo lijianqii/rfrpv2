@@ -32,6 +32,7 @@ async fn unknown_proxy_returns_ok() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let req = ReqWorkConn {
@@ -65,6 +66,7 @@ async fn local_service_unreachable_closes_gracefully() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let req = ReqWorkConn {
@@ -87,6 +89,7 @@ async fn work_conn_tls_enabled_without_tls_errors() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(true),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let req = ReqWorkConn {
@@ -112,6 +115,7 @@ async fn tcp_work_conn_sends_start_frame_and_bridges() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let req = ReqWorkConn {
@@ -185,6 +189,7 @@ async fn udp_work_conn_sends_start_frame_and_ends_on_eof() {
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(false),
+        work_conn_token: Mutex::new(None),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     });
     let req = ReqWorkConn {

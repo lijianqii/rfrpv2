@@ -231,6 +231,7 @@ mod tests {
         let session = Arc::new(Session {
             run_id: "r".into(),
             session_id: "s".into(),
+            work_conn_token: "tok".into(),
             tx,
             proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
             proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -307,6 +308,7 @@ mod head_tests {
         let session = Arc::new(Session {
             run_id: "r".into(),
             session_id: "s".into(),
+            work_conn_token: "tok".into(),
             tx,
             proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
             proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),

@@ -220,7 +220,7 @@ impl Server {
                                 )
                                 .await
                                 {
-                                    tracing::warn!("connection error: {e}");
+                                    tracing::warn!(%peer, error = %e, "connection error");
                                 }
                             });
                         }
@@ -249,6 +249,9 @@ impl Server {
                         }
                     }
                 }
+                // 回收已完成任务：JoinSet 会保留已完成任务的条目直到被 join，
+                // 长期运行下按连接数累积（实测约 257B/连接）。此处持续回收。
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
                 _ = shutdown.cancelled() => {
                     tracing::info!("shutdown signal received; draining in-flight connections");
                     break;
