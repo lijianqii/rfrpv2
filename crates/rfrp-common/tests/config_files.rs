@@ -30,7 +30,7 @@ fn client_example_parses_with_proxies() {
         cfg.client
             .tls_ca
             .as_deref()
-            .map(|p| p.ends_with("examples/ca.pem"))
+            .map(|p| Path::new(p).ends_with("examples/ca.pem"))
             .unwrap_or(false),
         "tls_ca should resolve relative to the example config dir"
     );
@@ -65,7 +65,7 @@ fn server_example_parses_with_sections() {
         cfg.proxy
             .vhost_tls_cert
             .as_deref()
-            .map(|p| p.ends_with("examples/vhost-cert.pem"))
+            .map(|p| Path::new(p).ends_with("examples/vhost-cert.pem"))
             .unwrap_or(false),
         "vhost_tls_cert should resolve relative to the example config dir"
     );
@@ -73,7 +73,7 @@ fn server_example_parses_with_sections() {
         cfg.proxy
             .vhost_tls_key
             .as_deref()
-            .map(|p| p.ends_with("examples/vhost-key.pem"))
+            .map(|p| Path::new(p).ends_with("examples/vhost-key.pem"))
             .unwrap_or(false),
         "vhost_tls_key should resolve relative to the example config dir"
     );

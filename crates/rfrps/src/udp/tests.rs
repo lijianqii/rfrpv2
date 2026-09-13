@@ -135,6 +135,80 @@ async fn datagram_delivered_to_pending_session() {
 }
 
 #[tokio::test]
+async fn datagram_dropped_when_session_channel_full() {
+    // 背压保护：会话通道满时不得阻塞整代理收包循环（所有客户端共用），
+    // 应立即丢弃并计数（UDP 语义允许丢失）。
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let (session, mut ctl_rx) = test_session();
+    let state = ServerState::new();
+    let peer: SocketAddr = "127.0.0.1:1004".parse().unwrap();
+
+    let (tx, _keep_rx) = mpsc::channel::<Vec<u8>>(1);
+    tx.try_send(vec![0u8; 1]).expect("fill channel");
+    proxy.sessions.lock().unwrap().insert(
+        peer,
+        UdpSession {
+            tx,
+            last_active: Instant::now(),
+        },
+    );
+
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop"),
+    )
+    .await
+    .expect("must not block on a full session channel");
+
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(ctl_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn datagram_dropped_when_pending_channel_full() {
+    // 待配对窗口期同样不得阻塞收包循环。
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let (session, mut ctl_rx) = test_session();
+    let state = ServerState::new();
+    let peer: SocketAddr = "127.0.0.1:1005".parse().unwrap();
+
+    let (tx, _keep_rx) = mpsc::channel::<Vec<u8>>(1);
+    tx.try_send(vec![0u8; 1]).expect("fill channel");
+    proxy.pending_by_id.lock().unwrap().insert(
+        7,
+        PendingUdp {
+            client: peer,
+            tx: tx.clone(),
+            rx: mpsc::channel(4).1,
+            created: Instant::now(),
+        },
+    );
+    proxy.pending_client.lock().unwrap().insert(peer, 7);
+
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop"),
+    )
+    .await
+    .expect("must not block on a full pending channel");
+
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(ctl_rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn first_datagram_creates_pending_and_requests_work_conn() {
     // 首包：建立待配对项（含首包入队）、登记 client→work_id、并触发 ReqWorkConn（§8.6）。
     let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;

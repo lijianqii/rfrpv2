@@ -21,7 +21,17 @@ rfrps = { path = "../rfrps" }
 rfrpc = { path = "../rfrpc" }
 
 [dev-dependencies]
+
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+# 混沌测试用：CTRL_BREAK_EVENT 投递（GenerateConsoleCtrlEvent）与
+# CREATE_NEW_PROCESS_GROUP 创建标志（见 tests/chaos.rs）。
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
 
 [build-dependencies]
 embed-resource = "2"

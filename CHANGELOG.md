@@ -8,6 +8,39 @@
 
 ### Added
 
+- **GitHub Actions CI（`.github/workflows/ci.yml`）**：ubuntu 执行 fmt + clippy（-D warnings）、
+  ubuntu/windows 双平台 `cargo test --all`、以及 musl 与 Windows-gnu 交叉构建回归，
+  保证后续改动在 Linux/Windows 两侧持续可验证。
+
+### Fixed
+
+- **示例配置不再硬编码开发机绝对路径**：`examples/rfrp-{server,client}.toml` 的证书路径
+  改为相对配置文件目录（如 `./cert.pem`），使仓库自带的契约测试（`config_files`）与
+  `example_smoke` 在任何机器/平台通过，恢复"克隆即可本地测试"。
+- **Windows 混沌测试可编译可运行**：`rfrp-bin/tests/chaos.rs` 按平台门控（Unix 用
+  SIGTERM/SIGINT/SIGKILL，Windows 用 CTRL_BREAK_EVENT / TerminateProcess），
+  修复此前 Windows 下 `cargo test --all` 因 `libc::kill` 无法编译的问题；
+  `libc`/`windows-sys` 改为按目标平台的 dev-dependencies。
+- **Linux 下 `unused_mut` 告警**：`chaos.rs::rfrp_command` 的 `mut` 仅在 Windows 分支使用，
+  Linux 上 `clippy -D warnings` 会失败；改为分平台构造命令，双平台零告警。
+- **UDP 背压不再阻塞整代理收包循环**：会话/待配对通道满时改为 `try_send` 丢弃并计入
+  `rfrp_udp_dropped_total`（此前 `send().await` 会因单个慢工作连接阻塞该代理所有客户端的数据报）。
+- **vhost 代理注册补同名检查**：HTTP/HTTPS 重名与 TCP/UDP 一致返回 `proxy_name exists`，
+  不再静默覆盖旧条目。
+- **`example_smoke` 固定 Dashboard 端口竞态**：测试中 Dashboard 也改用 OS 分配端口，
+  避免 CI/本机 7500 被占用导致偶发失败。
+
+### Changed
+
+- **Windows 信号处理同时监听 Ctrl-C 与 Ctrl-Break**：服务/脚本/测试可用
+  `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` 触发优雅退出（CTRL_C_EVENT 无法定向到进程组）。
+- **主目录解析更健壮（双平台）**：`HOME`/`USERPROFILE` 为空串时视为缺失，
+  Windows 继续回退 `HOMEDRIVE` + `HOMEPATH`；找不到主目录时回退当前目录。
+- README：M4–M6 进度标记更新为已完成；修正服务端默认监听描述；
+  `rfrp_udp_dropped_total` 说明补充背压丢包；补充 Windows 原生构建与 CI 说明。
+
+### Added
+
 - **协议错误码**：`NewProxyResp.error` 统一为稳定错误码
   （`invalid type` / `invalid field` / `proxy_name exists` / `port not allowed` /
   `port occupied` / `domain conflict` / `internal error`，见 DESIGN §6.6），

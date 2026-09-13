@@ -1,4 +1,5 @@
-//! 统一信号处理：监听 SIGINT/SIGTERM/Ctrl-C 并触发 `CancellationToken`。
+//! 统一信号处理：Unix 监听 SIGINT/SIGTERM，Windows 监听 Ctrl-C/Ctrl-Break，
+//! 收到后触发 `CancellationToken` 优雅退出。
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -40,7 +41,38 @@ pub fn spawn_signal_watcher(shutdown: CancellationToken) -> JoinHandle<()> {
                 _ = sigterm.recv() => {}
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Windows 没有 SIGTERM/SIGINT：同时监听 Ctrl-C 与 Ctrl-Break。
+            // - 交互式终端用户使用 Ctrl-C；
+            // - 服务/脚本/测试可用 GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) 定向触发
+            //   （CTRL_C_EVENT 无法限定到单个进程组，故不适用于自动化）。
+            use tokio::signal::windows::{ctrl_break, ctrl_c};
+            let mut c = match ctrl_c() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("install Ctrl-C handler failed: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown.cancel();
+                    return;
+                }
+            };
+            let mut b = match ctrl_break() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("install Ctrl-Break handler failed: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown.cancel();
+                    return;
+                }
+            };
+            tracing::info!("OS signal handler installed (Ctrl-C/Ctrl-Break)");
+            tokio::select! {
+                _ = c.recv() => {}
+                _ = b.recv() => {}
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             tracing::info!("OS signal handler installed (Ctrl-C)");
             let _ = tokio::signal::ctrl_c().await;

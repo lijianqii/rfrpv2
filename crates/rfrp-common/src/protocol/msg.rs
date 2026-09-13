@@ -377,6 +377,7 @@ mod proxy_error_tests {
         assert_eq!(ProxyError::InvalidType.as_str(), "invalid type");
         assert_eq!(ProxyError::InvalidField.as_str(), "invalid field");
         assert_eq!(ProxyError::NameExists.as_str(), "proxy_name exists");
+        assert_eq!(ProxyError::TooManyProxies.as_str(), "too many proxies");
         assert_eq!(ProxyError::PortNotAllowed.as_str(), "port not allowed");
         assert_eq!(ProxyError::PortOccupied.as_str(), "port occupied");
         assert_eq!(ProxyError::DomainConflict.as_str(), "domain conflict");
@@ -404,6 +405,7 @@ mod proxy_error_tests {
             ProxyError::InvalidType,
             ProxyError::InvalidField,
             ProxyError::NameExists,
+            ProxyError::TooManyProxies,
             ProxyError::PortNotAllowed,
             ProxyError::PortOccupied,
             ProxyError::DomainConflict,

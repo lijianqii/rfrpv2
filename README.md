@@ -8,21 +8,46 @@ Rust Fast Reverse Proxy —— 用 Rust + tokio 实现的轻量级反向代理�
 - ✅ M1：TCP 代理全链路
 - ✅ M2：心跳、重连、run_id、优雅退出、连接池
 - ✅ M3：TLS 控制链路、工作连接 TLS、token 鉴权
-- ⬜ M4：UDP / HTTP / HTTPS vhost
-- ⬜ M5：Dashboard / 可观测
-- ⬜ M6：发布与打包
+- ✅ M4：UDP / HTTP / HTTPS vhost
+- ✅ M5：Dashboard / 可观测
+- ✅ M6：发布与打包
 
 ## 构建
+
+### Linux / macOS
 
 ```bash
 cargo build --release
 ```
 
-质量门：
+### Windows（原生）
+
+Windows 发布产物使用 GNU ABI：`.cargo/config.toml` 为 `x86_64-pc-windows-gnu`
+目标指定了 `x86_64-w64-mingw32-gcc` 链接器（静态链接 winpthread，产物免 DLL）。
+因此原生 Windows 构建需要：
+
+- Rust 工具链：`rustup default stable-x86_64-pc-windows-gnu`（或 `rustup target add` 后显式指定 target）；
+- MinGW-w64（提供 `x86_64-w64-mingw32-gcc`）：如 WinLibs / MSYS2 / w64devkit，安装后加入 `PATH`。
+
+```powershell
+rustup default stable-x86_64-pc-windows-gnu
+cargo build --release
+cargo test --all
+```
+
+> 也可使用 MSVC 工具链（`x86_64-pc-windows-msvc`）构建 + 运行测试，
+> 此时不经过上述 GNU 链接器配置（发布产物仍以 GNU 为准）。
+
+质量门（`make` 需在 bash 环境；Windows 下可直接执行各命令）：
 
 ```bash
 make ci
+# 等价于：cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+#          && cargo build --all && cargo test --all
 ```
+
+持续集成（`.github/workflows/ci.yml`）：ubuntu 上执行 fmt+clippy、
+ubuntu/windows 双平台 `cargo test --all`、以及 musl 与 Windows-gnu 交叉构建回归。
 
 ## 发布产物
 
@@ -58,7 +83,7 @@ cargo run -- server -c examples/rfrp-server.toml
 cargo run -- client -c examples/rfrp-client.toml
 ```
 
-服务端默认监听 `127.0.0.1:7000`，客户端通过 TLS 连接并注册 TCP 代理。
+服务端示例监听 `0.0.0.0:7000`（`bind_addr` 默认值，可按需改为回环地址），客户端通过 TLS 连接并注册 TCP 代理。
 
 ## 监控与运维
 
@@ -97,7 +122,7 @@ rfrp_rtt_ms                 控制链路 RTT（毫秒，0=未测得）
 rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/工作连接）
 rfrp_accept_errors_total    accept 错误累计
 rfrp_accepting              accept 循环是否正常（1/0）
-rfrp_udp_dropped_total      UDP 因待配对会话达上限而丢弃的包数
+rfrp_udp_dropped_total      UDP 因待配对会话达上限或会话背压（通道满）而丢弃的包数
 rfrp_proxy_bytes_up_total{proxy="…"}     每代理上行字节
 rfrp_proxy_bytes_down_total{proxy="…"}   每代理下行字节
 rfrp_proxy_connections_total{proxy="…"}  每代理累计连接数
@@ -152,6 +177,10 @@ crates/
 ```bash
 cargo test --all
 ```
+
+Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`
+验证优雅退出（服务端信号 watcher 同时监听 Ctrl-C/Ctrl-Break）；无控制台环境
+（服务/CI）会自动跳过该用例，强制终止用例不依赖控制台、始终运行。
 
 ## 注意事项
 

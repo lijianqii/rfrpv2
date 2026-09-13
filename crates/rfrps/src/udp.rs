@@ -148,7 +148,15 @@ async fn handle_datagram(
             .metrics
             .bytes_up
             .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let _ = tx.send(data.to_vec()).await;
+        // 背压保护：所有客户端共用同一个收包循环，工作连接消费慢时不得在这里
+        // await（否则整代理数据报被阻塞）。通道满即丢包并计数——UDP 语义允许丢失。
+        if tx.try_send(data.to_vec()).is_err() {
+            proxy.metrics.inc_udp_dropped();
+            tracing::debug!(
+                proxy = %proxy_name, %peer,
+                "udp session backpressure; dropping datagram"
+            );
+        }
         return;
     }
 
@@ -164,7 +172,14 @@ async fn handle_datagram(
                 .map(|p| p.tx.clone())
         };
         if let Some(tx) = tx {
-            let _ = tx.send(data.to_vec()).await;
+            // 同会话背压：待配对窗口期也不得阻塞收包循环。
+            if tx.try_send(data.to_vec()).is_err() {
+                proxy.metrics.inc_udp_dropped();
+                tracing::debug!(
+                    proxy = %proxy_name, %peer,
+                    "udp pending backpressure; dropping datagram"
+                );
+            }
         }
         return;
     }

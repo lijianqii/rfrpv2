@@ -44,6 +44,13 @@ pub async fn register_proxy(
     if matches!(np.r#type, ProxyType::Http | ProxyType::Https) {
         // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
         let domains = np.custom_domains.as_ref().ok_or(ProxyError::InvalidField)?;
+        // 与 TCP/UDP 一致：同名代理拒绝，避免静默覆盖旧条目。
+        {
+            let proxies = session.proxies.lock().unwrap();
+            if proxies.contains_key(&np.proxy_name) {
+                return Err(ProxyError::NameExists);
+            }
+        }
         // 域名全局唯一：与其他代理冲突则拒绝（DESIGN §6.6）。
         // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
         for d in domains {

@@ -24,9 +24,14 @@ async fn example_configs_smoke() {
         .expect("load example server config");
     // 用 OS 分配端口，避免固定 7000 在 CI/本机被占用导致偶发失败。
     server_cfg.server.bind_port = 0;
-    // vhost 固定端口 80/443 需要特权，非 root 环境会 EACCES；改用 OS 分配端口。
+    // vhost 端口在示例里是 8080/8443（非特权）；此处仍改为 OS 分配端口，
+    // 避免 CI/本机端口被占用导致偶发失败。
     server_cfg.proxy.vhost_http_port = Some(0);
     server_cfg.proxy.vhost_https_port = Some(0);
+    // Dashboard 端口同理（示例固定 7500，可能与 CI 上其他服务冲突）。
+    if let Some(d) = server_cfg.dashboard.as_mut() {
+        d.addr = "127.0.0.1:0".into();
+    }
     // 示例配置里证书路径是相对 examples/ 的，测试进程 CWD 不一定是 examples/，
     // 这里改成绝对路径以便直接加载。
     server_cfg.server.tls_cert = Some(example_dir.join("cert.pem").display().to_string());

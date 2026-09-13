@@ -132,7 +132,7 @@ impl Metrics {
              # HELP rfrp_accept_errors_total Accept errors.\n\
              # TYPE rfrp_accept_errors_total counter\n\
              rfrp_accept_errors_total {}\n\
-             # HELP rfrp_udp_dropped_total UDP datagrams dropped (pending session limit).\n\
+             # HELP rfrp_udp_dropped_total UDP datagrams dropped (pending session limit or session backpressure).\n\
              # TYPE rfrp_udp_dropped_total counter\n\
              rfrp_udp_dropped_total {}\n\
              # HELP rfrp_accepting Whether the accept loop is healthy (1/0).\n\

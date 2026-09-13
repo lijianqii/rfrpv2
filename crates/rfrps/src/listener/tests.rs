@@ -259,6 +259,38 @@ async fn register_http_proxy_registers_domains() {
 }
 
 #[tokio::test]
+async fn register_http_duplicate_name_rejected() {
+    // 与 TCP/UDP 一致：同名 vhost 代理拒绝，不静默覆盖旧条目（§6.6）。
+    let state = ServerState::new();
+    let session = test_session();
+    let cfg = test_config("");
+    let np1 = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["a.example.com".into()]),
+    };
+    assert!(register_proxy(&np1, &session, &state, &cfg).await.is_ok());
+
+    // 同名、不同域名：应返回 proxy_name exists。
+    let np2 = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["b.example.com".into()]),
+    };
+    let err = register_proxy(&np2, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::NameExists);
+
+    // 原域名映射保持不变，新域名未被登记。
+    let domains = session.proxy_domains.lock().unwrap();
+    assert!(domains.contains_key("a.example.com"));
+    assert!(!domains.contains_key("b.example.com"));
+}
+
+#[tokio::test]
 async fn register_https_proxy_registers_domains() {
     let state = ServerState::new();
     let session = test_session();
