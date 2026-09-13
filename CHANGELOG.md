@@ -6,12 +6,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- **GitHub Actions CI（`.github/workflows/ci.yml`）**：ubuntu 执行 fmt + clippy（-D warnings）、
-  ubuntu/windows 双平台 `cargo test --all`、以及 musl 与 Windows-gnu 交叉构建回归，
-  保证后续改动在 Linux/Windows 两侧持续可验证。
-
 ### Fixed
 
 - **示例配置不再硬编码开发机绝对路径**：`examples/rfrp-{server,client}.toml` 的证书路径

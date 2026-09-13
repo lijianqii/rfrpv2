@@ -46,9 +46,6 @@ make ci
 #          && cargo build --all && cargo test --all
 ```
 
-持续集成（`.github/workflows/ci.yml`）：ubuntu 上执行 fmt+clippy、
-ubuntu/windows 双平台 `cargo test --all`、以及 musl 与 Windows-gnu 交叉构建回归。
-
 ## 发布产物
 
 在 Debian 开发机上一条命令构建三平台产物：
