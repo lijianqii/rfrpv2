@@ -23,6 +23,21 @@ async fn http_get(port: u16, path: &str) -> std::io::Result<String> {
         .to_string())
 }
 
+/// 极简 GET：返回 HTTP 状态码（用于断言 429 等，不解析 body）。
+async fn http_status(port: u16, path: &str) -> u16 {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
 async fn get_with_retry(port: u16, path: &str, timeout: Duration) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -107,6 +122,41 @@ async fn status_endpoint_unknown_path_404() {
     s.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn status_endpoint_rate_limits_excess_requests() {
+    // 状态端点与 Dashboard 一致：每 IP 100 次/分钟；超额必须返回 429，
+    // 避免无鉴权的只读端点被刷。
+    let echo_port = spawn_echo().await;
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let status_port = free_port();
+    let mut cfg = client_config(addr, vec![tcp_proxy("p1", echo_port, remote)], None);
+    cfg.client.status_addr = Some(format!("127.0.0.1:{status_port}"));
+    let cli = start_client(cfg).await;
+    assert!(wait_for_proxy(addr, remote, Duration::from_secs(5)).await);
+
+    // 等端点就绪（这一次请求会消耗 1 个配额）。
+    let _ = get_with_retry(status_port, "/healthz", Duration::from_secs(5)).await;
+
+    let mut ok = 0u32;
+    let mut limited = 0u32;
+    for _ in 0..120 {
+        match http_status(status_port, "/healthz").await {
+            200 => ok += 1,
+            429 => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(
+        limited > 0,
+        "excess requests must be rate limited (ok={ok}, limited={limited})"
+    );
+    assert!(ok >= 95, "most requests should still succeed: {ok}");
 
     srv.abort();
     cli.abort();

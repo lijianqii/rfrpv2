@@ -171,6 +171,23 @@ impl ClientTls {
 mod tests {
     use super::*;
     use crate::config::ClientSection;
+    use rustls::HandshakeKind;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn example_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
+    }
+
+    fn client_section(server_name: &str, ca: Option<&Path>) -> ClientSection {
+        ClientSection {
+            tls_server_name: Some(server_name.to_string()),
+            tls_ca: ca.map(|p| p.display().to_string()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn client_tls_requires_server_name() {
@@ -194,12 +211,108 @@ mod tests {
     #[test]
     fn server_tls_enables_tls13_session_resumption() {
         // rustls 服务端默认不产生 TLS 1.3 票据；启用后 ticketer.enabled() 为 true。
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let dir = example_dir();
         let cfg = load_server_tls(&dir.join("cert.pem"), &dir.join("key.pem"))
             .expect("load example cert");
         assert!(
             cfg.ticketer.enabled(),
             "TLS 1.3 session tickets must be enabled for resumption"
+        );
+    }
+
+    /// 用一个自签服务端证书与指定客户端参数发起一次真实 TLS 握手，断言客户端拒绝。
+    async fn expect_tls_rejected(server_name: &str, ca_file: Option<&str>) {
+        let dir = example_dir();
+        let server_tls =
+            ServerTls::new(&dir.join("cert.pem"), &dir.join("key.pem")).expect("server tls");
+        let ca = ca_file.map(|f| dir.join(f));
+        let client_tls =
+            ClientTls::new(&client_section(server_name, ca.as_deref())).expect("client tls");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // 客户端会因证书校验失败中止握手，服务端 accept 返回错误属预期。
+            let _ = server_tls.accept(stream).await;
+        });
+
+        let result = client_tls
+            .connect(TcpStream::connect(addr).await.unwrap())
+            .await;
+        assert!(
+            result.is_err(),
+            "client must reject the TLS handshake (server_name={server_name})"
+        );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_tls_rejects_certificate_from_untrusted_ca() {
+        // 不配置 tls_ca 时使用系统/webpki 内置根证书；示例自签服务端必须被拒绝。
+        // （同为“错 CA”场景：即便证书本身有效，不在信任链中也不得放行。）
+        expect_tls_rejected("localhost", None).await;
+    }
+
+    #[tokio::test]
+    async fn client_tls_rejects_server_name_mismatch() {
+        // CA 可信但 server_name 与证书 SAN 不匹配：必须拒绝（防中间人）。
+        expect_tls_rejected("wrong.example.com", Some("ca.pem")).await;
+    }
+
+    #[tokio::test]
+    async fn tls13_session_resumption_occurs_on_second_connection() {
+        // 真实握手验证：第一次 Full，第二次用同一客户端配置应命中会话恢复（Resumed）。
+        // 仅断言 ticketer 已启用不足以防止“ticket 未下发/未缓存”的回归。
+        let dir = example_dir();
+        let server_tls =
+            ServerTls::new(&dir.join("cert.pem"), &dir.join("key.pem")).expect("server tls");
+        let client_tls = ClientTls::new(&client_section("localhost", Some(&dir.join("ca.pem"))))
+            .expect("client tls");
+
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let listener = listener.clone();
+            let server_tls = server_tls.clone();
+            let accept = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = server_tls.accept(stream).await.unwrap();
+                // 一次完整往返，确保双方握手完成后服务端已下发 NewSessionTicket。
+                let mut b = [0u8; 1];
+                tls.read_exact(&mut b).await.unwrap();
+                tls.write_all(b"x").await.unwrap();
+                tls.flush().await.unwrap();
+                // 保持片刻，让客户端有时间读取并处理票据。
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let mut tls = client_tls
+                .connect(TcpStream::connect(addr).await.unwrap())
+                .await
+                .expect("client handshake");
+            tls.write_all(b"x").await.unwrap();
+            let mut b = [0u8; 1];
+            tls.read_exact(&mut b).await.unwrap();
+            // 若有 NewSessionTicket（或后续字节），在关闭前读完/超时，确保票据入缓存。
+            let mut extra = [0u8; 1];
+            let _ = tokio::time::timeout(Duration::from_millis(100), tls.read(&mut extra)).await;
+            kinds.push(tls.get_ref().1.handshake_kind());
+            drop(tls);
+            accept.await.unwrap();
+        }
+
+        assert_eq!(
+            kinds[0],
+            Some(HandshakeKind::Full),
+            "first handshake is full"
+        );
+        assert_eq!(
+            kinds[1],
+            Some(HandshakeKind::Resumed),
+            "second handshake must resume the TLS 1.3 session"
         );
     }
 }

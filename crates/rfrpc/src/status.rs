@@ -57,9 +57,9 @@ async fn handle_request(
     limiter: &RateLimiter,
     peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    if !limiter.allow(peer.ip(), Instant::now()) {
-        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
-    }
+    // 先读完请求头再限频：与 Dashboard 一致。否则被限频的连接会带着未读的
+    // 请求数据直接关闭，Windows/Linux 都会发 RST，客户端拿到的是连接错误
+    // 而不是 429 响应（限频本身生效但响应不可读）。
     let head = match read_request_head(
         &mut stream,
         std::time::Duration::from_secs(rfrp_common::constants::HTTP_HEAD_TIMEOUT),
@@ -69,6 +69,10 @@ async fn handle_request(
         Some(h) => h,
         None => return Ok(()),
     };
+
+    if !limiter.allow(peer.ip(), Instant::now()) {
+        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
+    }
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
     let path = match req.parse(&head) {

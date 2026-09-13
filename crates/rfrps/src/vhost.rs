@@ -168,14 +168,25 @@ async fn route_and_dispatch(
 }
 
 /// 读取 HTTP 请求头，返回 `(Host, 带已读缓冲的流)`。
-async fn read_request_head<S>(mut stream: S) -> Result<Option<(String, BoxedStream)>>
+async fn read_request_head<S>(stream: S) -> Result<Option<(String, BoxedStream)>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    read_request_head_with_timeout(stream, Duration::from_secs(HTTP_HEAD_TIMEOUT)).await
+}
+
+/// 同 [`read_request_head`]，但可指定整体超时（测试用，避免等待 10s 常量）。
+async fn read_request_head_with_timeout<S>(
+    mut stream: S,
+    timeout: Duration,
+) -> Result<Option<(String, BoxedStream)>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 8192];
     // 整体截止时间：慢速请求（slowloris）不得长期占用任务与套接字。
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(HTTP_HEAD_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -359,5 +370,27 @@ mod head_tests {
         let stream: BoxedStream = Box::new(b);
         let r = route_and_dispatch("dev.example.com".into(), ProxyType::Http, stream, state).await;
         assert!(r.is_ok(), "type mismatch should not error");
+    }
+
+    #[tokio::test]
+    async fn read_request_head_times_out_on_slow_client() {
+        // 慢速请求（slowloris）：只发一半请求头后停住，整体超时后必须关闭（返回 None），
+        // 不得长期占用任务与套接字。
+        let (mut a, b) = duplex(4096);
+        a.write_all(b"GET / HTTP/1.1\r\nHost: dev.example.com\r\n")
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let out = read_request_head_with_timeout(b, Duration::from_millis(150))
+            .await
+            .unwrap();
+        assert!(out.is_none(), "incomplete head must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must not hang: {:?}",
+            started.elapsed()
+        );
+        // 保持写端存活到断言之后，避免提前 EOF 掩盖超时路径。
+        drop(a);
     }
 }

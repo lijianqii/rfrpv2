@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- **客户端状态端点限频响应可读**：限频判断移到请求头读取之后（与 Dashboard 一致），
+  否则被限频的连接会带着未读请求数据直接关闭，Windows/Linux 发送 RST，客户端拿到连接
+  错误而非 429；新增限频集成测试（含 429 断言）。
 - **示例配置不再硬编码开发机绝对路径**：`examples/rfrp-{server,client}.toml` 的证书路径
   改为相对配置文件目录（如 `./cert.pem`），使仓库自带的契约测试（`config_files`）与
   `example_smoke` 在任何机器/平台通过，恢复"克隆即可本地测试"。
@@ -71,6 +74,9 @@
 
 ### Added
 
+- **补充 5 类边界测试**：TLS 1.3 会话恢复（真实握手指明 `HandshakeKind::Resumed`）、
+  TLS 证书校验失败（不可信 CA / server_name 不匹配）、vhost 请求头慢速超时（slowloris）、
+  重连退避重置条件（`should_reset_backoff`）、客户端状态端点限频。
 - **每代理流量指标**：`rfrp_proxy_bytes_up_total` / `rfrp_proxy_bytes_down_total` /
   `rfrp_proxy_connections_total` / `rfrp_proxy_active_connections`（带 `proxy` 标签），
   Dashboard 状态页与 `/api/status` 同步展示每代理表格。

@@ -159,7 +159,7 @@ impl Client {
                     // 仅"稳定连接"重置退避：会话刚建立即断开（抖动/被顶替）时保持退避增长，
                     // 避免 1s 间隔的重连风暴。
                     let lived = attempt_started.elapsed();
-                    if connected && lived >= Duration::from_secs(MIN_STABLE_CONNECTION_SECS) {
+                    if should_reset_backoff(connected, lived) {
                         attempt = 0;
                         backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
                     }
@@ -376,6 +376,14 @@ async fn wait_for_reconnect(backoff: Duration, shutdown: &CancellationToken) -> 
         _ = tokio::time::sleep(backoff) => true,
         _ = shutdown.cancelled() => false,
     }
+}
+
+/// 连接结束后是否应重置重连退避。
+///
+/// 仅在本次成功建立过控制会话、且存活时间达到 [`MIN_STABLE_CONNECTION_SECS`]
+/// 时重置；否则保持退避增长，避免"建立即断开"场景下的 1s 重连风暴。
+fn should_reset_backoff(connected: bool, lived: Duration) -> bool {
+    connected && lived >= Duration::from_secs(MIN_STABLE_CONNECTION_SECS)
 }
 
 /// Unix 下将 run_id 文件权限设为 0600；其他平台静默跳过（§6.6）。

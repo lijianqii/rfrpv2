@@ -153,3 +153,22 @@ async fn reconnect_delay_is_interruptible_by_shutdown() {
         "should not wait out the full backoff after shutdown"
     );
 }
+
+#[test]
+fn backoff_resets_only_after_stable_connection() {
+    // “建立即断开”（存活 < MIN_STABLE_CONNECTION_SECS）不得重置退避，
+    // 否则抖动/被顶替场景会退化成 1s 间隔的重连风暴。
+    assert!(!should_reset_backoff(true, Duration::from_secs(0)));
+    assert!(!should_reset_backoff(
+        true,
+        Duration::from_secs(MIN_STABLE_CONNECTION_SECS - 1)
+    ));
+    // 从未成功建立会话（如建连失败）也不重置。
+    assert!(!should_reset_backoff(false, Duration::from_secs(3600)));
+    // 达到稳定阈值后重置。
+    assert!(should_reset_backoff(
+        true,
+        Duration::from_secs(MIN_STABLE_CONNECTION_SECS)
+    ));
+    assert!(should_reset_backoff(true, Duration::from_secs(3600)));
+}
