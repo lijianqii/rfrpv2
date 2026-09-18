@@ -681,6 +681,13 @@ User → rfrps:remote_port  (Listener 接收)
 >
 > 池命中时 rfrps 不再通过控制连接通知 rfrpc 数据面已就绪（工作连接已桥接，直接透传），rfrpc 透明透传。补充池的 ReqWorkConn 是控制面消息，与数据面透传独立。
 
+**服务端池上限（安全边界）**：`pool_size` 是客户端本地配置、**不随协议上送**，因此服务端
+必须自己设上限——否则任何持有有效 `work_conn_token` 的连接都可以反复发
+`StartWorkConn(work_id=0)` 把空闲连接灌进池子（每条都是常驻 socket + 内存）。
+rfrps 对单个代理最多保留 `MAX_POOLED_WORK_CONNS_PER_PROXY`(32) 条空闲预热连接，
+超出的连接直接关闭并记 `warn` 日志（正常客户端的 `pool_size` 远低于该值，
+推荐上限见 §9.4 的 `POOL_SIZE_WARN_THRESHOLD`）。
+
 ### 8.3 心跳与重连
 
 - 心跳由**独立定时器驱动**，每 30s 固定发一次 `Heartbeat`，与业务消息流并行，**不依赖"控制连接空闲"**——即使持续有 NewProxy/ReqWorkConn 在传，心跳仍按 30s 周期发送。

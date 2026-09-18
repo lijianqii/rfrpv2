@@ -92,6 +92,13 @@ pub const MAX_CUSTOM_DOMAINS: usize = 16;
 pub const POOL_SIZE_DEFAULT: u32 = 1;
 /// 池大小告警阈值（超过记警告但不拒绝）。
 pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
+/// 单个代理在**服务端**保留的预热工作连接上限。
+///
+/// `pool_size` 是客户端本地配置、不随协议上送，服务端必须自己设上限：否则持有有效
+/// work_conn_token 的连接可以不断发 `work_id=0` 把连接灌进池子，服务端会一直保留
+/// （每条 = 一个 socket + 任务内存），直到会话结束。取 32：远高于推荐值
+/// （`POOL_SIZE_WARN_THRESHOLD` = 16），正常客户端不可能触达。
+pub const MAX_POOLED_WORK_CONNS_PER_PROXY: usize = 32;
 /// 单个 UDP 代理同时允许的待配对会话上限（超出直接丢弃，防伪造源放大/耗尽）。
 pub const MAX_PENDING_UDP_SESSIONS: usize = 256;
 /// 单个 UDP 包最大字节数（IPv4 UDP payload 上限）。

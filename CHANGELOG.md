@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- **预热工作连接池加上限**：`pool_size` 是客户端本地配置、不随协议上送，服务端此前
+  没有自己的上限——持有有效 `work_conn_token` 的连接可以反复发 `StartWorkConn(work_id=0)`
+  把空闲连接灌进池子（每条都是常驻 socket + 内存），直到会话结束。现在单个代理最多
+  保留 `MAX_POOLED_WORK_CONNS_PER_PROXY`(32) 条，超出直接关闭并记 `warn`。
 - **vhost 路由改为全局域名索引（O(1)）**：`find_proxy_by_domain` 原先持 `sessions` 锁
   遍历所有会话及其 `proxy_domains`，请求量或会话数上升后会把所有 vhost 请求串行化在
   这把锁上（注册路径也是 O(#sessions)）。现新增与 `proxy_index` 对称的

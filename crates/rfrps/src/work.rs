@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use rfrp_common::constants::WORK_ID_POOL_RESERVED;
+use rfrp_common::constants::{MAX_POOLED_WORK_CONNS_PER_PROXY, WORK_ID_POOL_RESERVED};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::Frame;
 use rfrp_common::protocol::msg::*;
@@ -71,13 +71,20 @@ where
 
     // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
     if work_id == WORK_ID_POOL_RESERVED {
-        session
-            .pools
-            .lock()
-            .unwrap()
-            .entry(proxy_name.clone())
-            .or_default()
-            .push(Box::new(stream));
+        let mut pools = session.pools.lock().unwrap();
+        let pool = pools.entry(proxy_name.clone()).or_default();
+        // 池上限：`pool_size` 是客户端本地配置、不上送协议，服务端必须自设上限，
+        // 否则持有合法 token 的连接可以把池子灌满（每条都是常驻 socket + 内存）。
+        if pool.len() >= MAX_POOLED_WORK_CONNS_PER_PROXY {
+            tracing::warn!(
+                %proxy_name,
+                limit = MAX_POOLED_WORK_CONNS_PER_PROXY,
+                "pooled work connection rejected: pool full"
+            );
+            return Ok(()); // 关闭该连接（stream 在此 drop）
+        }
+        pool.push(Box::new(stream));
+        drop(pools);
         tracing::debug!(%proxy_name, "work connection pooled");
         return Ok(());
     }
@@ -116,8 +123,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rfrp_common::constants::PROTOCOL_VERSION;
+    use rfrp_common::constants::{MAX_POOLED_WORK_CONNS_PER_PROXY, PROTOCOL_VERSION};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+
+    fn start_frame(proxy_name: &str, work_id: u64, token: Option<&str>) -> Frame {
+        Message::StartWorkConn(StartWorkConn {
+            proxy_name: proxy_name.into(),
+            work_id,
+            work_conn_token: token.map(String::from),
+        })
+        .to_frame()
+        .unwrap()
+    }
+
+    /// 构造"已登录且已注册 ssh 代理"的状态：`session_for_proxy` 需要它才能校验工作连接。
+    fn state_with_session(token: &str) -> (Arc<ServerState>, Arc<Session>) {
+        let state = ServerState::new();
+        let (tx, _rx) = mpsc::channel::<Message>(8);
+        let session = Arc::new(Session {
+            run_id: "r1".into(),
+            session_id: "s1".into(),
+            work_conn_token: token.into(),
+            tx,
+            proxies: Mutex::new(HashMap::new()),
+            proxy_domains: Mutex::new(HashMap::new()),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            pools: Mutex::new(HashMap::new()),
+        });
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".into(), session.clone());
+        state.index_proxy("ssh", "r1");
+        (state, session)
+    }
 
     #[tokio::test]
     async fn unknown_work_id_closes_without_panic() {
@@ -171,5 +216,70 @@ mod tests {
         let _client = TcpStream::connect(addr).await.unwrap();
         let (server, _peer) = listener.accept().await.unwrap();
         assert!(handle_work_connection(frame, server, state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pooled_work_conn_rejected_when_pool_full() {
+        // 池上限：`pool_size` 是客户端本地配置、不上送协议，服务端必须自己设限，
+        // 否则持有合法 token 的连接可以无限灌 work_id=0 撑爆服务端内存/句柄。
+        let (state, session) = state_with_session("tok");
+        let mut keep_alive = Vec::new();
+
+        // 池未满：正常入池。
+        let (client, server) = tokio::io::duplex(8);
+        keep_alive.push(client);
+        assert!(handle_work_connection(
+            start_frame("ssh", WORK_ID_POOL_RESERVED, Some("tok")),
+            server,
+            state.clone()
+        )
+        .await
+        .is_ok());
+        assert_eq!(session.pools.lock().unwrap()["ssh"].len(), 1);
+
+        // 灌满到上限。
+        {
+            let mut pools = session.pools.lock().unwrap();
+            let pool = pools.entry("ssh".into()).or_default();
+            while pool.len() < MAX_POOLED_WORK_CONNS_PER_PROXY {
+                pool.push(Box::new(tokio::io::duplex(8).0));
+            }
+        }
+
+        // 超限连接必须被关闭且不入池。
+        let (mut rejected, server) = tokio::io::duplex(8);
+        assert!(handle_work_connection(
+            start_frame("ssh", WORK_ID_POOL_RESERVED, Some("tok")),
+            server,
+            state.clone()
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            session.pools.lock().unwrap()["ssh"].len(),
+            MAX_POOLED_WORK_CONNS_PER_PROXY,
+            "rejected connection must not be pooled"
+        );
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut buf))
+            .await
+            .expect("rejected work connection should be closed promptly")
+            .expect("read should succeed");
+        assert_eq!(n, 0, "rejected pooled connection must be closed");
+    }
+
+    #[tokio::test]
+    async fn pooled_work_conn_without_token_not_pooled() {
+        // 无 token 的预热连接不得入池（防止未认证连接注入池做中间人，§8.2）。
+        let (state, session) = state_with_session("tok");
+        let (_client, server) = tokio::io::duplex(8);
+        assert!(handle_work_connection(
+            start_frame("ssh", WORK_ID_POOL_RESERVED, None),
+            server,
+            state
+        )
+        .await
+        .is_ok());
+        assert!(session.pools.lock().unwrap().is_empty());
     }
 }
