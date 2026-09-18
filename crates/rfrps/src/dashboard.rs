@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::DashboardSection;
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{read_request_head, write_response};
 use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
@@ -23,11 +24,14 @@ pub async fn run_dashboard(
     shutdown: CancellationToken,
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
+    // accept 出错不得结束循环：Dashboard 是进程级监听，自行退出后只能靠重启恢复。
+    let mut retry = AcceptRetry::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        retry.record_ok();
                         tracing::debug!(%peer, "dashboard connection");
                         let cfg = cfg.clone();
                         let state = state.clone();
@@ -37,8 +41,15 @@ pub async fn run_dashboard(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("dashboard accept error: {e}");
-                        break;
+                        let backoff = retry.record_err();
+                        if retry.should_log() {
+                            tracing::warn!(
+                                consecutive = retry.consecutive(),
+                                error = %e,
+                                "dashboard accept error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

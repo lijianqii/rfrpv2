@@ -8,6 +8,7 @@ use rfrp_common::constants::{HTTP_HEAD_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
 use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::io::AsyncReadExt;
@@ -24,11 +25,15 @@ pub async fn run_http_vhost(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
+    // accept 出错不得结束循环：vhost 监听是进程级的，自行退出会让所有 vhost 代理
+    // 静默失效（详见 util::accept 模块说明）。
+    let mut retry = AcceptRetry::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        retry.record_ok();
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TCP stream");
                         }
@@ -38,8 +43,15 @@ pub async fn run_http_vhost(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("vhost accept error: {e}");
-                        break;
+                        let backoff = retry.record_err();
+                        if retry.should_log() {
+                            tracing::warn!(
+                                consecutive = retry.consecutive(),
+                                error = %e,
+                                "vhost http accept error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
@@ -66,11 +78,13 @@ pub async fn run_https_vhost(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
+    let mut retry = AcceptRetry::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        retry.record_ok();
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TLS TCP stream");
                         }
@@ -101,8 +115,15 @@ pub async fn run_https_vhost(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("vhost https accept error: {e}");
-                        break;
+                        let backoff = retry.record_err();
+                        if retry.should_log() {
+                            tracing::warn!(
+                                consecutive = retry.consecutive(),
+                                error = %e,
+                                "vhost https accept error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

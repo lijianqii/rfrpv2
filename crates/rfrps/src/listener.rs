@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::*;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::counting::{CountingStream, ExtraCounters};
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
@@ -149,11 +150,15 @@ async fn proxy_accept_loop(
     session: Arc<Session>,
     state: Arc<ServerState>,
 ) {
+    // accept 出错（EMFILE、握手期 reset 等）不得结束循环：该监听的生命周期绑定在
+    // 控制会话上，自行退出会造成"端口没监听、进程却一切正常"的静默故障。
+    let mut retry = AcceptRetry::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((user, peer)) => {
+                        retry.record_ok();
                         if let Err(e) = configure_tcp_stream(&user) {
                             tracing::warn!(%proxy_name, %peer, error = %e, "failed to configure user TCP stream");
                         }
@@ -161,8 +166,16 @@ async fn proxy_accept_loop(
                         dispatch_user_connection(proxy_name.clone(), Box::new(user), session.clone(), state.clone());
                     }
                     Err(e) => {
-                        tracing::warn!("proxy listener accept error: {e}");
-                        break;
+                        let backoff = retry.record_err();
+                        if retry.should_log() {
+                            tracing::warn!(
+                                %proxy_name,
+                                consecutive = retry.consecutive(),
+                                error = %e,
+                                "proxy listener accept error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

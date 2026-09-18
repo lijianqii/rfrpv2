@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rfrp_common::config::ClientConfig;
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{read_request_head, write_response};
 use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
@@ -24,11 +25,15 @@ pub async fn run_status_server(
 ) {
     // 与 Dashboard 对称的每 IP 限频（端点默认关闭且建议绑回环，此处仅兜底防刷）。
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
+    // accept 出错不得结束循环：状态端点自行退出后，客户端进程仍会继续跑隧道，
+    // 监控侧只会看到"状态端点没了"却无从判断原因。
+    let mut retry = AcceptRetry::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        retry.record_ok();
                         let cfg = cfg.clone();
                         let metrics = metrics.clone();
                         let limiter = limiter.clone();
@@ -37,8 +42,15 @@ pub async fn run_status_server(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("status accept error: {e}");
-                        break;
+                        let backoff = retry.record_err();
+                        if retry.should_log() {
+                            tracing::warn!(
+                                consecutive = retry.consecutive(),
+                                error = %e,
+                                "status accept error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

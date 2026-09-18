@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
-    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, MAX_CONSECUTIVE_ACCEPT_ERRORS,
-    SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT,
+    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, SERVER_ALIVE_LOG_INTERVAL,
+    TLS_HANDSHAKE_TIMEOUT,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
@@ -162,13 +163,15 @@ impl Server {
                 }
             });
         }
-        let mut consecutive_accept_errors: u32 = 0;
+        // 与代理/vhost/Dashboard 共用同一套退避策略；区别是主监听连续失败达到阈值后
+        // 判定不可恢复，进程以非零码退出交服务管理器重启（见 util::accept 说明）。
+        let mut accept_retry = AcceptRetry::new();
         loop {
             tokio::select! {
                 res = self.listener.accept() => {
                     match res {
                         Ok((stream, peer)) => {
-                            consecutive_accept_errors = 0;
+                            accept_retry.record_ok();
                             self.state.metrics.inc_accepted();
                             if let Err(e) = configure_tcp_stream(&stream) {
                                 tracing::warn!(%peer, error = %e, "failed to configure TCP stream");
@@ -196,25 +199,24 @@ impl Server {
                         Err(e) => {
                             // 瞬时错误（对端握手期重置、fd 耗尽等）不应终止 accept 循环：
                             // 退避重试，避免"服务端仍在运行却不再接受连接"的静默故障。
-                            consecutive_accept_errors += 1;
+                            let backoff = accept_retry.record_err();
                             self.state.metrics.inc_accept_error();
-                            tracing::warn!(
-                                consecutive = consecutive_accept_errors,
-                                error = %e,
-                                "accept error; retrying"
-                            );
-                            if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                            if accept_retry.should_log() {
+                                tracing::warn!(
+                                    consecutive = accept_retry.consecutive(),
+                                    error = %e,
+                                    "accept error; retrying"
+                                );
+                            }
+                            if accept_retry.is_fatal() {
                                 tracing::error!(
-                                    consecutive = consecutive_accept_errors,
+                                    consecutive = accept_retry.consecutive(),
                                     "accept loop failed repeatedly; exiting for supervisor restart"
                                 );
                                 sig.abort();
-                                return Err(rfrp_common::Error::Other(
-                                    "accept loop failed repeatedly".into(),
-                                ));
+                                return Err(Error::Other("accept loop failed repeatedly".into()));
                             }
-                            let backoff_ms = (consecutive_accept_errors as u64 * 100).min(1000);
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            tokio::time::sleep(backoff).await;
                         }
                     }
                 }
