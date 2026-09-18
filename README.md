@@ -183,6 +183,9 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
 
 - **Windows 杀毒软件误报**：rfrp 是内网穿透/反代工具，与 frp、nps、ngrok 等同类，Windows 安全软件可能将其归类为 `HackTool`/`RiskWare` 风险工具。二进制已嵌入版本信息/清单/图标以降低启发式误报，但无法消除功能特征归类；加入信任区或代码签名可解决，详见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md)。
 - **`pool_size` 与有状态服务**：预热会建立一条空闲本地连接，sshd/RDP 等服务可能将其超时踢除。服务端出池前会探活并跳过死连接（自动回退按需建立），因此 `pool_size = 1` 可安全使用；若日志频繁出现 `discarded dead pooled work connection`，说明本地服务踢除较快，预热收益有限但不影响功能。
+- **短连接密集 + `work_conn_tls` 时建议 `pool_size = 4`**：实测（见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)）
+  每连接"建连 + 首字节"耗时在 `pool_size=1` 下约 314 µs，提到 4 后降到约 215 µs（−32%）——
+  池为 1 时补充连接常常赶不上下一个用户连接，退化成按需 TLS 握手。明文场景 `pool_size=1` 已足够。
 - **TCP keepalive 默认启用**（空闲 30s 后探测、间隔 5s，Linux/Windows 一致）：用于空闲长连接（SSH/RDP）在 NAT/防火墙表项过期后的断线感知。可用 `tcp_keepalive_secs` 调整（0 = 禁用）：
   ```toml
   [client]            # 或 [server]

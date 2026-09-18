@@ -8,6 +8,11 @@
 
 ### Fixed
 
+- **性能基准（`cargo bench`）已恢复可用**：协议升到 v2 后，`benches/forward.rs` 里的帧版本仍
+  写死 `1`，被 `FrameCodec` 直接拒绝（`unsupported protocol version`），整个基准跑不起来；
+  bridge 基准还每轮新建两对 TCP，跑满一万轮后本地端口被 TIME_WAIT 耗尽（`AddrNotAvailable`）。
+  现改用 `PROTOCOL_VERSION`，并在**一条常驻连接**上测稳态吞吐（含采样规模限制），
+  `docs/BENCHMARKS.md` 同步更新为实测的新基线 + 端到端数据 + `pool_size` 调优建议。
 - **辅助监听 accept 出错不再永久退出**：代理端口监听、HTTP/HTTPS vhost 监听、
   Dashboard 与客户端状态端点此前都是"accept 出错即 `break`"——一次瞬时错误
   （`EMFILE`、对端握手期重置）就会让该监听永久停止，而控制连接与进程一切正常，
