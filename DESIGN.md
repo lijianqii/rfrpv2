@@ -718,6 +718,9 @@ User → rfrps:remote_port  (Listener 接收)
   rfrps 回一个最小 `HTTP/1.1 404 Not Found` + `Connection: close` 再关闭连接，
   而不是静默断连——便于用户与上游负载均衡区分"没有这个 vhost"与"链路故障"。
   请求头本身读不全（超时/畸形/对端提前关闭）时仍直接关闭（无法安全回应）。
+- **路由查表 O(1)**：域名归属由全局索引 `domain → (run_id, proxy_name)` 承载，
+  与 `proxy_index` 对称，注册成功时写入、会话清理时移除；请求路径不再持有
+  `sessions` 锁做全表扫描。
 - **HTTP**：rfrps 用 `hyper` 读取请求头判定 Host，命中后将**已读缓冲区连同后续流**一起桥接到工作连接（不丢失已读字节）。
 - **HTTPS**：TLS 终止在 rfrps（使用 `vhost_tls_cert` / `vhost_tls_key`），rfrps 完成 TLS 握手拿到 SNI 后，按明文 HTTP 处理取 Host，再将**解密后的明文流**桥接到工作连接。工作连接承载明文，本地服务收到的是明文 HTTP。
 - HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。**证书在 rfrps 启动时一次性加载到内存**（`rustls::ServerConfig` 持有），运行期不重新读取；证书文件更换需重启 rfrps 生效（首版不支持热重载，见非目标）。

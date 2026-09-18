@@ -407,8 +407,17 @@ fn cleanup(session: &Session, state: &ServerState) {
         .filter(|(_, e)| e.kind == ProxyType::Udp)
         .map(|(n, _)| n.clone())
         .collect();
+    // 收集 vhost 域名，用于清理全局域名索引（domain → 归属）。
+    let domain_names: Vec<String> = session
+        .proxy_domains
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
     state.remove_proxy_stats(&proxy_names);
     state.unindex_proxies(proxy_names);
+    state.unindex_domains(domain_names);
     for (_, entry) in session.proxies.lock().unwrap().drain() {
         entry.handle.abort();
     }

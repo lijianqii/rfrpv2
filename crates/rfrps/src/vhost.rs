@@ -260,18 +260,12 @@ fn strip_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-/// 按域名查找所属会话与代理名。
+/// 按域名查找所属会话与代理名（O(1)，走全局域名索引）。
 pub(crate) fn find_proxy_by_domain(
     state: &ServerState,
     host: &str,
 ) -> Option<(Arc<Session>, String)> {
-    let sessions = state.sessions.lock().unwrap();
-    for s in sessions.values() {
-        if let Some(proxy) = s.proxy_domains.lock().unwrap().get(host) {
-            return Some((s.clone(), proxy.clone()));
-        }
-    }
-    None
+    state.session_for_domain(host)
 }
 
 #[cfg(test)]
@@ -280,10 +274,10 @@ mod tests {
     use crate::state::ServerState;
     use tokio::sync::mpsc;
 
-    fn test_session(domains: &[&str]) -> Arc<Session> {
+    fn test_session(run_id: &str, domains: &[&str]) -> Arc<Session> {
         let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
         let session = Arc::new(Session {
-            run_id: "r".into(),
+            run_id: run_id.into(),
             session_id: "s".into(),
             work_conn_token: "tok".into(),
             tx,
@@ -315,17 +309,31 @@ mod tests {
     #[test]
     fn find_proxy_by_domain_finds_and_skips() {
         let state = test_state();
+        let s1 = test_session("r1", &["dev.example.com"]);
+        let s2 = test_session("r2", &["other.example.com"]);
         {
             let mut sessions = state.sessions.lock().unwrap();
-            sessions.insert("s1".into(), test_session(&["dev.example.com"]));
-            sessions.insert("s2".into(), test_session(&["other.example.com"]));
+            sessions.insert("r1".into(), s1.clone());
+            sessions.insert("r2".into(), s2.clone());
         }
+        // 域名索引由注册路径维护；这里按同样方式登记（避免测试绕过真实路径的语义）。
+        state.index_domain("dev.example.com", "r1", "web");
+        state.index_domain("other.example.com", "r2", "web");
 
-        let hit = find_proxy_by_domain(&state, "dev.example.com");
-        assert!(hit.is_some());
-        assert_eq!(hit.unwrap().1, "web");
+        let (session, proxy) =
+            find_proxy_by_domain(&state, "dev.example.com").expect("indexed domain");
+        assert_eq!(proxy, "web");
+        assert!(
+            Arc::ptr_eq(&session, &s1),
+            "must resolve to the owner session"
+        );
 
         assert!(find_proxy_by_domain(&state, "missing.example.com").is_none());
+
+        // 会话清理后索引必须失效（否则会命中已注销的会话）。
+        state.unindex_domains(vec!["dev.example.com".to_string()]);
+        assert!(find_proxy_by_domain(&state, "dev.example.com").is_none());
+        assert!(find_proxy_by_domain(&state, "other.example.com").is_some());
     }
 }
 
@@ -384,6 +392,7 @@ mod head_tests {
             let mut sessions = state.sessions.lock().unwrap();
             sessions.insert("r".into(), session);
         }
+        state.index_domain("dev.example.com", "r", "web");
 
         let (mut a, b) = duplex(1024);
         a.write_all(b"x").await.unwrap();

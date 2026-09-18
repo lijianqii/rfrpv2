@@ -122,6 +122,7 @@ pub async fn register_proxy(
         let mut map = session.proxy_domains.lock().unwrap();
         for d in &domains {
             map.insert(d.clone(), np.proxy_name.clone());
+            state.index_domain(d, &session.run_id, &np.proxy_name);
         }
     }
     session

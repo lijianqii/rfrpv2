@@ -61,6 +61,12 @@ pub struct ServerState {
     /// 避免每次池连接到达时全表扫描（§8.2）。与 `sessions` 同键（run_id），
     /// 重连替换会话后映射仍有效，清理时按名移除。
     pub proxy_index: Mutex<HashMap<String, String>>,
+    /// domain → (run_id, proxy_name)：vhost 路由按域名 O(1) 定位代理。
+    ///
+    /// 此前每次 vhost 请求都要持 `sessions` 锁遍历所有会话及其 `proxy_domains`，
+    /// 请求量或会话数一上来就会串行化在这把锁上；改为与 `proxy_index` 对称的
+    /// 全局索引，注册/清理时维护。
+    pub domain_index: Mutex<HashMap<String, (String, String)>>,
     /// UDP 代理运行状态（proxy_name -> UdpProxy）。
     pub udp: Mutex<HashMap<String, Arc<crate::udp::UdpProxy>>>,
     /// 登录失败计数（IP -> (失败次数, 窗口起点)），用于登录限速（防 token 穷举）。
@@ -82,6 +88,7 @@ impl ServerState {
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             proxy_index: Mutex::new(HashMap::new()),
+            domain_index: Mutex::new(HashMap::new()),
             udp: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             proxy_stats: Mutex::new(HashMap::new()),
@@ -202,6 +209,35 @@ impl ServerState {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(run_id).cloned()
     }
+
+    /// 登记域名归属（vhost 路由用，注册成功后调用）。
+    pub fn index_domain(&self, domain: &str, run_id: &str, proxy_name: &str) {
+        self.domain_index.lock().unwrap().insert(
+            domain.to_string(),
+            (run_id.to_string(), proxy_name.to_string()),
+        );
+    }
+
+    /// 批量移除域名归属（会话清理时调用）。按域名移除，与 run_id 无关：
+    /// 同一 run_id 重连后若已重新登记同名域名，条目内容一致，移除无副作用
+    /// （清理发生在旧会话注销、新会话注册之前）。
+    pub fn unindex_domains(&self, domains: impl IntoIterator<Item = String>) {
+        let mut idx = self.domain_index.lock().unwrap();
+        for d in domains {
+            idx.remove(&d);
+        }
+    }
+
+    /// 按域名定位所属会话与代理名（O(1)，vhost 路由热路径）。
+    pub fn session_for_domain(&self, host: &str) -> Option<(Arc<crate::control::Session>, String)> {
+        let (run_id, proxy_name) = {
+            let idx = self.domain_index.lock().unwrap();
+            let (run_id, proxy_name) = idx.get(host)?;
+            (run_id.clone(), proxy_name.clone())
+        };
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(&run_id).cloned().map(|s| (s, proxy_name))
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +296,38 @@ mod tests {
         state.unindex_proxies(vec!["web".into(), "udp-x".into()]);
         assert!(state.session_for_proxy("web").is_none());
         assert!(state.session_for_proxy("udp-x").is_none());
+    }
+
+    #[test]
+    fn domain_index_roundtrip() {
+        // vhost 路由按域名 O(1) 定位会话；清理后必须失效，否则会命中已注销的会话。
+        let state = ServerState::new();
+        let s = test_session("r1");
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("r1".into(), s.clone());
+
+        assert!(state.session_for_domain("dev.example.com").is_none());
+
+        state.index_domain("dev.example.com", "r1", "web");
+        let (found, proxy) = state
+            .session_for_domain("dev.example.com")
+            .expect("indexed domain");
+        assert_eq!(proxy, "web");
+        assert!(Arc::ptr_eq(&found, &s));
+
+        state.unindex_domains(vec!["dev.example.com".into()]);
+        assert!(state.session_for_domain("dev.example.com").is_none());
+    }
+
+    #[test]
+    fn domain_index_ignores_stale_run_id() {
+        // 索引指向已不存在的会话（例如会话已被替换/清理）时不得 panic，返回 None。
+        let state = ServerState::new();
+        state.index_domain("dev.example.com", "ghost", "web");
+        assert!(state.session_for_domain("dev.example.com").is_none());
     }
 
     #[tokio::test]

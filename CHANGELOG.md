@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- **vhost 路由改为全局域名索引（O(1)）**：`find_proxy_by_domain` 原先持 `sessions` 锁
+  遍历所有会话及其 `proxy_domains`，请求量或会话数上升后会把所有 vhost 请求串行化在
+  这把锁上（注册路径也是 O(#sessions)）。现新增与 `proxy_index` 对称的
+  `domain → (run_id, proxy_name)` 索引，注册时写入、会话清理时移除。
 - **TCP/UDP 代理也会校验 `custom_domains` 全局唯一**：此前只有 vhost 代理做域名冲突
   校验，TCP 代理带 `custom_domains` 时会直接登记域名，可能抢占 vhost 域名并让同名
   请求路由到类型不匹配的代理（用户只会看到 404，注册方毫无察觉）。现在所有代理类型
