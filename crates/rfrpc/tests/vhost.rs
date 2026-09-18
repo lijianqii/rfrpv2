@@ -46,6 +46,8 @@ fn vhost_server_config(http_port: Option<u16>, https_port: Option<u16>) -> Serve
             tls_key: None,
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -75,11 +77,7 @@ async fn start_vhost_stack(
     http_port: Option<u16>,
     https_port: Option<u16>,
     proxy: ClientProxy,
-) -> (
-    tokio::task::JoinHandle<()>,
-    SocketAddr,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (TestServer, SocketAddr, TestClient) {
     let (srv, addr) = start_server(vhost_server_config(http_port, https_port)).await;
     let cli = start_client(client_config(addr, vec![proxy], None)).await;
     (srv, addr, cli)
@@ -107,11 +105,16 @@ async fn send_http_request(port: u16, host: &str, tls: Option<&ClientTls>) -> Op
 }
 
 /// 轮询直到 vhost 请求成功。
+///
+/// 未注册的 vhost 现在会**立即返回 404**（而不是断连），所以这里把 404 视为
+/// "尚未就绪"继续等待——否则会在客户端注册完成前就拿到 404 并断言失败。
 async fn wait_vhost_response(port: u16, host: &str, tls: Option<&ClientTls>) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(resp) = send_http_request(port, host, tls).await {
-            return resp;
+            if !resp.starts_with("HTTP/1.1 404") {
+                return resp;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("vhost proxy did not become ready");
@@ -190,14 +193,25 @@ async fn http_vhost_rejects_unknown_host() {
         web_proxy(ProxyType::Http, local_port, 0),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // 未知 Host：服务端应关闭连接（无响应）。
+    // 先等注册完成，区分"未注册"与"注册完成但没有该域名"两种 404 来源。
     assert!(
-        send_http_request(vhost_port, "unknown.example.com", None)
+        wait_vhost_response(vhost_port, "dev.example.com", None)
             .await
-            .is_none(),
-        "unknown host should not be forwarded"
+            .contains("200 OK"),
+        "registered vhost should serve 200"
+    );
+
+    // 未知 Host：不得转发到本地服务，且应回明确的 404（而非静默断连）。
+    let resp = send_http_request(vhost_port, "unknown.example.com", None)
+        .await
+        .expect("unmatched vhost must return an HTTP response");
+    assert!(
+        resp.starts_with("HTTP/1.1 404"),
+        "unknown host should get 404, got: {resp}"
+    );
+    assert!(
+        !resp.contains("ok"),
+        "unknown host must not be forwarded to the local service: {resp}"
     );
 
     srv.abort();
@@ -315,6 +329,8 @@ async fn http_vhost_with_tls_work_conn() {
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -340,6 +356,8 @@ async fn http_vhost_with_tls_work_conn() {
             work_conn_tls: true,
             run_id_file: None,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
         },
         proxies: vec![proxy],

@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
-    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
-    MAX_CONSECUTIVE_ACCEPT_ERRORS, SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT,
+    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, MAX_CONSECUTIVE_ACCEPT_ERRORS,
+    SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
-use rfrp_common::error::Result;
+use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::read_one_frame;
 use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
 use rfrp_common::util::signal::spawn_signal_watcher;
@@ -34,6 +34,9 @@ pub struct Server {
     state: Arc<ServerState>,
     /// 优雅退出宽限期：停止接收后等待在途连接结束的最长时间（§14.4）。
     grace: Duration,
+    /// 心跳参数（来自配置，缺省 30s 间隔 / 10s 超时，见 §8.3）。
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
     /// 控制/工作连接 TLS acceptor（按配置按需加载）。
     tls: Option<ServerTls>,
     /// HTTP vhost 监听（可选）。
@@ -48,59 +51,21 @@ impl Server {
     /// 绑定 `config.server.bind_addr:bind_port`。`bind_port=0` 由 OS 分配。
     pub async fn new(config: ServerConfig) -> Result<Self> {
         let listener = TcpListener::bind(config.server.bind_socket_addr()?).await?;
-        let vhost_http = match config.proxy.vhost_http_port {
-            Some(port) => {
-                let addr = (config.server.bind_addr.as_str(), port);
-                Some(TcpListener::bind(addr).await?)
-            }
-            None => None,
-        };
-        let dashboard = match &config.dashboard {
-            Some(d) => {
-                let addr: SocketAddr = d.addr.parse().map_err(|e| {
-                    rfrp_common::Error::Config(format!("invalid dashboard addr: {e}"))
-                })?;
-                Some(TcpListener::bind(addr).await?)
-            }
-            None => None,
-        };
-        let vhost_https = match config.proxy.vhost_https_port {
-            Some(port) => {
-                let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(|| {
-                    rfrp_common::Error::Config(
-                        "vhost_https_port requires vhost_tls_cert and vhost_tls_key".into(),
-                    )
-                })?;
-                let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(|| {
-                    rfrp_common::Error::Config(
-                        "vhost_https_port requires vhost_tls_cert and vhost_tls_key".into(),
-                    )
-                })?;
-                let listener = TcpListener::bind((config.server.bind_addr.as_str(), port)).await?;
-                let tls = ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))?;
-                Some((listener, tls))
-            }
-            None => None,
-        };
-        let tls = if config.server.tls_enable || config.server.work_conn_tls {
-            let cert = config.server.tls_cert.as_deref().ok_or_else(|| {
-                rfrp_common::Error::Config("tls_cert is required when TLS is enabled".into())
-            })?;
-            let key = config.server.tls_key.as_deref().ok_or_else(|| {
-                rfrp_common::Error::Config("tls_key is required when TLS is enabled".into())
-            })?;
-            Some(ServerTls::new(
-                std::path::Path::new(cert),
-                std::path::Path::new(key),
-            )?)
-        } else {
-            None
-        };
+        let vhost_http =
+            bind_optional(&config.server.bind_addr, config.proxy.vhost_http_port).await?;
+        let dashboard = bind_dashboard(&config).await?;
+        let vhost_https = bind_vhost_https(&config).await?;
+        let tls = load_control_tls(&config)?;
+        // 在 config 移入 Arc 之前取出生效的心跳参数。
+        let heartbeat_interval = config.server.heartbeat_interval();
+        let heartbeat_timeout = config.server.heartbeat_timeout();
         Ok(Self {
             config: Arc::new(config),
             listener,
             state: ServerState::new(),
             grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
+            heartbeat_interval,
+            heartbeat_timeout,
             tls,
             vhost_http,
             vhost_https,
@@ -141,6 +106,8 @@ impl Server {
         let dashboard = self.dashboard;
         let dashboard_cfg = self.config.dashboard.clone();
         let config = self.config.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+        let heartbeat_timeout = self.heartbeat_timeout;
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
@@ -217,6 +184,8 @@ impl Server {
                                     config,
                                     tls,
                                     Duration::from_secs(FIRST_FRAME_TIMEOUT),
+                                    heartbeat_interval,
+                                    heartbeat_timeout,
                                 )
                                 .await
                                 {
@@ -277,6 +246,66 @@ impl Server {
     }
 }
 
+/// 绑定可选监听端口（`None` = 该监听未启用）。
+async fn bind_optional(bind_addr: &str, port: Option<u16>) -> Result<Option<TcpListener>> {
+    match port {
+        Some(port) => Ok(Some(TcpListener::bind((bind_addr, port)).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Dashboard 监听（可选）。地址格式已在配置校验阶段检查过。
+async fn bind_dashboard(config: &ServerConfig) -> Result<Option<TcpListener>> {
+    let Some(d) = &config.dashboard else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = d
+        .addr
+        .parse()
+        .map_err(|e| Error::Config(format!("invalid dashboard addr: {e}")))?;
+    Ok(Some(TcpListener::bind(addr).await?))
+}
+
+/// HTTPS vhost 监听 + 证书（可选；启用时必须同时提供证书与私钥）。
+async fn bind_vhost_https(config: &ServerConfig) -> Result<Option<(TcpListener, ServerTls)>> {
+    let Some(port) = config.proxy.vhost_https_port else {
+        return Ok(None);
+    };
+    let missing =
+        || Error::Config("vhost_https_port requires vhost_tls_cert and vhost_tls_key".into());
+    let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(missing)?;
+    let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(missing)?;
+    let listener = TcpListener::bind((config.server.bind_addr.as_str(), port)).await?;
+    let tls = ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))?;
+    Ok(Some((listener, tls)))
+}
+
+/// 控制链路 / 工作连接共用的 TLS acceptor（可选）。
+fn load_control_tls(config: &ServerConfig) -> Result<Option<ServerTls>> {
+    if !(config.server.tls_enable || config.server.work_conn_tls) {
+        return Ok(None);
+    }
+    let missing = |field: &str| {
+        Error::Config(format!(
+            "{field} is required when tls_enable or work_conn_tls is set"
+        ))
+    };
+    let cert = config
+        .server
+        .tls_cert
+        .as_deref()
+        .ok_or_else(|| missing("tls_cert"))?;
+    let key = config
+        .server
+        .tls_key
+        .as_deref()
+        .ok_or_else(|| missing("tls_key"))?;
+    Ok(Some(ServerTls::new(
+        std::path::Path::new(cert),
+        std::path::Path::new(key),
+    )?))
+}
+
 /// 读取首帧，按类型分派到控制连接或工作连接处理。
 ///
 /// 同一 `bind_port` 上可能混有 TLS 与明文连接（取决于 `tls_enable` / `work_conn_tls`），
@@ -287,6 +316,8 @@ async fn handle_connection(
     config: Arc<ServerConfig>,
     tls: Option<ServerTls>,
     first_frame_timeout: Duration,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
 ) -> Result<()> {
     let peer_ip = stream
         .peer_addr()
@@ -361,8 +392,8 @@ async fn handle_connection(
                 peer_ip,
                 state,
                 (*config).clone(),
-                Duration::from_secs(HEARTBEAT_INTERVAL),
-                Duration::from_secs(HEARTBEAT_TIMEOUT),
+                heartbeat_interval,
+                heartbeat_timeout,
             )
             .await
         }
@@ -407,6 +438,8 @@ mod tests {
             cfg,
             None,
             Duration::from_millis(150), // 测试用短超时
+            Duration::from_secs(30),
+            Duration::from_secs(10),
         )
         .await;
         assert!(res.is_ok(), "silent connection should be closed cleanly");

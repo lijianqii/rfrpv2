@@ -37,6 +37,9 @@ pub const HTTP_HEAD_TIMEOUT: u64 = 10;
 pub const HEARTBEAT_INTERVAL: u64 = 30;
 /// 心跳响应等待超时，超时判定对端已死。
 pub const HEARTBEAT_TIMEOUT: u64 = 10;
+/// 心跳参数（间隔/超时）可配置范围的上下限（秒），见 §9.4 校验。
+pub const HEARTBEAT_MIN_SECS: u64 = 1;
+pub const HEARTBEAT_MAX_SECS: u64 = 3600;
 /// rfrps 侧等待 StartWorkConn 的兜底超时。
 pub const WORK_CONN_TIMEOUT_RFRPS: u64 = 10;
 /// rfrpc 侧建立工作连接的本地截止。
@@ -110,4 +113,3 @@ pub const MAX_RUN_ID_LEN: usize = 64;
 pub const MAX_TOKEN_LEN: usize = 256;
 pub const MAX_PROXY_NAME_LEN: usize = 64;
 pub const MAX_DOMAIN_LEN: usize = 253;
-pub const MAX_ERROR_LEN: usize = 512;

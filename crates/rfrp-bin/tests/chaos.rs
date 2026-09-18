@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use rfrp_common::testutil::free_port;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, Command};
 
@@ -39,11 +40,6 @@ fn rfrp_command() -> Command {
     {
         Command::new(BIN)
     }
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
 }
 
 fn write_server_config(port: u16) -> PathBuf {

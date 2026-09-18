@@ -61,6 +61,8 @@ fn server_validate_basic() {
             token: "x".into(),
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
@@ -88,11 +90,66 @@ fn work_conn_tls_requires_certs() {
             token: "x".into(),
             work_conn_tls: true,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
     };
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn work_conn_tls_default_error_names_the_field() {
+    // 最小配置（只写 token）最常踩到这个坑：报错必须点名 work_conn_tls，
+    // 并给出改法，而不是含糊地说 "tls_enable or work_conn_tls"。
+    let cfg = ServerConfig {
+        server: ServerSection {
+            token: "x".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("work_conn_tls=true (default)"), "{err}");
+    assert!(err.contains("work_conn_tls=false"), "{err}");
+}
+
+#[test]
+fn heartbeat_secs_range_and_ordering_validated() {
+    let base = r#"
+        [server]
+        token = "x"
+        work_conn_tls = false
+    "#;
+    let cfg = |interval: Option<u64>, timeout: Option<u64>| -> ServerConfig {
+        let mut c: ServerConfig = toml::from_str(base).unwrap();
+        c.server.heartbeat_interval_secs = interval;
+        c.server.heartbeat_timeout_secs = timeout;
+        c
+    };
+
+    // 缺省与合法值。
+    assert!(cfg(None, None).validate().is_ok());
+    assert!(cfg(Some(5), Some(1)).validate().is_ok());
+    assert!(cfg(Some(60), Some(20)).validate().is_ok());
+    assert!(cfg(Some(3600), Some(3599)).validate().is_ok());
+    // 生效值（缺省 30/10）。
+    let d = cfg(None, None);
+    assert_eq!(d.server.heartbeat_interval().as_secs(), 30);
+    assert_eq!(d.server.heartbeat_timeout().as_secs(), 10);
+    let c = cfg(Some(60), Some(20));
+    assert_eq!(c.server.heartbeat_interval().as_secs(), 60);
+    assert_eq!(c.server.heartbeat_timeout().as_secs(), 20);
+
+    // 越界。
+    assert!(cfg(Some(0), None).validate().is_err());
+    assert!(cfg(Some(3601), None).validate().is_err());
+    assert!(cfg(None, Some(0)).validate().is_err());
+    // 超时必须严格小于间隔：否则每轮心跳都会在等待回应时超时。
+    assert!(cfg(Some(10), Some(10)).validate().is_err());
+    assert!(cfg(Some(10), Some(11)).validate().is_err());
+    assert!(cfg(Some(10), Some(9)).validate().is_ok());
 }
 
 #[test]
@@ -105,6 +162,8 @@ fn tls_cert_file_missing_rejected() {
             tls_key: Some("./definitely-missing-key.pem".into()),
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
@@ -119,6 +178,8 @@ fn vhost_cert_file_missing_rejected() {
             token: "x".into(),
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         proxy: ProxySection {
@@ -140,6 +201,8 @@ fn dashboard_port_conflict_rejected() {
             bind_port: 7000,
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         dashboard: Some(DashboardSection {
@@ -159,6 +222,8 @@ fn dashboard_nonloopback_valid_but_warns() {
             token: "x".into(),
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         dashboard: Some(DashboardSection {
@@ -177,6 +242,8 @@ fn empty_token_rejected() {
             token: "".into(),
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()

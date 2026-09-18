@@ -152,6 +152,8 @@ async fn udp_proxy_with_tls_work_conn() {
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         },
         dashboard: None,
         proxy: ProxySection {
@@ -176,6 +178,8 @@ async fn udp_proxy_with_tls_work_conn() {
             work_conn_tls: true,
             run_id_file: None,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
         },
         proxies: vec![udp_proxy(echo_port, remote)],

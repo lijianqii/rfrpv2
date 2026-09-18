@@ -8,10 +8,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
-    CONNECT_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN,
-    MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT, PROXY_REGISTER_RETRY_INITIAL,
-    PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY, RECONNECT_BACKOFF_INITIAL,
-    RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
+    CONNECT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN, MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT,
+    PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY,
+    RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
@@ -87,10 +86,10 @@ impl Client {
             None
         };
         Ok(Self {
+            heartbeat_interval: config.client.heartbeat_interval(),
+            heartbeat_timeout: config.client.heartbeat_timeout(),
             config,
             tls,
-            heartbeat_interval: Duration::from_secs(HEARTBEAT_INTERVAL),
-            heartbeat_timeout: Duration::from_secs(HEARTBEAT_TIMEOUT),
             metrics: Arc::new(ClientMetrics::new()),
             shutdown: CancellationToken::new(),
         })

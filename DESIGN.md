@@ -687,6 +687,10 @@ User → rfrps:remote_port  (Listener 接收)
 - **首版由 rfrps 主动发起心跳**（rfrps → rfrpc 方向）：rfrps 每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat`，随后在 `HEARTBEAT_TIMEOUT`(10s) 内等待对端 `HeartbeatResp`；超时未收到则判定对端已死，直接断开 TCP 并清理 Session（ping/pong 语义）。rfrpc 维持对 `Heartbeat` 的 `HeartbeatResp` 应答。
   - **实现要点（修复项）**：超时判定必须绑定"本次 Heartbeat 的回应"，而非"距上次收到 Resp 的间隔"。若用 `last_resp` 时间戳 + `elapsed > HEARTBEAT_TIMEOUT` 在每次周期 tick 检查，会因 `HEARTBEAT_INTERVAL(30s) > HEARTBEAT_TIMEOUT(10s)` 而在首个周期即误判超时——误杀控制连接 → rfrpc 重连（复用 run_id）→ rfrps 去重清理旧 Session → 中止代理监听（代理端口 `Connection refused`）、回收在用工作连接（在途 SSH 等会话 `closed by remote host`）。改用 `Notify`：发送后 `timeout(HEARTBEAT_TIMEOUT, pong.notified())`，仅当该次心跳未收到回应立即断开。
 - **双向主动心跳（已实现）**：rfrpc 同样每 `HEARTBEAT_INTERVAL`(30s) 发送 `Heartbeat` 并在 `HEARTBEAT_TIMEOUT`(10s) 内等待 `HeartbeatResp`，超时即断开并进入重连。
+- **心跳参数可配置（v0.1 补强）**：`[server]` / `[client]` 均支持
+  `heartbeat_interval_secs`（默认 30）与 `heartbeat_timeout_secs`（默认 10，必须小于间隔）。
+  弱网/高延迟链路可调大以降低误判断连；希望更快感知失联（例如同城直连）可调小，
+  但过小会与心跳往返时延同量级，反而增加误判。校验见 §9.4。
   - **原因**：仅靠 TCP EOF 无法感知**半开连接**——对端进程挂起、链路静默中断（NAT/防火墙丢弃表项）时不会产生 FIN/RST，reader 永久阻塞，客户端将卡死且永不重连（Windows 上未启用 TCP keepalive，尤其明显）。rfrps 早已响应 rfrpc 的 `Heartbeat`（`Message::Heartbeat` → `HeartbeatResp`），故客户端侧补上主动探测即可，语义与服务端一致。
   - **误判防护**：写通道满时跳过本轮心跳（不等待回应），避免本地拥塞误判断连。
 - **accept 循环健壮性**：`accept()` 瞬时错误（握手期重置、fd 耗尽等）退避重试，
@@ -706,6 +710,14 @@ User → rfrps:remote_port  (Listener 接收)
 ### 8.4 HTTP/HTTPS（vhost）
 
 - rfrps 共用 80/443 监听，按 `Host` / `SNI` 路由到对应 Proxy。
+- **路由粒度是"连接"而非"请求"**：rfrps 只解析**首个请求**的 `Host`/SNI，命中后即把该连接
+  双向透传给对应后端（含请求头已读缓冲）。因此同一 HTTP/1.1 长连接（keep-alive）内
+  若复用连接访问**不同域名**，会被路由到首个请求对应的后端。反向代理/网关类客户端
+  应按域名拆分连接（绝大多数客户端与 SDK 默认如此）。
+- **未命中时返回 404**：`Host` 无法匹配任何已注册代理（或代理类型与监听不符）时，
+  rfrps 回一个最小 `HTTP/1.1 404 Not Found` + `Connection: close` 再关闭连接，
+  而不是静默断连——便于用户与上游负载均衡区分"没有这个 vhost"与"链路故障"。
+  请求头本身读不全（超时/畸形/对端提前关闭）时仍直接关闭（无法安全回应）。
 - **HTTP**：rfrps 用 `hyper` 读取请求头判定 Host，命中后将**已读缓冲区连同后续流**一起桥接到工作连接（不丢失已读字节）。
 - **HTTPS**：TLS 终止在 rfrps（使用 `vhost_tls_cert` / `vhost_tls_key`），rfrps 完成 TLS 握手拿到 SNI 后，按明文 HTTP 处理取 Host，再将**解密后的明文流**桥接到工作连接。工作连接承载明文，本地服务收到的是明文 HTTP。
 - HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。**证书在 rfrps 启动时一次性加载到内存**（`rustls::ServerConfig` 持有），运行期不重新读取；证书文件更换需重启 rfrps 生效（首版不支持热重载，见非目标）。
@@ -774,6 +786,9 @@ tls_enable = true                # 控制链路 TLS 总开关（M1 测试期可�
 tls_cert = "./cert.pem"          # 控制链路证书
 tls_key  = "./key.pem"
 work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）
+heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
+heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps↔rfrpc 控制连接
@@ -822,6 +837,8 @@ tls_ca = "./ca.pem"               # 可选；自签证书场景指定 CA/服务�
 work_conn_tls = true              # 工作连接是否走 TLS，默认 true
 run_id_file = ""                  # run_id 持久化路径，空表示默认 ~/.rfrp/run_id
 tcp_keepalive_secs = 30           # TCP keepalive 空闲秒数；0 = 禁用（默认 30，Windows 亦生效）
+heartbeat_interval_secs = 30      # 心跳发送间隔（秒，默认 30）
+heartbeat_timeout_secs = 10       # 心跳回应超时（秒，默认 10，必须小于 interval）
 # status_addr = "127.0.0.1:7400"  # 可选状态端点（/、/api/status、/metrics）；默认关闭
 
 [[proxy]]
@@ -1578,3 +1595,26 @@ M6 发布与打包已完成：
 - 关键消息（`LoginResp`、`NewProxyResp`、按需 `ReqWorkConn`）用 `send_with_timeout`，失败即清理 pending / 断开。
 - 控制通道容量 64 → 256。
 - 新增回归测试 `tcp_proxy_rapid_connect_disconnect_stays_usable`：50 次高频短连接后代理仍可用。
+
+### 17.23 测试稳定性与运行期加固（v0.1 补强）
+
+针对"`cargo test --all` 随机失败、`make ci` 结果不可信"的问题，定位到两个根因并修复：
+
+- **测试服务端用 `abort()` 关停**：代理监听、控制写任务都是独立 `tokio::spawn` 出来的，
+  abort 只留下一批仍持有端口与会话的"僵尸服务端"——重连类用例要么被旧会话假性服务
+  （0.16s 假通过），要么等不到端口释放（15s 超时假失败）。测试改为统一的
+  `TestServer` / `TestClient` 句柄，退出走优雅关闭令牌，`Drop` 时自动取消。
+- **fd 耗尽**：同一测试二进制内用例并行执行，macOS 默认软上限 256 被连接数打满，
+  随机报 `TooManyOpenFiles` / `ConnectionReset` / 连接超时，看起来像协议 bug。
+  测试初始化时把软上限提升到硬上限；测试端口改为非 ephemeral 区间自增分配
+  （不与 `bind(0)` 抢号）；`tcp_proxy_connection_cap_enforced` 不再依赖探针连接的释放时序。
+
+同批完成的其他加固：
+
+- 移除 release 的 `panic = "abort"`（任务级 panic 不再终止整个进程）；四个 crate 增加
+  `#![forbid(unsafe_code)]`。
+- 心跳参数可配置：`heartbeat_interval_secs` / `heartbeat_timeout_secs`（§8.3 / §9.1 / §9.2 / §9.4）。
+- vhost 未命中返回 404（§8.4），并明确"按连接首请求路由、keep-alive 不跨域名"的语义。
+- `work_conn_tls` 默认值导致的配置报错点名真实字段，并给出 `work_conn_tls=false` 的改法。
+
+验证：`make ci` 通过；`cargo test --all` 连续 10 次全绿（每次 264 个用例）。

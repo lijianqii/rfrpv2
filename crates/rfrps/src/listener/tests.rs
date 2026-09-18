@@ -26,6 +26,8 @@ fn test_config(allow_ports: &str) -> ServerConfig {
             tls_key: None,
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         },
         dashboard: None,
         proxy,
@@ -47,10 +49,7 @@ fn test_session() -> Arc<Session> {
     })
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+use rfrp_common::testutil::free_port;
 
 #[test]
 fn next_work_id_starts_at_one_and_increments() {
@@ -256,6 +255,51 @@ async fn register_http_proxy_registers_domains() {
     let proxies = session.proxies.lock().unwrap();
     let entry = proxies.get("web").unwrap();
     assert_eq!(entry.kind, ProxyType::Http);
+}
+
+#[tokio::test]
+async fn register_tcp_with_conflicting_domain_rejected() {
+    // 域名为全局唯一资源：TCP/UDP 代理即使不走 vhost 路由，也不得抢占已被
+    // vhost 代理登记的域名（否则同名 vhost 请求会路由到类型不匹配的代理，
+    // 用户只看到 404，且注册方毫无察觉）。
+    let state = ServerState::new();
+    let session = test_session();
+    // 域名查重走全局会话表（生产路径由登录时登记），此处按同样方式登记。
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    let web = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["dev.example.com".into()]),
+    };
+    assert!(register_proxy(&web, &session, &state, &cfg).await.is_ok());
+
+    let tcp = NewProxy {
+        proxy_name: "raw".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: Some(vec!["dev.example.com".into()]),
+    };
+    let err = register_proxy(&tcp, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::DomainConflict);
+    // 域名仍归属原 vhost 代理，失败注册不留下任何痕迹。
+    assert_eq!(
+        session
+            .proxy_domains
+            .lock()
+            .unwrap()
+            .get("dev.example.com")
+            .map(|s| s.as_str()),
+        Some("web")
+    );
+    assert!(!session.proxies.lock().unwrap().contains_key("raw"));
 }
 
 #[tokio::test]

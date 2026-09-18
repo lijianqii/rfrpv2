@@ -19,8 +19,14 @@ httparse = { workspace = true }
 
 [dev-dependencies]
 rfrps = { path = "../rfrps" }
-rfrp-common = { path = "../rfrp-common" }
+rfrp-common = { path = "../rfrp-common", features = ["test-support"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# 集成测试并行跑时会打开大量套接字；macOS 默认软上限 256 会被打满，
+# 表现为随机的 TooManyOpenFiles / ConnectionReset。测试启动时把软上限提到硬上限
+# （`raise_fd_limit`，测试 crate 内的少量 unsafe；rfrp-common 保持 forbid(unsafe_code)）。
+libc = "0.2"

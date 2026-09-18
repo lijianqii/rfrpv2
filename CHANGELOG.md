@@ -8,6 +8,22 @@
 
 ### Fixed
 
+- **TCP/UDP 代理也会校验 `custom_domains` 全局唯一**：此前只有 vhost 代理做域名冲突
+  校验，TCP 代理带 `custom_domains` 时会直接登记域名，可能抢占 vhost 域名并让同名
+  请求路由到类型不匹配的代理（用户只会看到 404，注册方毫无察觉）。现在所有代理类型
+  统一校验与登记。
+- **集成测试随机失败（`make ci` 不可靠）**：根因有二 ——
+  ① 用例用 `abort()` 关停测试服务端，而代理监听/控制写任务是独立 `tokio::spawn` 出来的，
+  abort 只会留下一批仍持有端口与会话的"僵尸服务端"，使重连类用例要么被旧会话假性服务（假通过）、
+  要么等不到端口释放（假失败）；② 同一测试二进制并行执行时，macOS 默认 fd 软上限（256）
+  被连接数打满，随机报 `TooManyOpenFiles` / `ConnectionReset` / 连接超时。
+  现在测试统一改用优雅退出令牌（`TestServer`/`TestClient` 句柄，`Drop` 时自动取消），
+  启动时把 fd 软上限提到硬上限，测试端口改为非 ephemeral 区间自增分配（避免与 `bind(0)` 撞号），
+  并移除 `tcp_proxy_connection_cap_enforced` 对探针连接释放时序的依赖。
+- **`work_conn_tls` 默认值导致的配置报错难以理解**：`work_conn_tls` 默认 `true`，最小配置
+  （只写 token）必然因缺少证书/`tls_server_name` 失败，但原报错只说
+  "tls_enable or work_conn_tls"，用户无从下手。现报错点名真正触发的字段并给出改法
+  （`set work_conn_tls=false for plaintext work connections`）。
 - **客户端状态端点限频响应可读**：限频判断移到请求头读取之后（与 Dashboard 一致），
   否则被限频的连接会带着未读请求数据直接关闭，Windows/Linux 发送 RST，客户端拿到连接
   错误而非 429；新增限频集成测试（含 429 断言）。
@@ -29,6 +45,16 @@
 
 ### Changed
 
+- **代码整理**：`Server::new` 的监听/证书加载拆分为小函数；`register_proxy` 的
+  TCP/UDP/vhost 三段重复逻辑合并为统一流程；TLS 缺证书的报错措辞抽到
+  `config` 模块一处；测试端口分配（含"非 ephemeral 区间自增 + 可用性探测"）
+  下沉到 `rfrp-common::testutil`（`test-support` feature），消除各 crate 的重复副本；
+  测试服务端句柄统一为 `TestServer`（不再混用裸 `JoinHandle`）。
+- **release 不再使用 `panic = "abort"`**：服务端/客户端是"每条连接一个任务"的模型，
+  `panic = "abort"` 会让任何任务级 panic（如锁中毒上的 `unwrap`）直接终止整个进程；
+  保留 unwind 后任务级 panic 只影响该任务，进程继续服务其他连接。
+- 四个 crate 增加 `#![forbid(unsafe_code)]`；`unsafe` 仅保留在**测试 crate** 中
+  （Windows 混沌测试的进程控制、测试用 fd 上限提升），不进入发布产物。
 - **Windows 信号处理同时监听 Ctrl-C 与 Ctrl-Break**：服务/脚本/测试可用
   `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` 触发优雅退出（CTRL_C_EVENT 无法定向到进程组）。
 - **主目录解析更健壮（双平台）**：`HOME`/`USERPROFILE` 为空串时视为缺失，
@@ -38,6 +64,13 @@
 
 ### Added
 
+- **心跳参数可配置**：`[server]` / `[client]` 新增 `heartbeat_interval_secs`（默认 30）与
+  `heartbeat_timeout_secs`（默认 10，必须小于间隔）。弱网/高延迟链路可调大以降低误判断连，
+  低时延直连可调小以更快感知失联；越界或 `timeout >= interval` 在配置校验阶段直接报错。
+- **vhost 未命中返回 404**：`Host` 无法匹配任何代理（或代理类型与监听不符）时返回
+  `HTTP/1.1 404 Not Found` + `Connection: close`，替代此前的静默断连；请求头本身读不全
+  （超时/畸形/提前关闭）仍直接关闭。文档补充"vhost 按连接首请求路由"的语义：
+  同一条 keep-alive 连接不要混用多个域名。
 - **协议错误码**：`NewProxyResp.error` 统一为稳定错误码
   （`invalid type` / `invalid field` / `proxy_name exists` / `port not allowed` /
   `port occupied` / `domain conflict` / `internal error`，见 DESIGN §6.6），

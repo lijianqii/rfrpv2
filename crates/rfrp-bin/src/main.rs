@@ -3,6 +3,8 @@
 //! 解析 CLI、加载配置、应用 CLI 覆盖、初始化日志，按子命令分派到
 //! `rfrps::Server::run` 或 `rfrpc::Client::run`。
 
+#![forbid(unsafe_code)]
+
 mod cli;
 mod logging;
 

@@ -100,6 +100,58 @@ fn work_conn_tls_requires_server_name() {
 }
 
 #[test]
+fn work_conn_tls_default_error_names_the_field() {
+    // work_conn_tls 默认 true：最小客户端配置（只写 server/token）会因缺少
+    // tls_server_name 失败，报错需点名真实字段并给出改法。
+    // 走 TOML 反序列化路径：`work_conn_tls` 的默认值由 serde default 提供
+    // （derived Default 会给出 false，与用户实际配置路径不一致）。
+    let cfg: ClientConfig = toml::from_str(
+        r#"
+        [client]
+        server_addr = "s.example.com"
+        server_port = 7000
+        token = "x"
+    "#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("work_conn_tls=true (default)"), "{err}");
+    assert!(err.contains("work_conn_tls=false"), "{err}");
+}
+
+#[test]
+fn heartbeat_secs_range_and_ordering_validated() {
+    let base = r#"
+        [client]
+        server_addr = "s.example.com"
+        server_port = 7000
+        token = "secret"
+        work_conn_tls = false
+    "#;
+    let cfg = |interval: Option<u64>, timeout: Option<u64>| -> ClientConfig {
+        let mut c: ClientConfig = toml::from_str(base).unwrap();
+        c.client.heartbeat_interval_secs = interval;
+        c.client.heartbeat_timeout_secs = timeout;
+        c
+    };
+
+    assert!(cfg(None, None).validate().is_ok());
+    assert!(cfg(Some(5), Some(2)).validate().is_ok());
+    let d = cfg(None, None);
+    assert_eq!(d.client.heartbeat_interval().as_secs(), 30);
+    assert_eq!(d.client.heartbeat_timeout().as_secs(), 10);
+    let c = cfg(Some(2), Some(1));
+    assert_eq!(c.client.heartbeat_interval().as_secs(), 2);
+    assert_eq!(c.client.heartbeat_timeout().as_secs(), 1);
+
+    assert!(cfg(Some(0), None).validate().is_err());
+    assert!(cfg(Some(3601), None).validate().is_err());
+    assert!(cfg(None, Some(0)).validate().is_err());
+    assert!(cfg(Some(10), Some(10)).validate().is_err());
+    assert!(cfg(Some(10), Some(11)).validate().is_err());
+}
+
+#[test]
 fn tls_ca_file_missing_rejected() {
     let cfg = ClientConfig {
         client: ClientSection {

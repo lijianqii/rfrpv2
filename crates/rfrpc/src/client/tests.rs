@@ -40,6 +40,8 @@ fn cfg_for(path: &std::path::Path) -> ClientConfig {
         client: ClientSection {
             run_id_file: Some(path.to_string_lossy().to_string()),
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
             ..Default::default()
         },

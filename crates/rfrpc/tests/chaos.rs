@@ -11,12 +11,10 @@ use common::*;
 use rfrp_common::config::ClientProxy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 static TMP: AtomicU64 = AtomicU64::new(0);
 
-async fn start_server_grace(grace: Duration) -> (JoinHandle<()>, SocketAddr, CancellationToken) {
+async fn start_server_grace(grace: Duration) -> (TestServer, SocketAddr) {
     start_server_with_grace(server_config(0), grace).await
 }
 
@@ -29,7 +27,7 @@ async fn start_client(
     server_addr: SocketAddr,
     proxies: Vec<ClientProxy>,
     run_id_file: PathBuf,
-) -> JoinHandle<()> {
+) -> TestClient {
     let cfg = client_config(
         server_addr,
         proxies,
@@ -58,7 +56,8 @@ async fn wait_until_refused(target: SocketAddr, timeout: Duration) -> bool {
 #[tokio::test]
 async fn graceful_shutdown_keeps_inflight_during_grace() {
     let echo_port = spawn_echo().await;
-    let (srv, addr, sd) = start_server_grace(Duration::from_millis(800)).await;
+    let (srv, addr) = start_server_grace(Duration::from_millis(800)).await;
+    let sd = srv.shutdown_token();
     let remote = free_port();
     let run_id_file = unique_run_id_file();
     let cli = start_client(
@@ -86,7 +85,7 @@ async fn graceful_shutdown_keeps_inflight_during_grace() {
     assert_eq!(&buf2, b"ping2");
 
     drop(user);
-    let r = tokio::time::timeout(Duration::from_secs(3), srv).await;
+    let r = tokio::time::timeout(Duration::from_secs(3), srv.wait()).await;
     assert!(
         r.is_ok(),
         "server.run() must return after in-flight drained within grace"
@@ -99,7 +98,7 @@ async fn graceful_shutdown_keeps_inflight_during_grace() {
 #[tokio::test]
 async fn proxy_listener_closed_after_control_disconnect() {
     let echo_port = spawn_echo().await;
-    let (srv, addr, _sd) = start_server_grace(Duration::from_millis(300)).await;
+    let (srv, addr) = start_server_grace(Duration::from_millis(300)).await;
     let remote = free_port();
     let run_id_file = unique_run_id_file();
     let cli = start_client(

@@ -3,33 +3,17 @@
 //! 当退出令牌被取消（等价于收到 SIGINT/SIGTERM）时，server.run() 应停止接收新连接，
 //! 在宽限期内让在途连接自然结束，随后返回。
 
+mod common;
+
 use std::time::Duration;
 
-use rfrp_common::config::{LogSection, ProxySection, ServerConfig, ServerSection};
+use common::base_server_config;
 use rfrps::server::Server;
 use tokio::time::{timeout, Instant};
 
-fn server_config() -> ServerConfig {
-    ServerConfig {
-        server: ServerSection {
-            bind_addr: "127.0.0.1".into(),
-            bind_port: 0,
-            token: "".into(),
-            tls_enable: false,
-            tls_cert: None,
-            tls_key: None,
-            work_conn_tls: false,
-            tcp_keepalive_secs: None,
-        },
-        dashboard: None,
-        proxy: ProxySection::default(),
-        log: LogSection::default(),
-    }
-}
-
 #[tokio::test]
 async fn server_run_returns_after_shutdown_token() {
-    let server = Server::new(server_config())
+    let server = Server::new(base_server_config())
         .await
         .unwrap()
         .with_grace(Duration::from_millis(50));
@@ -50,7 +34,7 @@ async fn server_run_returns_after_shutdown_token() {
 #[tokio::test]
 async fn server_run_returns_immediately_when_idle() {
     // 没有在途连接时，即使 grace 很长也不应等待完整宽限期。
-    let server = Server::new(server_config())
+    let server = Server::new(base_server_config())
         .await
         .unwrap()
         .with_grace(Duration::from_secs(30));

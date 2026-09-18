@@ -21,6 +21,7 @@ rfrps = { path = "../rfrps" }
 rfrpc = { path = "../rfrpc" }
 
 [dev-dependencies]
+rfrp-common = { path = "../rfrp-common", features = ["test-support"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

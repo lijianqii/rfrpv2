@@ -29,7 +29,12 @@ fn port_allowed(config: &ServerConfig, port: u16) -> bool {
     })
 }
 
-/// 注册代理：TCP 在 `remote_port` 起监听；HTTP 走共享 vhost 监听，仅登记域名。
+/// 注册代理。
+///
+/// 所有类型共用同一套前置校验与登记流程，只有"句柄从哪来"不同：
+/// - TCP：在 `remote_port` 上起独立监听；
+/// - UDP：在 `remote_port` 上起 UDP 监听 + 会话表；
+/// - HTTP/HTTPS：不绑定端口，走共享 vhost 监听，仅登记域名。
 pub async fn register_proxy(
     np: &NewProxy,
     session: &Arc<Session>,
@@ -41,126 +46,99 @@ pub async fn register_proxy(
         tracing::warn!(proxy = %np.proxy_name, "proxy limit per session reached");
         return Err(ProxyError::TooManyProxies);
     }
-    if matches!(np.r#type, ProxyType::Http | ProxyType::Https) {
-        // vhost 代理：不绑定独立端口，仅登记域名与元信息（共享 vhost 监听已在 Server 启动）。
-        let domains = np.custom_domains.as_ref().ok_or(ProxyError::InvalidField)?;
-        // 与 TCP/UDP 一致：同名代理拒绝，避免静默覆盖旧条目。
-        {
-            let proxies = session.proxies.lock().unwrap();
-            if proxies.contains_key(&np.proxy_name) {
-                return Err(ProxyError::NameExists);
-            }
-        }
-        // 域名全局唯一：与其他代理冲突则拒绝（DESIGN §6.6）。
-        // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
-        for d in domains {
-            if let Some((_, owner)) = find_proxy_by_domain(state, d) {
-                tracing::warn!(
-                    proxy = %np.proxy_name, domain = %d, owner = %owner,
-                    "vhost domain conflict, registration rejected"
-                );
-                return Err(ProxyError::DomainConflict);
-            }
-        }
-        let mut map = session.proxy_domains.lock().unwrap();
-        for d in domains {
-            map.insert(d.clone(), np.proxy_name.clone());
-        }
-        let handle = tokio::spawn(async {});
-        session.proxies.lock().unwrap().insert(
-            np.proxy_name.clone(),
-            ProxyEntry {
-                handle,
-                kind: np.r#type,
-            },
-        );
-        state.index_proxy(&np.proxy_name, &session.run_id);
-        tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "proxy registered (vhost)");
-        return Ok(());
+    // 同名代理一律拒绝，避免静默覆盖旧条目。
+    if session.proxies.lock().unwrap().contains_key(&np.proxy_name) {
+        return Err(ProxyError::NameExists);
     }
-    if np.r#type == ProxyType::Udp {
-        let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
-        if !port_allowed(config, remote_port) {
-            return Err(ProxyError::PortNotAllowed);
-        }
-        {
-            let proxies = session.proxies.lock().unwrap();
-            if proxies.contains_key(&np.proxy_name) {
-                return Err(ProxyError::NameExists);
-            }
-        }
-        let handle = crate::udp::register_udp_proxy(
-            np.proxy_name.clone(),
-            remote_port,
-            session,
-            state,
-            &config.server.bind_addr,
-        )
-        .await?;
-        session.proxies.lock().unwrap().insert(
-            np.proxy_name.clone(),
-            ProxyEntry {
-                handle,
-                kind: ProxyType::Udp,
-            },
-        );
-        state.index_proxy(&np.proxy_name, &session.run_id);
-        tracing::info!(proxy = %np.proxy_name, remote_port, "proxy registered (udp)");
-        return Ok(());
+
+    let domains = np.custom_domains.clone().unwrap_or_default();
+    if matches!(np.r#type, ProxyType::Http | ProxyType::Https) && domains.is_empty() {
+        return Err(ProxyError::InvalidField);
     }
-    if np.r#type != ProxyType::Tcp {
-        return Err(ProxyError::InvalidType);
-    }
-    let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
-    if !port_allowed(config, remote_port) {
-        return Err(ProxyError::PortNotAllowed);
-    }
-    {
-        let proxies = session.proxies.lock().unwrap();
-        if proxies.contains_key(&np.proxy_name) {
-            return Err(ProxyError::NameExists);
+    // 域名全局唯一（DESIGN §6.6）：所有类型统一校验，避免 TCP/UDP 代理抢占域名后，
+    // 同名 vhost 请求被路由到类型不匹配的代理（用户只会看到 404）。
+    // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
+    for d in &domains {
+        if let Some((_, owner)) = find_proxy_by_domain(state, d) {
+            tracing::warn!(
+                proxy = %np.proxy_name, domain = %d, owner = %owner,
+                "vhost domain conflict, registration rejected"
+            );
+            return Err(ProxyError::DomainConflict);
         }
     }
 
-    let listener = match TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
-            // 权限不足等归为不可重试的内部错误。
-            tracing::warn!(
-                proxy = %np.proxy_name, remote_port, error = %e,
-                "failed to bind proxy port"
-            );
-            return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
-                ProxyError::PortOccupied
-            } else {
-                ProxyError::Internal
-            });
+    let kind = np.r#type;
+    let handle = match kind {
+        // vhost 代理不绑定独立端口，仅登记域名与元信息（共享 vhost 监听在 Server 启动时创建）。
+        ProxyType::Http | ProxyType::Https => tokio::spawn(async {}),
+        ProxyType::Udp => {
+            let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
+            if !port_allowed(config, remote_port) {
+                return Err(ProxyError::PortNotAllowed);
+            }
+            crate::udp::register_udp_proxy(
+                np.proxy_name.clone(),
+                remote_port,
+                session,
+                state,
+                &config.server.bind_addr,
+            )
+            .await?
+        }
+        ProxyType::Tcp => {
+            let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
+            if !port_allowed(config, remote_port) {
+                return Err(ProxyError::PortNotAllowed);
+            }
+            let listener =
+                match TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
+                        // 权限不足等归为不可重试的内部错误。
+                        tracing::warn!(
+                            proxy = %np.proxy_name, remote_port, error = %e,
+                            "failed to bind proxy port"
+                        );
+                        return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
+                            ProxyError::PortOccupied
+                        } else {
+                            ProxyError::Internal
+                        });
+                    }
+                };
+            let proxy_name = np.proxy_name.clone();
+            let session = session.clone();
+            let state_loop = state.clone();
+            tokio::spawn(async move {
+                proxy_accept_loop(listener, proxy_name, session, state_loop).await;
+            })
         }
     };
 
-    let proxy_name = np.proxy_name.clone();
-    let session = session.clone();
-    let session_for_insert = session.clone();
-    let state_loop = state.clone();
-    let handle = tokio::spawn(async move {
-        proxy_accept_loop(listener, proxy_name, session, state_loop).await;
-    });
-    session_for_insert.proxies.lock().unwrap().insert(
-        np.proxy_name.clone(),
-        ProxyEntry {
-            handle,
-            kind: np.r#type,
-        },
-    );
-    if let Some(domains) = &np.custom_domains {
-        let mut map = session_for_insert.proxy_domains.lock().unwrap();
-        for d in domains {
+    // 登记：vhost 域名映射 + 会话内条目 + 全局归属索引。
+    if !domains.is_empty() {
+        let mut map = session.proxy_domains.lock().unwrap();
+        for d in &domains {
             map.insert(d.clone(), np.proxy_name.clone());
         }
     }
-    state.index_proxy(&np.proxy_name, &session_for_insert.run_id);
-    tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (tcp)");
+    session
+        .proxies
+        .lock()
+        .unwrap()
+        .insert(np.proxy_name.clone(), ProxyEntry { handle, kind });
+    state.index_proxy(&np.proxy_name, &session.run_id);
+    match kind {
+        ProxyType::Udp => {
+            tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (udp)")
+        }
+        ProxyType::Tcp => {
+            tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (tcp)")
+        }
+        other => tracing::info!(proxy = %np.proxy_name, typ = ?other, "proxy registered (vhost)"),
+    }
     Ok(())
 }
 

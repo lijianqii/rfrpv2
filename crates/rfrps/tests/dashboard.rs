@@ -1,41 +1,25 @@
 //! M5：Dashboard / 指标集成测试。
 
+mod common;
+
 use std::time::Duration;
 
 use base64::Engine;
-use rfrp_common::config::{
-    DashboardSection, LogSection, ProxySection, ServerConfig, ServerSection,
-};
+use common::*;
+use rfrp_common::config::{DashboardSection, ServerConfig};
 use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 fn server_config(dashboard_port: u16) -> ServerConfig {
-    ServerConfig {
-        server: ServerSection {
-            bind_addr: "127.0.0.1".into(),
-            bind_port: 0,
-            token: "".into(),
-            tls_enable: false,
-            tls_cert: None,
-            tls_key: None,
-            work_conn_tls: false,
-            tcp_keepalive_secs: None,
-        },
-        dashboard: Some(DashboardSection {
-            addr: format!("127.0.0.1:{dashboard_port}"),
-            user: "admin".into(),
-            password: "secret123".into(),
-        }),
-        proxy: ProxySection::default(),
-        log: LogSection::default(),
-    }
+    let mut cfg = base_server_config();
+    cfg.dashboard = Some(DashboardSection {
+        addr: format!("127.0.0.1:{dashboard_port}"),
+        user: "admin".into(),
+        password: "secret123".into(),
+    });
+    cfg
 }
 
 async fn start_server(port: u16) -> (JoinHandle<()>, std::net::SocketAddr) {

@@ -5,6 +5,8 @@
 //!
 //! 对外入口：[`Client`]（长驻运行、指数退避重连），CLI 覆盖见 `cli` 模块。
 
+#![forbid(unsafe_code)]
+
 pub mod cli;
 pub mod client;
 pub mod control;

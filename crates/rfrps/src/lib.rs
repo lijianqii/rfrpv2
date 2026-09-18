@@ -6,6 +6,8 @@
 //!
 //! 对外入口：[`Server`]（accept 循环 + 优雅退出），CLI 覆盖见 `cli` 模块。
 
+#![forbid(unsafe_code)]
+
 pub mod cli;
 pub mod control;
 pub mod dashboard;

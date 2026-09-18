@@ -39,6 +39,13 @@ pub struct ServerSection {
     /// 用于空闲长连接（SSH/RDP）的断线感知；Windows 亦生效。
     #[serde(default)]
     pub tcp_keepalive_secs: Option<u64>,
+    /// 心跳发送间隔（秒），缺省 30。
+    /// 弱网/高延迟链路可调大以降低误判断连的概率（见 §8.3）。
+    #[serde(default)]
+    pub heartbeat_interval_secs: Option<u64>,
+    /// 心跳响应等待超时（秒），缺省 10；必须小于 `heartbeat_interval_secs`。
+    #[serde(default)]
+    pub heartbeat_timeout_secs: Option<u64>,
 }
 
 impl Default for ServerSection {
@@ -52,6 +59,8 @@ impl Default for ServerSection {
             tls_key: None,
             work_conn_tls: default_true(),
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         }
     }
 }
@@ -62,6 +71,22 @@ impl ServerSection {
         let s = format!("{}:{}", self.bind_addr, self.bind_port);
         s.parse()
             .map_err(|e| config(format!("invalid server bind addr '{s}': {e}")))
+    }
+
+    /// 生效的心跳发送间隔（配置缺省时用默认值）。
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.heartbeat_interval_secs
+                .unwrap_or(crate::constants::HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// 生效的心跳响应超时（配置缺省时用默认值）。
+    pub fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.heartbeat_timeout_secs
+                .unwrap_or(crate::constants::HEARTBEAT_TIMEOUT),
+        )
     }
 }
 
@@ -178,6 +203,14 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// 校验 `heartbeat_interval_secs` / `heartbeat_timeout_secs`。
+    fn validate_heartbeat(&self) -> Result<()> {
+        super::validate_heartbeat(
+            self.server.heartbeat_interval_secs,
+            self.server.heartbeat_timeout_secs,
+        )
+    }
+
     /// 校验配置（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
         if !(1..=65535).contains(&self.server.bind_port) {
@@ -190,12 +223,21 @@ impl ServerConfig {
             return Err(config("server token must not be empty"));
         }
         if self.server.tls_enable || self.server.work_conn_tls {
-            let cert = self.server.tls_cert.as_deref().ok_or_else(|| {
-                config("tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key")
-            })?;
-            let key = self.server.tls_key.as_deref().ok_or_else(|| {
-                config("tls_enable=true or work_conn_tls=true requires both tls_cert and tls_key")
-            })?;
+            let missing_tls = format!(
+                "{} requires both tls_cert and tls_key{}",
+                super::tls_requirement_reason(self.server.tls_enable, self.server.work_conn_tls),
+                super::plaintext_hint(self.server.work_conn_tls)
+            );
+            let cert = self
+                .server
+                .tls_cert
+                .as_deref()
+                .ok_or_else(|| config(missing_tls.clone()))?;
+            let key = self
+                .server
+                .tls_key
+                .as_deref()
+                .ok_or_else(|| config(missing_tls.clone()))?;
             ensure_file_exists(cert, "tls_cert")?;
             ensure_file_exists(key, "tls_key")?;
         }
@@ -206,6 +248,7 @@ impl ServerConfig {
                 )));
             }
         }
+        self.validate_heartbeat()?;
         // allow_ports 格式必须可解析。
         let _ = self.proxy.parse_allow_ports()?;
         for p in [self.proxy.vhost_http_port, self.proxy.vhost_https_port]

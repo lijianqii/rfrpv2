@@ -40,6 +40,8 @@ async fn fatal_login_exits_without_reconnect() {
             server_port: addr.port(),
             run_id_file: Some(run_id_file.to_string_lossy().to_string()),
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
             ..Default::default()
         },
@@ -96,6 +98,8 @@ async fn fatal_login_version_mismatch_exits_without_reconnect() {
             server_port: addr.port(),
             run_id_file: Some(run_id_file.to_string_lossy().to_string()),
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
             ..Default::default()
         },

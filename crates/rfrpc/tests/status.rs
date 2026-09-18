@@ -8,41 +8,33 @@ use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// 极简 GET：返回响应体。
-async fn http_get(port: u16, path: &str) -> std::io::Result<String> {
+/// 极简 GET：返回（状态码, 响应体）。
+async fn http_get(port: u16, path: &str) -> std::io::Result<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).await?;
     s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
         .await?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await?;
     let text = String::from_utf8_lossy(&buf).into_owned();
-    Ok(text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_string())
-}
-
-/// 极简 GET：返回 HTTP 状态码（用于断言 429 等，不解析 body）。
-async fn http_status(port: u16, path: &str) -> u16 {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf)
+    let status = text
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    Ok((status, body))
 }
 
+/// 轮询直到端点返回 200 且响应体非空。
 async fn get_with_retry(port: u16, path: &str, timeout: Duration) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(body) = http_get(port, path).await {
-            if !body.is_empty() {
+        if let Ok((status, body)) = http_get(port, path).await {
+            if status == 200 && !body.is_empty() {
                 return body;
             }
         }
@@ -146,10 +138,10 @@ async fn status_endpoint_rate_limits_excess_requests() {
     let mut ok = 0u32;
     let mut limited = 0u32;
     for _ in 0..120 {
-        match http_status(status_port, "/healthz").await {
-            200 => ok += 1,
-            429 => limited += 1,
-            other => panic!("unexpected status {other}"),
+        match http_get(status_port, "/healthz").await.map(|(s, _)| s) {
+            Ok(200) => ok += 1,
+            Ok(429) => limited += 1,
+            other => panic!("unexpected status {other:?}"),
         }
     }
     assert!(

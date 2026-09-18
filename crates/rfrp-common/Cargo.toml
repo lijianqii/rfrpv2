@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "共享库：协议编解码、配置结构、TLS/鉴权、错误类型与通用工具"
 
+[features]
+# 测试辅助（测试端口分配）。仅由各 crate 的 dev-dependencies 启用，
+# 不影响发布产物与其依赖树。
+test-support = []
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }

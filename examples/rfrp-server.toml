@@ -10,6 +10,8 @@ tls_cert = "./cert.pem"          # 控制链路证书（相对配置文件目录
 tls_key  = "./key.pem"
 work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
 tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）
+heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
+heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps<->rfrpc 控制连接

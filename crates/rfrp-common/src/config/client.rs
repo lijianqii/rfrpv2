@@ -1,7 +1,9 @@
 //! 客户端配置结构（DESIGN §9.2）。
 
 use crate::config::LogSection;
-use crate::constants::{MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, POOL_SIZE_WARN_THRESHOLD};
+use crate::constants::{
+    MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, POOL_SIZE_DEFAULT, POOL_SIZE_WARN_THRESHOLD,
+};
 use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
 use serde::Deserialize;
@@ -15,7 +17,7 @@ fn default_true() -> bool {
     true
 }
 fn default_pool_size() -> u32 {
-    1
+    POOL_SIZE_DEFAULT
 }
 
 /// 简单的域名格式校验（字母/数字/连字符，标签长度限制）。
@@ -55,6 +57,13 @@ pub struct ClientSection {
     /// 用于空闲长连接（SSH/RDP）的断线感知；Windows 亦生效。
     #[serde(default)]
     pub tcp_keepalive_secs: Option<u64>,
+    /// 心跳发送间隔（秒），缺省 30。
+    /// 弱网/高延迟链路或希望更快感知服务端失联时可调小（见 §8.3）。
+    #[serde(default)]
+    pub heartbeat_interval_secs: Option<u64>,
+    /// 心跳响应等待超时（秒），缺省 10；必须小于 `heartbeat_interval_secs`。
+    #[serde(default)]
+    pub heartbeat_timeout_secs: Option<u64>,
     /// 可选状态端点地址（如 `"127.0.0.1:7400"`）：提供 `/`、`/api/status`、`/metrics`。
     /// 默认关闭；仅只读、无鉴权，建议绑定回环地址。
     #[serde(default)]
@@ -67,6 +76,22 @@ impl ClientSection {
         let s = format!("{}:{}", self.server_addr, self.server_port);
         s.parse()
             .map_err(|e| config(format!("invalid server addr '{s}': {e}")))
+    }
+
+    /// 生效的心跳发送间隔（配置缺省时用默认值）。
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.heartbeat_interval_secs
+                .unwrap_or(crate::constants::HEARTBEAT_INTERVAL),
+        )
+    }
+
+    /// 生效的心跳响应超时（配置缺省时用默认值）。
+    pub fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.heartbeat_timeout_secs
+                .unwrap_or(crate::constants::HEARTBEAT_TIMEOUT),
+        )
     }
 }
 
@@ -176,6 +201,10 @@ impl ClientConfig {
                 )));
             }
         }
+        super::validate_heartbeat(
+            self.client.heartbeat_interval_secs,
+            self.client.heartbeat_timeout_secs,
+        )?;
         if let Some(addr) = &self.client.status_addr {
             addr.parse::<std::net::SocketAddr>()
                 .map_err(|e| config(format!("invalid status_addr '{addr}': {e}")))?;
@@ -188,9 +217,11 @@ impl ClientConfig {
                 .map(|s| s.is_empty())
                 .unwrap_or(true)
         {
-            return Err(config(
-                "tls_server_name required when tls_enable or work_conn_tls is true",
-            ));
+            return Err(config(format!(
+                "{} requires tls_server_name{}",
+                super::tls_requirement_reason(self.client.tls_enable, self.client.work_conn_tls),
+                super::plaintext_hint(self.client.work_conn_tls)
+            )));
         }
         if let Some(ca) = &self.client.tls_ca {
             if !Path::new(ca).is_file() {

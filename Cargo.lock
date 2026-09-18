@@ -759,6 +759,7 @@ dependencies = [
  "base64",
  "futures",
  "httparse",
+ "libc",
  "rfrp-common",
  "rfrps",
  "serde_json",

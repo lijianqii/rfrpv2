@@ -12,22 +12,18 @@ use rfrp_common::config::ClientProxy;
 use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 static TMP: AtomicU64 = AtomicU64::new(0);
 
-async fn start_server_on(port: u16) -> (JoinHandle<()>, SocketAddr) {
+async fn start_server_on(port: u16) -> (TestServer, SocketAddr) {
     let mut last_err = None;
     for _ in 0..40 {
         let cfg = server_config(port);
         match Server::new(cfg).await {
             Ok(server) => {
-                let a = server.local_addr();
-                let task = tokio::spawn(async move {
-                    let _ = server.run().await;
-                });
-                return (task, a);
+                let server = server.with_grace(Duration::from_millis(500));
+                return TestServer::spawn(server).await;
             }
             Err(e) => {
                 last_err = Some(e);
@@ -47,7 +43,7 @@ async fn start_client(
     server_addr: SocketAddr,
     proxies: Vec<ClientProxy>,
     run_id_file: PathBuf,
-) -> JoinHandle<()> {
+) -> TestClient {
     let cfg = client_config(
         server_addr,
         proxies,
@@ -95,7 +91,9 @@ async fn client_reconnects_and_recovers_proxy_after_server_restart() {
         .await
         .expect("proxy works before server crash");
 
-    srv1.abort();
+    // 优雅重启（等价 SIGTERM + 同端口重新拉起）：必须走优雅关闭，否则旧监听/旧会话
+    // 会作为僵尸任务留在同进程内，用例要么被旧会话假性服务（假通过），要么永远等不到恢复。
+    srv1.stop().await;
     let (srv2, _) = start_server_on(addr.port()).await;
 
     let recovered = retry_until(|| try_echo(addr, remote, b"after"), Duration::from_secs(15)).await;
@@ -105,7 +103,7 @@ async fn client_reconnects_and_recovers_proxy_after_server_restart() {
     );
 
     srv2.abort();
-    cli.abort();
+    cli.stop().await;
     let _ = std::fs::remove_file(run_id_file);
 }
 
@@ -131,7 +129,7 @@ async fn client_reconnects_and_recovers_multiple_proxies() {
     try_echo(addr, r1, b"to-ssh").await.unwrap();
     try_echo(addr, r2, b"to-web").await.unwrap();
 
-    srv1.abort();
+    srv1.stop().await;
     let (srv2, _) = start_server_on(addr.port()).await;
 
     let recovered = retry_until(
@@ -149,7 +147,7 @@ async fn client_reconnects_and_recovers_multiple_proxies() {
     );
 
     srv2.abort();
-    cli.abort();
+    cli.stop().await;
     let _ = std::fs::remove_file(run_id_file);
 }
 

@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::*;
@@ -255,11 +256,12 @@ async fn tcp_proxy_connection_cap_enforced() {
         "proxy should become ready"
     );
 
-    // 占用两个活跃连接。
-    let mut u1 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
-    let mut u2 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
-    let _ = &mut u1;
-    let _ = &mut u2;
+    // 占用两个活跃连接：每次建连后都完成一次 echo，证明该连接确实进入了派发路径
+    // （活跃计数已递增）。前置探针连接的释放是异步的，会被上限拒绝的连接重试即可，
+    // 避免用例依赖时序（否则偶发早退 / 偶发假通过）。
+    let mut u1 = connect_and_echo(addr, remote, b"1").await;
+    let mut u2 = connect_and_echo(addr, remote, b"2").await;
+    let _ = (&mut u1, &mut u2);
 
     // 第三个连接应被连接上限拒绝（立即关闭）。
     let mut u3 = TcpStream::connect((addr.ip(), remote)).await.unwrap();
@@ -277,6 +279,33 @@ async fn tcp_proxy_connection_cap_enforced() {
     drop(u2);
     srv.abort();
     cli.abort();
+}
+
+/// 建立一条用户连接并完成一次 echo；被连接上限拒绝时短暂重试。
+async fn connect_and_echo(addr: SocketAddr, remote_port: u16, data: &[u8]) -> TcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let attempt = async {
+            let mut user = TcpStream::connect((addr.ip(), remote_port)).await?;
+            user.write_all(data).await?;
+            let mut buf = vec![0u8; data.len()];
+            user.read_exact(&mut buf).await?;
+            if buf != data {
+                return Err(std::io::Error::other("echo mismatch"));
+            }
+            Ok::<TcpStream, std::io::Error>(user)
+        }
+        .await;
+        match attempt {
+            Ok(user) => return user,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("could not establish a counted connection: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
 #[tokio::test]

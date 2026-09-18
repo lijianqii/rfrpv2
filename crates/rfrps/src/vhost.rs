@@ -141,13 +141,16 @@ async fn route_and_dispatch(
     stream: BoxedStream,
     state: Arc<ServerState>,
 ) -> Result<()> {
+    let mut stream = stream;
     // 域名大小写不敏感，统一小写后路由。
     let host = host.to_lowercase();
     let (session, proxy_name) = match find_proxy_by_domain(&state, &host) {
         Some(x) => x,
         None => {
-            tracing::warn!(host = %host, "no vhost proxy matched, closing");
-            return Ok(());
+            tracing::warn!(host = %host, "no vhost proxy matched, returning 404");
+            // 返回 404 而不是静默断连：用户/上游 LB 能明确区分"没有这个 vhost"与
+            // "链路故障"，也避免浏览器显示连接重置。
+            return respond_not_found(&mut stream).await;
         }
     };
 
@@ -159,11 +162,26 @@ async fn route_and_dispatch(
         .map(|e| e.kind == expected_kind)
         .unwrap_or(false);
     if !kind_ok {
-        tracing::warn!(host = %host, proxy = %proxy_name, "proxy type mismatch, closing");
-        return Ok(());
+        tracing::warn!(host = %host, proxy = %proxy_name, "proxy type mismatch, returning 404");
+        return respond_not_found(&mut stream).await;
     }
 
     dispatch_user_connection(proxy_name, stream, session, state);
+    Ok(())
+}
+
+/// 路由失败时回一个最小 404（HTTP/1.1 + Connection: close），随后关闭连接。
+///
+/// HTTPS vhost 的 TLS 已在 rfrps 终止，这里写出的明文响应会经 TLS 加密回给用户。
+async fn respond_not_found(stream: &mut BoxedStream) -> Result<()> {
+    rfrp_common::util::http::write_response(
+        stream,
+        404,
+        "text/plain; charset=utf-8",
+        "404 Not Found: no rfrp proxy matched this vhost\n",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -216,7 +234,9 @@ where
                     .and_then(|h| std::str::from_utf8(h.value).ok())
                     .map(|h| strip_port(h).to_string());
                 let stream: BoxedStream = Box::new(PrependStream::new(buf, Box::new(stream)));
-                return Ok(host.map(|h| (h, stream)));
+                // HTTP/1.1 要求 Host 头；缺失时用空 host 走路由，由路由层回 404，
+                // 而不是静默断连（用户能看到明确原因）。
+                return Ok(Some((host.unwrap_or_default(), stream)));
             }
             Ok(httparse::Status::Partial) => {
                 if buf.len() > 64 * 1024 {

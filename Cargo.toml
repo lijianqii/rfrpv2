@@ -41,5 +41,9 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
+
+# 注意：这里**不**设置 `panic = "abort"`。
+# 服务端/客户端以“每条连接一个任务”的方式运行，panic=abort 会让任何一个任务的
+# panic（例如 PoisonError 上的 unwrap）直接终止整个进程。保留 unwind 后，任务级
+# panic 只影响该任务，由 tokio 转换为 JoinError，进程继续服务其他连接。

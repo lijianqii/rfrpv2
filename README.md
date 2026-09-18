@@ -188,6 +188,15 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
   [client]            # 或 [server]
   tcp_keepalive_secs = 30
   ```
+- **心跳间隔可配**：控制链路默认 30s 发一次心跳、10s 未收到回应判定失联。弱网/高延迟链路可调大，同城直连想更快感知失联可调小（`heartbeat_timeout_secs` 必须小于 `heartbeat_interval_secs`）：
+  ```toml
+  [server]                      # 或 [client]，两端各自生效
+  heartbeat_interval_secs = 30
+  heartbeat_timeout_secs = 10
+  ```
+- **HTTP vhost 按连接路由**：rfrps 只按**首个请求**的 `Host`（HTTPS 优先 SNI）选择后端，之后整条连接透传。
+  因此不要在同一条 HTTP/1.1 keep-alive 连接上混用多个域名；未匹配到代理的请求会收到 `404 Not Found`
+  （而不是被静默断连）。
 
 ## 排障
 
@@ -238,6 +247,7 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
 ### 控制连接与重连
 
 - **控制连接异常**：客户端每 30s 心跳、10s 未收到回应判定失联并重连（指数退避 1s→30s）；
+  两个参数均可配置（`heartbeat_interval_secs` / `heartbeat_timeout_secs`，见"注意事项"）；
   已建立的数据连接（SSH/RDP 会话）在控制面重连期间**不受影响**（有集成测试覆盖）。
 - **RTT 观测**：`rfrp_rtt_ms` / `rfrp_client_rtt_ms` 给出控制链路往返时延，可用于判断链路质量与抖动。
 

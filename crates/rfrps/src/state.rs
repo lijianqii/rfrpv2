@@ -1,4 +1,18 @@
 //! 服务端共享状态与待处理工作连接。
+//!
+//! # 锁顺序
+//!
+//! 本结构被所有 accept / 控制 / 数据面任务共享，加锁顺序必须统一，否则会出现
+//! 反向持锁导致的死锁。已确立的顺序（从左到右，不可反向获取）：
+//!
+//! ```text
+//! proxy_index → sessions → session.proxies / session.pools / session.proxy_domains
+//! ```
+//!
+//! 即：`session_for_proxy` 先 `proxy_index` 再 `sessions`；`gauges` / `status_json`
+//! 先 `sessions` 再逐个会话的内部表。需要跨层操作时（如会话替换后的清理），
+//! 先收集结果、**释放锁之后**再获取另一把锁：见 control.rs 中 `cleanup` 的调用方式。
+//! `pending` / `udp` / `proxy_stats` / `login_failures` 彼此独立，不参与上述嵌套。
 
 use std::collections::HashMap;
 use std::net::IpAddr;

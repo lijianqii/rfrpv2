@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rfrp_common::config::{
@@ -14,10 +15,142 @@ use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
+/// 把进程的 fd 软上限提升到硬上限（best-effort，失败静默忽略）。
+///
+/// 同一测试二进制里的用例默认并行执行，每个用例都会拉起 server/client/echo 与
+/// 若干连接；macOS 默认软上限仅 256，**先耗尽 fd 的用例会随机报
+/// `TooManyOpenFiles` / `ConnectionReset` / 连接超时**，看起来像协议 bug。
+/// 在首次分配端口/启动服务前把软上限提到硬上限（通常为 unlimited）。
+fn raise_fd_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: getrlimit/setrlimit 接收本栈上的合法指针，且不持有任何锁。
+            unsafe {
+                let mut lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0
+                    && lim.rlim_cur < lim.rlim_max
+                {
+                    lim.rlim_cur = lim.rlim_max;
+                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+            }
+        }
+    });
+}
+
+/// 取一个测试用端口（实现见 [`rfrp_common::testutil::free_port`]）。
 pub fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+    raise_fd_limit();
+    rfrp_common::testutil::free_port()
+}
+
+/// 测试用服务端句柄。
+///
+/// 退出统一走**优雅关闭令牌**而不是 `abort()`：`Server::run` 里的代理监听、
+/// 控制写任务等是 `tokio::spawn` 出来的独立任务，硬 abort 只会丢下持有端口与
+/// 会话的僵尸任务（表现为"重启后旧端口仍被占用"或"旧会话仍能服务连接"），
+/// 使重连类用例产生假通过/假失败。取消令牌则会走完整的会话清理路径。
+pub struct TestServer {
+    pub addr: SocketAddr,
+    shutdown: CancellationToken,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TestServer {
+    /// 启动一个已构造好的 [`Server`]（供需要自定义绑定/重试的用例复用）。
+    pub async fn spawn(server: Server) -> (TestServer, SocketAddr) {
+        let addr = server.local_addr();
+        let shutdown = server.shutdown_token();
+        let task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        (
+            TestServer {
+                addr,
+                shutdown,
+                task: Mutex::new(Some(task)),
+            },
+            addr,
+        )
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// 触发优雅退出（等价收到 SIGTERM），不等待结束。
+    pub fn abort(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// 触发优雅退出并等待 accept 循环返回（最多 5s）。
+    pub async fn stop(&self) {
+        self.stop_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    /// 等待 accept 循环返回（不触发退出）。
+    ///
+    /// 用于测试自行取消退出令牌后等待收尾；若任务句柄已被 [`Self::stop`] 取走，
+    /// 则立即返回。
+    pub async fn wait(&self) {
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    pub async fn stop_with_timeout(&self, timeout: Duration) {
+        self.shutdown.cancel();
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
+            let _ = tokio::time::timeout(timeout, task).await;
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// 测试用客户端句柄（语义同 [`TestServer`]：优雅退出优先）。
+pub struct TestClient {
+    shutdown: CancellationToken,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TestClient {
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// 触发优雅退出（等价收到 SIGTERM），不等待结束。
+    pub fn abort(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// 触发优雅退出并等待客户端任务结束（最多 5s）。
+    pub async fn stop(&self) {
+        self.shutdown.cancel();
+        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        }
+    }
+}
+
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 pub async fn spawn_echo() -> u16 {
@@ -45,6 +178,8 @@ pub fn server_config(bind_port: u16) -> ServerConfig {
             tls_key: None,
             work_conn_tls: false,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         },
         dashboard: None,
         proxy: ProxySection::default(),
@@ -80,6 +215,8 @@ pub fn client_config(
             work_conn_tls: false,
             run_id_file,
             tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
             status_addr: None,
         },
         proxies,
@@ -87,36 +224,35 @@ pub fn client_config(
     }
 }
 
-pub async fn start_server(cfg: ServerConfig) -> (JoinHandle<()>, SocketAddr) {
-    let server = Server::new(cfg).await.unwrap();
-    let addr = server.local_addr();
-    let task = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    (task, addr)
+/// 启动测试服务端。宽限期取 500ms：退出路径不必让用例等满 30s 默认值。
+pub async fn start_server(cfg: ServerConfig) -> (TestServer, SocketAddr) {
+    raise_fd_limit();
+    let server = Server::new(cfg)
+        .await
+        .unwrap()
+        .with_grace(Duration::from_millis(500));
+    TestServer::spawn(server).await
 }
 
 pub async fn start_server_with_grace(
     cfg: ServerConfig,
     grace: Duration,
-) -> (
-    JoinHandle<()>,
-    SocketAddr,
-    tokio_util::sync::CancellationToken,
-) {
+) -> (TestServer, SocketAddr) {
     let server = Server::new(cfg).await.unwrap().with_grace(grace);
-    let addr = server.local_addr();
-    let sd = server.shutdown_token();
-    let task = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    (task, addr, sd)
+    TestServer::spawn(server).await
 }
 
-pub async fn start_client(cfg: ClientConfig) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let _ = Client::new(cfg).unwrap().run().await;
-    })
+pub async fn start_client(cfg: ClientConfig) -> TestClient {
+    raise_fd_limit();
+    let client = Client::new(cfg).unwrap();
+    let shutdown = client.shutdown_token();
+    let task = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+    TestClient {
+        shutdown,
+        task: Mutex::new(Some(task)),
+    }
 }
 
 /// 轮询直到代理端口可正常 echo，用于替代固定 sleep。
