@@ -27,6 +27,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
         metrics: Arc::new(Metrics::new()),
+        packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout,
     })
@@ -35,7 +36,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
 #[tokio::test]
 async fn sweep_removes_expired_session_and_pending() {
     let proxy = test_proxy(Duration::from_millis(50), Duration::from_millis(50)).await;
-    let (tx, _rx) = mpsc::channel::<Bytes>(4);
+    let (tx, _rx) = mpsc::channel::<UdpPacket>(4);
     let old = Instant::now() - Duration::from_secs(1);
 
     proxy.sessions.lock().unwrap().insert(
@@ -92,7 +93,7 @@ async fn sweep_removes_expired_session_and_pending() {
 #[tokio::test]
 async fn sweep_keeps_newer_pending_for_same_client() {
     let proxy = test_proxy(Duration::from_millis(50), Duration::from_millis(50)).await;
-    let (tx, _rx) = mpsc::channel::<Bytes>(4);
+    let (tx, _rx) = mpsc::channel::<UdpPacket>(4);
     let old = Instant::now() - Duration::from_secs(1);
     let client: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
@@ -142,7 +143,7 @@ async fn datagram_forwarded_to_paired_session() {
     let state = ServerState::new();
     let peer: SocketAddr = "127.0.0.1:1001".parse().unwrap();
 
-    let (tx, mut rx) = mpsc::channel::<Bytes>(4);
+    let (tx, mut rx) = mpsc::channel::<UdpPacket>(4);
     proxy.sessions.lock().unwrap().insert(
         peer,
         UdpSession {
@@ -166,7 +167,7 @@ async fn datagram_delivered_to_pending_session() {
     let state = ServerState::new();
     let peer: SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
-    let (tx, mut rx) = mpsc::channel::<Bytes>(4);
+    let (tx, mut rx) = mpsc::channel::<UdpPacket>(4);
     proxy.pending_by_id.lock().unwrap().insert(
         5,
         PendingUdp {
@@ -193,8 +194,8 @@ async fn datagram_dropped_when_session_channel_full() {
     let state = ServerState::new();
     let peer: SocketAddr = "127.0.0.1:1004".parse().unwrap();
 
-    let (tx, _keep_rx) = mpsc::channel::<Bytes>(1);
-    tx.try_send(Bytes::from_static(&[0u8]))
+    let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
         .expect("fill channel");
     proxy.sessions.lock().unwrap().insert(
         peer,
@@ -229,8 +230,8 @@ async fn datagram_dropped_when_pending_channel_full() {
     let state = ServerState::new();
     let peer: SocketAddr = "127.0.0.1:1005".parse().unwrap();
 
-    let (tx, _keep_rx) = mpsc::channel::<Bytes>(1);
-    tx.try_send(Bytes::from_static(&[0u8]))
+    let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
         .expect("fill channel");
     proxy.pending_by_id.lock().unwrap().insert(
         7,
@@ -309,7 +310,7 @@ async fn datagram_dropped_when_pending_limit_reached() {
     let state = ServerState::new();
 
     for i in 0..MAX_PENDING_UDP_SESSIONS {
-        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        let (tx, rx) = mpsc::channel::<UdpPacket>(4);
         let client: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 20000 + i as u16));
         proxy.pending_by_id.lock().unwrap().insert(
             i as u64 + 1,

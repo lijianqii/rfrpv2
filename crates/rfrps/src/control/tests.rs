@@ -67,6 +67,7 @@ async fn cleanup_clears_proxy_domains() {
             pending_by_id: Mutex::new(HashMap::new()),
             pending_client: Mutex::new(HashMap::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            packet_pool: Arc::new(Mutex::new(Vec::new())),
             session_timeout: std::time::Duration::from_secs(60),
             pending_timeout: std::time::Duration::from_secs(10),
         }),

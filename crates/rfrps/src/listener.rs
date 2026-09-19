@@ -11,7 +11,7 @@ use rfrp_common::protocol::msg::*;
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::counting::{CountingStream, ExtraCounters};
-use rfrp_common::util::stream::{BoxedStream, PrependStream};
+use rfrp_common::util::stream::{AsyncStream, BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
@@ -163,7 +163,7 @@ async fn proxy_accept_loop(
                             tracing::warn!(%proxy_name, %peer, error = %e, "failed to configure user TCP stream");
                         }
                         tracing::debug!(%proxy_name, %peer, "user connected");
-                        dispatch_user_connection(proxy_name.clone(), Box::new(user), session.clone(), state.clone());
+                        dispatch_user_connection(proxy_name.clone(), user, session.clone(), state.clone());
                     }
                     Err(e) => {
                         let backoff = retry.record_err();
@@ -232,12 +232,14 @@ fn probe_alive(mut work: BoxedStream) -> std::result::Result<BoxedStream, ()> {
 
 /// 统一处理一条用户连接：优先命中预热池，否则登记 pending 并按需请求工作连接。
 /// 桥接与 ReqWorkConn 均放入独立任务，避免阻塞 accept 循环。
-pub(crate) fn dispatch_user_connection(
+pub(crate) fn dispatch_user_connection<S>(
     proxy_name: String,
-    user: BoxedStream,
+    user: S,
     session: Arc<Session>,
     state: Arc<ServerState>,
-) {
+) where
+    S: AsyncStream + 'static,
+{
     // 并发连接数兜底（防 DoS）：原子地检查并递增，避免并发尖峰突破上限。
     let max = state.max_active.load(std::sync::atomic::Ordering::Relaxed);
     let accepted = state
@@ -270,7 +272,7 @@ pub(crate) fn dispatch_user_connection(
     stats
         .connections_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let user = Box::new(
+    let user: BoxedStream = Box::new(
         CountingStream::new(
             user,
             metrics.bytes_up.clone(),

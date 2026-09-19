@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::stream::BoxedStream;
-
 /// 本地累计达到该字节数后写入全局计数器。
 ///
 /// `bytes_up` / `bytes_down` 是所有连接共享的原子变量；原实现每个读写块都
@@ -19,6 +17,13 @@ const FLUSH_THRESHOLD: u64 = 256 * 1024;
 /// 距上次写入全局计数器的最大时间：保证低速长连接（如 SSH）在传输中也能
 /// 及时反映到监控，而不是等到连接关闭（监控滞后 ≤ 1s）。
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 时间检查节流：每 N 次读写才检查一次 `Instant::now()`。
+///
+/// Windows 上每次 `Instant::now()` 的成本比 Linux 更明显；RDP 这类小包长连接
+/// 每次读写都取时钟会持续消耗 CPU。字节阈值仍每次检查，因此高吞吐不会延迟刷新；
+/// 低速连接最多延迟 N 次 I/O 后才按时间刷新。
+const TIME_CHECK_EVERY_OPS: u32 = 32;
 
 /// 一组额外计数目标（与主计数器同时累加），用于每代理统计等。
 #[derive(Clone)]
@@ -32,8 +37,8 @@ pub struct ExtraCounters {
 ///
 /// 计数在本地累计，达到 `FLUSH_THRESHOLD` 或超过 `FLUSH_INTERVAL` 时批量
 /// 写入全局原子计数器；`Drop` 时做最后一次 flush。
-pub struct CountingStream {
-    inner: BoxedStream,
+pub struct CountingStream<S> {
+    inner: S,
     read: Arc<AtomicU64>,
     write: Arc<AtomicU64>,
     active: Arc<AtomicI64>,
@@ -42,11 +47,12 @@ pub struct CountingStream {
     pending_read: u64,
     pending_write: u64,
     last_flush: Instant,
+    ops_since_time_check: u32,
 }
 
-impl CountingStream {
+impl<S> CountingStream<S> {
     pub fn new(
-        inner: BoxedStream,
+        inner: S,
         read: Arc<AtomicU64>,
         write: Arc<AtomicU64>,
         active: Arc<AtomicI64>,
@@ -60,6 +66,7 @@ impl CountingStream {
             pending_read: 0,
             pending_write: 0,
             last_flush: Instant::now(),
+            ops_since_time_check: 0,
         }
     }
 
@@ -87,6 +94,7 @@ impl CountingStream {
             self.pending_write = 0;
         }
         self.last_flush = Instant::now();
+        self.ops_since_time_check = 0;
     }
 
     /// 达到字节阈值或时间阈值时刷新全局计数器。
@@ -94,16 +102,21 @@ impl CountingStream {
         if self.pending_read == 0 && self.pending_write == 0 {
             return;
         }
-        if self.pending_read >= FLUSH_THRESHOLD
-            || self.pending_write >= FLUSH_THRESHOLD
-            || self.last_flush.elapsed() >= FLUSH_INTERVAL
-        {
+        if self.pending_read >= FLUSH_THRESHOLD || self.pending_write >= FLUSH_THRESHOLD {
             self.flush();
+            return;
+        }
+        self.ops_since_time_check = self.ops_since_time_check.saturating_add(1);
+        if self.ops_since_time_check >= TIME_CHECK_EVERY_OPS {
+            self.ops_since_time_check = 0;
+            if self.last_flush.elapsed() >= FLUSH_INTERVAL {
+                self.flush();
+            }
         }
     }
 }
 
-impl Drop for CountingStream {
+impl<S> Drop for CountingStream<S> {
     fn drop(&mut self) {
         self.flush();
         self.active.fetch_sub(1, Ordering::Relaxed);
@@ -113,7 +126,10 @@ impl Drop for CountingStream {
     }
 }
 
-impl AsyncRead for CountingStream {
+impl<S> AsyncRead for CountingStream<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -130,7 +146,10 @@ impl AsyncRead for CountingStream {
     }
 }
 
-impl AsyncWrite for CountingStream {
+impl<S> AsyncWrite for CountingStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -196,8 +215,8 @@ mod tests {
 
     #[tokio::test]
     async fn flushes_globally_after_interval_for_slow_stream() {
-        // 低速长连接：即使未达字节阈值，超过刷新间隔后的下一次读写也应写入全局
-        // 计数器（保证监控实时性，而非等连接关闭）。
+        // 低速长连接：未达字节阈值时，时间检查按操作数节流；经过刷新间隔后，
+        // 下一次触发时间检查的读写会把累计字节写入全局计数器（而非等连接关闭）。
         let (mut a, b) = duplex(1024);
         let read = Arc::new(AtomicU64::new(0));
         let write = Arc::new(AtomicU64::new(0));
@@ -211,10 +230,15 @@ mod tests {
         assert_eq!(read.load(Ordering::Relaxed), 0);
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        a.write_all(b"x").await.unwrap();
-        let mut one = [0u8; 1];
-        counted.read_exact(&mut one).await.unwrap();
-        assert_eq!(read.load(Ordering::Relaxed), 3);
+        for _ in 0..TIME_CHECK_EVERY_OPS {
+            a.write_all(b"x").await.unwrap();
+            let mut one = [0u8; 1];
+            counted.read_exact(&mut one).await.unwrap();
+        }
+        assert!(
+            read.load(Ordering::Relaxed) > 2,
+            "time-based flush must eventually update the global counter"
+        );
     }
 
     #[tokio::test]
