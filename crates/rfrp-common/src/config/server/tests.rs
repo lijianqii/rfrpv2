@@ -60,9 +60,6 @@ fn server_validate_basic() {
         server: ServerSection {
             token: "x".into(),
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
@@ -73,8 +70,6 @@ fn server_validate_basic() {
         server: ServerSection {
             token: "x".into(),
             tls_enable: true,
-            tls_cert: None,
-            tls_key: None,
             ..Default::default()
         },
         ..Default::default()
@@ -89,9 +84,6 @@ fn work_conn_tls_requires_certs() {
         server: ServerSection {
             token: "x".into(),
             work_conn_tls: true,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
@@ -161,9 +153,6 @@ fn tls_cert_file_missing_rejected() {
             tls_cert: Some("./definitely-missing-cert.pem".into()),
             tls_key: Some("./definitely-missing-key.pem".into()),
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()
@@ -177,9 +166,6 @@ fn vhost_cert_file_missing_rejected() {
         server: ServerSection {
             token: "x".into(),
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         proxy: ProxySection {
@@ -198,11 +184,7 @@ fn dashboard_port_conflict_rejected() {
     let cfg = ServerConfig {
         server: ServerSection {
             token: "x".into(),
-            bind_port: 7000,
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         dashboard: Some(DashboardSection {
@@ -221,9 +203,6 @@ fn dashboard_nonloopback_valid_but_warns() {
         server: ServerSection {
             token: "x".into(),
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         dashboard: Some(DashboardSection {
@@ -239,11 +218,7 @@ fn dashboard_nonloopback_valid_but_warns() {
 fn empty_token_rejected() {
     let cfg = ServerConfig {
         server: ServerSection {
-            token: "".into(),
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
             ..Default::default()
         },
         ..Default::default()

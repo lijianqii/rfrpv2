@@ -39,10 +39,6 @@ fn cfg_for(path: &std::path::Path) -> ClientConfig {
     ClientConfig {
         client: ClientSection {
             run_id_file: Some(path.to_string_lossy().to_string()),
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
-            status_addr: None,
             ..Default::default()
         },
         ..Default::default()
@@ -56,7 +52,6 @@ fn new_fails_fast_when_tls_required_but_unconfigurable() {
     let cfg = ClientConfig {
         client: ClientSection {
             work_conn_tls: true,
-            tls_server_name: None,
             ..Default::default()
         },
         ..Default::default()

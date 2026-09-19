@@ -19,7 +19,6 @@ use tokio::time::{sleep, Duration};
 
 use crate::control::{ProxyEntry, Session};
 use crate::state::{PendingWork, ServerState};
-use crate::vhost::find_proxy_by_domain;
 use rfrp_common::util::control::{send_with_timeout, try_send};
 
 /// 端口是否在 `allow_ports` 允许范围内（fail-closed：配置解析失败视为不允许）。
@@ -60,7 +59,7 @@ pub async fn register_proxy(
     // 同名 vhost 请求被路由到类型不匹配的代理（用户只会看到 404）。
     // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
     for d in &domains {
-        if let Some((_, owner)) = find_proxy_by_domain(state, d) {
+        if let Some((_, owner)) = state.session_for_domain(d) {
             tracing::warn!(
                 proxy = %np.proxy_name, domain = %d, owner = %owner,
                 "vhost domain conflict, registration rejected"

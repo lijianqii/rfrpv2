@@ -80,14 +80,10 @@ async fn udp_proxy_with_tls_work_conn() {
         server: ServerSection {
             bind_addr: "127.0.0.1".into(),
             bind_port: 0,
-            token: "".into(),
-            tls_enable: false,
             tls_cert: Some(cert.to_string_lossy().to_string()),
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
+            ..Default::default()
         },
         dashboard: None,
         proxy: ProxySection {
@@ -105,16 +101,10 @@ async fn udp_proxy_with_tls_work_conn() {
         client: ClientSection {
             server_addr: addr.ip().to_string(),
             server_port: addr.port(),
-            token: "".into(),
-            tls_enable: false,
             tls_server_name: Some("localhost".into()),
             tls_ca: Some(ca.to_string_lossy().to_string()),
             work_conn_tls: true,
-            run_id_file: None,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
-            status_addr: None,
+            ..Default::default()
         },
         proxies: vec![udp_proxy("udp", echo_port, remote)],
         log: ClientLogSection::default(),

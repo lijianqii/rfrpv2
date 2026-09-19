@@ -24,14 +24,8 @@ fn server_config() -> ServerConfig {
         server: ServerSection {
             bind_addr: "127.0.0.1".into(),
             bind_port: 0,
-            token: "".into(),
-            tls_enable: false,
-            tls_cert: None,
-            tls_key: None,
             work_conn_tls: false,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
+            ..Default::default()
         },
         dashboard: None,
         proxy: ProxySection::default(),

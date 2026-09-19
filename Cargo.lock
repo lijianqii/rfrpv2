@@ -715,7 +715,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rfrp-bin"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "embed-resource",
  "libc",
@@ -732,7 +731,6 @@ dependencies = [
 name = "rfrp-common"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "criterion",
  "futures",
@@ -747,7 +745,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -774,7 +771,6 @@ dependencies = [
 name = "rfrps"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64",
  "futures",
  "httparse",

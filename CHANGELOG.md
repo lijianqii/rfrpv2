@@ -74,6 +74,18 @@
 
 ### Changed
 
+- **全工程整理（配置样板 / 测试辅助 / 依赖 / 工具）**：
+  - 测试与单测里的 `ServerSection` / `ClientSection` 字面量（32 处）改用
+    `..Default::default()` 收敛默认字段——上次新增心跳配置时被迫改动 24 处字面量，
+    今后新增配置字段不再需要这样扫一遍；
+  - 测试辅助按主题归位：`rfrpc/tests/common` 拆为 `mod.rs`（核心）+ `udp.rs` + `http.rs`
+    并统一再导出，`rfrps/tests` 的 `start_server` / `http_get` / `basic_auth` /
+    `dashboard_config` 收敛到 `tests/common`；
+  - `vhost::find_proxy_by_domain` 这层薄封装内联为 `ServerState::session_for_domain`
+    （上一轮已改成 O(1) 全局索引，封装已无独立语义），测试同步更名；
+  - 移除未使用的依赖：`rfrp-common` 的 `anyhow` / `uuid`、`rfrps` 与 `rfrp-bin` 的 `anyhow`；
+  - 新增 `scripts/bench-udp.py`（`burst` / `latency` 两个子命令），把此前散落在临时目录的
+    UDP 突发与延迟压测固化进仓库，`docs/BENCHMARKS.md` 补上复现方式与波动说明。
 - **代码整理（UDP 数据面与测试辅助）**：`util/udp` 按"socket 配置 / 逐帧原语 / 批量路径"
   分区，并删掉重复的分配版读取（只保留一个读取原语）；服务端 UDP 处理抽出
   `remove_pending` / `register_session` / `forward_to_client` / `drain_socket_batch`，

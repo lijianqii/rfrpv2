@@ -40,9 +40,7 @@ fn server_config(tls_enable: bool, work_conn_tls: bool, token: &str) -> ServerCo
             tls_cert: Some(cert.to_string_lossy().to_string()),
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
+            ..Default::default()
         },
         dashboard: None,
         proxy: ProxySection::default(),
@@ -67,11 +65,7 @@ fn client_config(
             tls_server_name: Some("localhost".into()),
             tls_ca: Some(cert.to_string_lossy().to_string()),
             work_conn_tls,
-            run_id_file: None,
-            tcp_keepalive_secs: None,
-            heartbeat_interval_secs: None,
-            heartbeat_timeout_secs: None,
-            status_addr: None,
+            ..Default::default()
         },
         proxies,
         log: ClientLogSection::default(),

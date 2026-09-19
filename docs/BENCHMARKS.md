@@ -44,6 +44,17 @@ cargo bench -p rfrp-common --bench forward
 - 端到端吞吐约为直连的 1/4：路径上有两次桥接（rfrps 一次、rfrpc 一次），每跳都是用户态
   拷贝 + 读写系统调用。这是当前最大的优化空间（Linux 可考虑 `splice` 零拷贝，需评估可移植性）。
 
+## 复现方式（UDP 通路）
+
+```bash
+cargo build --release
+scripts/bench-udp.py burst     # 单会话突发：端到端回收率 + 服务端 rfrp_udp_dropped_total
+scripts/bench-udp.py latency   # 200B 小包往返：直连 vs 代理（P50/P95/P99）
+```
+
+> 突发回收率对机器负载很敏感（同一台机器上实测 60%~97% 波动），因此脚本只打印数字、
+> 不做断言；`crates/rfrpc/tests/udp_burst.rs` 里另有一道 release 下的粗粒度闸门。
+
 ## 历史基线（2026-09-10，Debian x86_64，方法论不同）
 
 | Benchmark | 耗时 / 吞吐（中位数） | 说明 |

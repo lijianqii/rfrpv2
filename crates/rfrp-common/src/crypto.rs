@@ -193,7 +193,6 @@ mod tests {
     fn client_tls_requires_server_name() {
         let cfg = ClientSection {
             tls_enable: true,
-            tls_server_name: None,
             ..Default::default()
         };
         assert!(ClientTls::new(&cfg).is_err());

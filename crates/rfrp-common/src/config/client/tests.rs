@@ -91,7 +91,6 @@ fn work_conn_tls_requires_server_name() {
             server_port: 7000,
             token: "x".into(),
             work_conn_tls: true,
-            tls_server_name: None,
             ..Default::default()
         },
         ..Default::default()
@@ -158,7 +157,6 @@ fn tls_ca_file_missing_rejected() {
             server_addr: "s.example.com".into(),
             server_port: 7000,
             token: "x".into(),
-            work_conn_tls: false,
             tls_ca: Some("./definitely-missing-ca.pem".into()),
             ..Default::default()
         },
@@ -187,8 +185,6 @@ fn empty_token_rejected() {
         client: ClientSection {
             server_addr: "s.example.com".into(),
             server_port: 7000,
-            token: "".into(),
-            work_conn_tls: false,
             ..Default::default()
         },
         ..Default::default()
@@ -238,7 +234,6 @@ fn tcp_and_udp_may_share_remote_port() {
             server_addr: "s.example.com".into(),
             server_port: 7000,
             token: "x".into(),
-            work_conn_tls: false,
             ..Default::default()
         },
         proxies: vec![
@@ -283,7 +278,6 @@ fn duplicate_remote_port_within_same_protocol_fails() {
             server_addr: "s.example.com".into(),
             server_port: 7000,
             token: "x".into(),
-            work_conn_tls: false,
             ..Default::default()
         },
         proxies,

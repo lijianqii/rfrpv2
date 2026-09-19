@@ -15,7 +15,6 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::Session;
 use crate::listener::dispatch_user_connection;
 use crate::state::ServerState;
 
@@ -149,7 +148,7 @@ where
     };
     // SNI 优先（仅当 SNI 能命中代理时使用），否则回退到 Host 头。
     let host = match &sni {
-        Some(s) if find_proxy_by_domain(&state, s).is_some() => s.clone(),
+        Some(s) if state.session_for_domain(s).is_some() => s.clone(),
         _ => host,
     };
     route_and_dispatch(host, ProxyType::Https, stream, state).await
@@ -165,7 +164,7 @@ async fn route_and_dispatch(
     let mut stream = stream;
     // 域名大小写不敏感，统一小写后路由。
     let host = host.to_lowercase();
-    let (session, proxy_name) = match find_proxy_by_domain(&state, &host) {
+    let (session, proxy_name) = match state.session_for_domain(&host) {
         Some(x) => x,
         None => {
             tracing::warn!(host = %host, "no vhost proxy matched, returning 404");
@@ -281,17 +280,10 @@ fn strip_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-/// 按域名查找所属会话与代理名（O(1)，走全局域名索引）。
-pub(crate) fn find_proxy_by_domain(
-    state: &ServerState,
-    host: &str,
-) -> Option<(Arc<Session>, String)> {
-    state.session_for_domain(host)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::Session;
     use crate::state::ServerState;
     use tokio::sync::mpsc;
 
@@ -328,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn find_proxy_by_domain_finds_and_skips() {
+    fn session_for_domain_finds_and_skips() {
         let state = test_state();
         let s1 = test_session("r1", &["dev.example.com"]);
         let s2 = test_session("r2", &["other.example.com"]);
@@ -341,20 +333,21 @@ mod tests {
         state.index_domain("dev.example.com", "r1", "web");
         state.index_domain("other.example.com", "r2", "web");
 
-        let (session, proxy) =
-            find_proxy_by_domain(&state, "dev.example.com").expect("indexed domain");
+        let (session, proxy) = state
+            .session_for_domain("dev.example.com")
+            .expect("indexed domain");
         assert_eq!(proxy, "web");
         assert!(
             Arc::ptr_eq(&session, &s1),
             "must resolve to the owner session"
         );
 
-        assert!(find_proxy_by_domain(&state, "missing.example.com").is_none());
+        assert!(state.session_for_domain("missing.example.com").is_none());
 
         // 会话清理后索引必须失效（否则会命中已注销的会话）。
         state.unindex_domains(vec!["dev.example.com".to_string()]);
-        assert!(find_proxy_by_domain(&state, "dev.example.com").is_none());
-        assert!(find_proxy_by_domain(&state, "other.example.com").is_some());
+        assert!(state.session_for_domain("dev.example.com").is_none());
+        assert!(state.session_for_domain("other.example.com").is_some());
     }
 }
 
@@ -362,6 +355,7 @@ mod tests {
 mod head_tests {
     use super::*;
     use crate::control::ProxyEntry;
+    use crate::control::Session;
     use crate::state::ServerState;
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::mpsc;
