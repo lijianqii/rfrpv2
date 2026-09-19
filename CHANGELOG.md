@@ -70,6 +70,14 @@
 
 ### Changed
 
+- **UDP 数据面批量化（线格式不变）**：此前每个数据报都要经历"每包一次唤醒 + 每包两次 write
+  （TLS 下两个 record）+ 队列深度仅 16"，突发时服务端会大量丢包。现在：收包在同一唤醒内批量
+  drain、会话队列 64、服务端按批合并成一次 write、读侧一次 read 解析多帧、双端 UDP 接收缓冲
+  best-effort 调大（`UDP_*_BATCH` / `UDP_SESSION_QUEUE_DEPTH` / `UDP_SOCKET_RECV_BUF_BYTES`）。
+  **每包仍保留独立的 4 字节长度前缀，线格式未变，无需协议协商。**
+  实测单会话突发 2000×1000B（release、独立进程）：应用层丢包 1322 → 65，端到端回收 1.6% → 96.8%；
+  RDP 典型速率（≈1000 pps）下丢包为 0。回归用例见 `crates/rfrpc/tests/udp_burst.rs`（`#[ignore]`，
+  需 release 运行：`cargo test --release -p rfrpc --test udp_burst -- --ignored`）。
 - **代码整理**：`Server::new` 的监听/证书加载拆分为小函数；`register_proxy` 的
   TCP/UDP/vhost 三段重复逻辑合并为统一流程；TLS 缺证书的报错措辞抽到
   `config` 模块一处；测试端口分配（含"非 ephemeral 区间自增 + 可用性探测"）

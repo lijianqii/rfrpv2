@@ -103,6 +103,22 @@ pub const MAX_POOLED_WORK_CONNS_PER_PROXY: usize = 32;
 pub const MAX_PENDING_UDP_SESSIONS: usize = 256;
 /// 单个 UDP 包最大字节数（IPv4 UDP payload 上限）。
 pub const MAX_UDP_PACKET_SIZE: usize = 65507;
+/// 每个 UDP 会话的待发送队列深度（数据报个数）。
+///
+/// 服务端收包循环与"往工作连接写"的任务之间是队列解耦的：队列越深，越能吸收
+/// 视频/刷屏这类突发（实测深度 16 时，2000 包突发在应用层丢掉 1322 包）。
+/// 内存上界 = 深度 × 单包大小，正常 RDP 包（≈1.4 KB）约 90 KB/会话。
+pub const UDP_SESSION_QUEUE_DEPTH: usize = 64;
+/// 一次从 UDP socket 连续收取的最大数据报个数（收包循环内批量 drain，减少唤醒/系统调用）。
+pub const UDP_RECV_BATCH: usize = 64;
+/// 一次批量写工作连接的最大数据报个数（合并系统调用；每包仍保留独立的 4 字节长度前缀）。
+pub const UDP_WRITE_BATCH: usize = 32;
+/// 一次从工作连接批量解析的最大数据报个数（一次 read 解析多帧，避免每包一次唤醒）。
+pub const UDP_READ_BATCH: usize = 32;
+/// UDP socket 接收缓冲目标值（best-effort，内核可能按 rmem_max 截断）。
+///
+/// 突发时先由内核缓冲吸收，避免应用层队列还没腾出空间就丢包。
+pub const UDP_SOCKET_RECV_BUF_BYTES: usize = 1 << 20;
 
 /// 数据面桥接缓冲区大小（每方向，字节）。
 ///

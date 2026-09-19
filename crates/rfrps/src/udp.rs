@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rfrp_common::constants::{
-    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, UDP_SESSION_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS,
+    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, UDP_RECV_BATCH,
+    UDP_SESSION_QUEUE_DEPTH, UDP_SESSION_TIMEOUT, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::send_with_timeout;
-use rfrp_common::util::udp::{read_udp_frame_into, write_udp_frame};
+use rfrp_common::util::udp::{enlarge_recv_buffer, write_udp_frames_buffered, UdpFrameBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -65,6 +66,11 @@ pub async fn register_udp_proxy(
             });
         }
     };
+    // 突发时先由内核缓冲吸收（best-effort；内核按 rmem_max 截断）。
+    match enlarge_recv_buffer(&socket) {
+        Ok(bytes) => tracing::debug!(%proxy_name, bytes, "udp recv buffer enlarged"),
+        Err(e) => tracing::debug!(%proxy_name, error = %e, "failed to enlarge udp recv buffer"),
+    }
     let proxy = Arc::new(UdpProxy {
         socket: Arc::new(socket),
         sessions: Mutex::new(HashMap::new()),
@@ -108,6 +114,21 @@ async fn run_udp_listener(
                 match r {
                     Ok((n, peer)) => {
                         handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n]).await;
+                        // 同一唤醒内继续排空内核接收缓冲：减少任务唤醒与系统调用次数，
+                        // 突发时也更不容易把数据报堆到应用层队列里丢包（上限见 UDP_RECV_BATCH）。
+                        for _ in 1..UDP_RECV_BATCH {
+                            match proxy.socket.try_recv_from(&mut buf) {
+                                Ok((n, peer)) => {
+                                    handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n])
+                                        .await;
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => {
+                                    tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
+                                    break;
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
@@ -197,7 +218,7 @@ async fn handle_datagram(
 
     // 首个数据包：建立待配对项并请求工作连接，同时把该数据包先入队，
     // 避免工作连接建立期间丢包（DESIGN §8.6）。
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_DEPTH);
     let work_id = state.next_work_id();
     proxy
         .metrics
@@ -287,36 +308,41 @@ pub async fn handle_udp_work_conn(
     tracing::info!(client = %pending.client, work_id, "udp work connection established");
     let mut rx = pending.rx;
     let mut stream = stream;
-    // 复用下行帧缓冲，避免每包一次分配。
-    let mut frame_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
+    let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(UDP_WRITE_BATCH);
+    // 下行：一次 read 解析多帧，避免每包一次任务唤醒。
+    let mut reader = UdpFrameBuf::new();
+    let mut down: Vec<Vec<u8>> = Vec::with_capacity(UDP_READ_BATCH);
 
     loop {
         tokio::select! {
-            data = rx.recv() => {
-                match data {
-                    Some(d) => {
-                        touch_session(&proxy, pending.client);
-                        if let Err(e) = write_udp_frame(&mut stream, &d).await {
-                            tracing::warn!(work_id, error = %e, "udp write frame error");
-                            break;
-                        }
-                    }
-                    None => break,
+            n = rx.recv_many(&mut batch, UDP_WRITE_BATCH) => {
+                if n == 0 {
+                    break; // 通道关闭（会话结束）
                 }
+                touch_session(&proxy, pending.client);
+                if let Err(e) = write_udp_frames_buffered(&mut stream, &mut write_buf, &batch).await {
+                    tracing::warn!(work_id, error = %e, "udp write frames error");
+                    break;
+                }
+                batch.clear();
             }
-            r = read_udp_frame_into(&mut stream, &mut frame_buf) => {
+            r = reader.read_batch(&mut stream, &mut down, UDP_READ_BATCH) => {
                 match r {
-                    Ok(Some(())) => {
+                    Ok(n) if n > 0 => {
                         touch_session(&proxy, pending.client);
-                        proxy
-                            .metrics
-                            .bytes_down
-                            .fetch_add(frame_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = proxy.socket.send_to(&frame_buf, pending.client).await {
-                            tracing::warn!(work_id, error = %e, "udp send_to client error");
+                        for d in &down {
+                            proxy.metrics.bytes_down.fetch_add(
+                                d.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if let Err(e) = proxy.socket.send_to(d, pending.client).await {
+                                tracing::warn!(work_id, error = %e, "udp send_to client error");
+                            }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(_) => break, // EOF
                     Err(e) => {
                         tracing::warn!(work_id, error = %e, "udp read frame error");
                         break;

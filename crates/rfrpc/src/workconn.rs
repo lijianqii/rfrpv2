@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use futures::SinkExt;
-use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, WORK_CONN_TIMEOUT_RFRPC};
+use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, WORK_CONN_TIMEOUT_RFRPC};
 use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::FrameCodec;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
-use rfrp_common::util::udp::{read_udp_frame_into, write_udp_frame};
+use rfrp_common::util::udp::{enlarge_recv_buffer, write_udp_frame_buffered, UdpFrameBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
@@ -76,6 +76,10 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             return Ok(());
         }
         let work_conn_token = state.work_conn_token.lock().unwrap().clone();
+        // 本地服务回包（RDP 服务端 → 用户方向）也走这个 socket：突发时先由内核缓冲吸收。
+        if let Err(e) = enlarge_recv_buffer(&local) {
+            tracing::debug!(proxy = %req.proxy_name, error = %e, "failed to enlarge local udp recv buffer");
+        }
         framed
             .send(
                 Message::StartWorkConn(StartWorkConn {
@@ -147,19 +151,24 @@ async fn udp_bridge(
     req: &ReqWorkConn,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
-    // 复用下行帧缓冲，避免每包一次分配。
-    let mut frame_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    // 上行（本地 → 工作连接）写缓冲：合成一次 write，TLS 下即一个 record。
+    let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    // 下行：一次 read 解析多帧（突发时内核里通常已排好多个完整帧）。
+    let mut reader = UdpFrameBuf::new();
+    let mut down: Vec<Vec<u8>> = Vec::with_capacity(UDP_READ_BATCH);
     loop {
         tokio::select! {
-            r = read_udp_frame_into(&mut work_stream, &mut frame_buf) => {
+            r = reader.read_batch(&mut work_stream, &mut down, UDP_READ_BATCH) => {
                 match r {
-                    Ok(Some(())) => {
-                        if let Err(e) = local.send(&frame_buf).await {
-                            tracing::warn!(proxy = %req.proxy_name, error = %e, "udp send to local failed");
-                            break;
+                    Ok(n) if n > 0 => {
+                        for d in &down {
+                            if let Err(e) = local.send(d).await {
+                                tracing::warn!(proxy = %req.proxy_name, error = %e, "udp send to local failed");
+                                break;
+                            }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(_) => break, // EOF
                     Err(e) => {
                         tracing::warn!(proxy = %req.proxy_name, error = %e, "udp read frame error");
                         break;
@@ -169,7 +178,10 @@ async fn udp_bridge(
             r = local.recv(&mut buf) => {
                 match r {
                     Ok(n) => {
-                        if let Err(e) = write_udp_frame(&mut work_stream, &buf[..n]).await {
+                        if let Err(e) =
+                            write_udp_frame_buffered(&mut work_stream, &mut write_buf, &buf[..n])
+                                .await
+                        {
                             tracing::warn!(proxy = %req.proxy_name, error = %e, "udp write frame error");
                             break;
                         }
