@@ -10,6 +10,7 @@ description = "客户端：控制连接、代理注册、工作连接池化与�
 rfrp-common = { path = "../rfrp-common" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

@@ -5,15 +5,19 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::SinkExt;
-use rfrp_common::constants::{MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, WORK_CONN_TIMEOUT_RFRPC};
+use rfrp_common::constants::{
+    MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, UDP_RECV_BATCH, WORK_CONN_TIMEOUT_RFRPC,
+};
 use rfrp_common::error::{Error, Result};
 use rfrp_common::protocol::frame::FrameCodec;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::bridge::bridge;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
-use rfrp_common::util::udp::{enlarge_recv_buffer, write_udp_frame_buffered, UdpFrameBuf};
+use rfrp_common::util::udp::{append_udp_frame, enlarge_recv_buffer, UdpFrameBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
@@ -150,12 +154,13 @@ async fn udp_bridge(
     local: UdpSocket,
     req: &ReqWorkConn,
 ) -> Result<()> {
+    // 本地 UDP 收包缓冲：只在本任务内复用，不再每包分配。
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
-    // 上行（本地 → 工作连接）写缓冲：合成一次 write，TLS 下即一个 record。
+    // 上行（本地 → 工作连接）写缓冲：一批数据报合成一次 write，TLS 下即一个 record。
     let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
     // 下行：一次 read 解析多帧（突发时内核里通常已排好多个完整帧）。
     let mut reader = UdpFrameBuf::new();
-    let mut down: Vec<Vec<u8>> = Vec::with_capacity(UDP_READ_BATCH);
+    let mut down: Vec<Bytes> = Vec::with_capacity(UDP_READ_BATCH);
     loop {
         tokio::select! {
             r = reader.read_batch(&mut work_stream, &mut down, UDP_READ_BATCH) => {
@@ -178,11 +183,35 @@ async fn udp_bridge(
             r = local.recv(&mut buf) => {
                 match r {
                     Ok(n) => {
-                        if let Err(e) =
-                            write_udp_frame_buffered(&mut work_stream, &mut write_buf, &buf[..n])
-                                .await
-                        {
-                            tracing::warn!(proxy = %req.proxy_name, error = %e, "udp write frame error");
+                        write_buf.clear();
+                        if let Err(e) = append_udp_frame(&mut write_buf, &buf[..n]) {
+                            tracing::warn!(proxy = %req.proxy_name, error = %e, "udp frame encode error");
+                            break;
+                        }
+                        // 同一唤醒内继续 drain 本地 socket：RDP-UDP 突发时把多个数据报
+                        // 合并成一次工作连接写入；无更多数据时立即停止，不引入额外延迟。
+                        let mut batch_err = None;
+                        for _ in 1..UDP_RECV_BATCH {
+                            match local.try_recv(&mut buf) {
+                                Ok(n) => {
+                                    if let Err(e) = append_udp_frame(&mut write_buf, &buf[..n]) {
+                                        batch_err = Some(e);
+                                        break;
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => {
+                                    batch_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(e) = batch_err {
+                            tracing::warn!(proxy = %req.proxy_name, error = %e, "udp local recv/encode error");
+                            break;
+                        }
+                        if let Err(e) = work_stream.write_all(&write_buf).await {
+                            tracing::warn!(proxy = %req.proxy_name, error = %e, "udp write frames error");
                             break;
                         }
                     }

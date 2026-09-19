@@ -10,6 +10,7 @@ description = "服务端：控制连接、端口监听、工作连接路由、Da
 rfrp-common = { path = "../rfrp-common" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

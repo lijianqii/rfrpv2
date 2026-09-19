@@ -529,7 +529,7 @@ rfrp/
 
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
 > - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
-> - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 60`、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
+> - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 300`（可通过服务端 `udp_session_timeout_secs` 覆盖）、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
 > - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP）
 > - 代理注册重试（秒）：`PROXY_REGISTER_RETRY_INITIAL = 2`、`PROXY_REGISTER_RETRY_MAX = 8`（轮）、`PROXY_REGISTER_RETRY_MAX_DELAY = 30`
@@ -785,8 +785,9 @@ UDP 无连接，工作连接模型（一个用户连接对应一条工作连接�
 - rfrpc 收到 ReqWorkConn 后，建立到 rfrps 的 work TCP（同 TCP 代理），发 StartWorkConn，然后建立到 `local_ip:local_port` 的本地 UDP socket。
 - rfrps 将该 `<ip:port>` 的后续 UDP 包通过工作连接透传到 rfrpc；rfrpc 转发到本地 UDP socket。
 - 本地 UDP 响应包由 rfrpc 经工作连接回传 rfrps，rfrps 按会话映射发回原 `<ip:port>`。
-- 会话超时：某 `<ip:port>` **60s** 无活动则清理会话与对应工作连接（固定，不可配）。
-- **本地 UDP socket 生命周期**：rfrpc 侧为该会话建立的本地 UDP socket（连向 `local_ip:local_port`）**生命周期跟随工作连接**——工作连接关闭（TCP FIN 或 rfrps 主动断开）即立即关闭本地 UDP socket，释放端口资源。会话 60s 超时清理时，先关工作连接再关本地 socket。二者超时不一致时（如工作连接因 rfrps 侧异常提前 FIN，但会话未到 60s）以**工作连接关闭为准**，会话同步清理。
+- 会话超时：某 `<ip:port>` 无活动达到 `udp_session_timeout_secs`（默认 **300s**）则清理会话与对应工作连接。
+  RDP-UDP 在用户阅读/停顿期间可能长时间无数据，默认值取 300s 以避免频繁重建工作连接。
+- **本地 UDP socket 生命周期**：rfrpc 侧为该会话建立的本地 UDP socket（连向 `local_ip:local_port`）**生命周期跟随工作连接**——工作连接关闭（TCP FIN 或 rfrps 主动断开）即立即关闭本地 UDP socket，释放端口资源。会话超时清理时，先关工作连接再关本地 socket。二者超时不一致时（如工作连接因 rfrps 侧异常提前 FIN，但会话未到超时）以**工作连接关闭为准**，会话同步清理。
 - 工作连接承载方式：与 TCP 代理不同，UDP 在工作连接上仍用 8.2 的"首帧后透传字节流"模型，但需在字节流中区分每个 UDP 包边界——首版约定每个 UDP 包前加 **4 字节大端长度前缀**（u32），即工作连接上 UDP 数据帧格式为 `Length(4) + Data`。rfrps 与 rfrpc 双向按此分帧。
 - **单包大小限制**：单个 UDP 包最大 **65507 字节**（IPv4 UDP payload 上限，即 65535 − 20 IP头 − 8 UDP头）。Length 前缀值超过此上限视为协议错误，丢弃该帧并记日志（不断开工作连接，仅丢该包）。实际应用中 UDP 包通常 < 1472 字节（以太网 MTU 1500 − 20 − 8），超限包多为异常。
 
@@ -823,6 +824,7 @@ work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒
 tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）
 heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
+udp_session_timeout_secs = 300   # UDP 会话空闲超时（秒，默认 300；RDP-UDP 建议 300-600）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps↔rfrpc 控制连接
@@ -916,6 +918,7 @@ CLI 参数 > 配置文件 > 默认值。
 - **类型与字段匹配**：`type = http/https` 必须有 `custom_domains`；`type = tcp/udp` 必须有 `remote_port`。
 - **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时必须可解析为合法 IPv4/IPv6 地址（`std::net::IpAddr` 解析）。
 - **tcp_keepalive_secs 范围**：0–3600（0 = 禁用 keepalive）。
+- **udp_session_timeout_secs 范围**：1–86400（秒）；缺省 300。RDP-UDP 建议 300–600。
 - **status_addr 格式**：客户端可选状态端点地址，提供时必须可解析为 `SocketAddr`（如 `127.0.0.1:7400`）。
 - **pool_size 通用**：`pool_size` 对所有代理类型（tcp/udp/http/https）生效，省略默认 1。类型为 u32，≥0；0 表示禁用预热纯按需（见 8.2）；建议上限 16（超过记警告但不拒绝，防止资源耗尽）。
 - **vhost 端口与 proxy 类型交叉**：`vhost_http_port` 配置但无 HTTP 类型 proxy、`vhost_https_port` 配置但无 HTTPS 类型 proxy——视为**配置冗余，不报错**（vhost 监听仍启动，只是无流量，方便后续动态添加 proxy）。反之，有 HTTP/HTTPS proxy 但未配对应 vhost 端口——启动**报错**（proxy 无法路由）。

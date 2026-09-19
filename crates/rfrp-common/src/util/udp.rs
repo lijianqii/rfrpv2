@@ -11,7 +11,7 @@
 //! 逐帧 API（[`read_udp_frame_into`] / [`write_udp_frame`]）保留给简单场景与单元测试，
 //! 语义与批量版本完全一致。
 
-use bytes::Buf;
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::constants::{MAX_UDP_PACKET_SIZE, UDP_SOCKET_RECV_BUF_BYTES};
@@ -86,45 +86,47 @@ pub async fn write_udp_frame_buffered<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    scratch.clear();
+    append_udp_frame(scratch, data)?;
+    w.write_all(scratch).await
+}
+
+// ---------------------------------------------------------------- 批量读写（生产路径）
+
+/// 向 `scratch` 追加一个 UDP 帧（4 字节大端长度前缀 + 数据），不发起写系统调用。
+///
+/// 供批量路径复用同一块缓冲：调用方连续 append 多个数据报后只 `write_all` 一次。
+pub fn append_udp_frame(scratch: &mut Vec<u8>, data: &[u8]) -> std::io::Result<()> {
     if data.len() > MAX_UDP_PACKET_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("udp frame too large: {}", data.len()),
         ));
     }
-    scratch.clear();
     scratch.reserve(data.len() + 4);
     scratch.extend_from_slice(&(data.len() as u32).to_be_bytes());
     scratch.extend_from_slice(data);
-    w.write_all(scratch).await
+    Ok(())
 }
-
-// ---------------------------------------------------------------- 批量读写（生产路径）
 
 /// 把多个 UDP 数据报批量写入工作连接：每包仍保留独立的 4 字节长度前缀（**线格式不变**），
 /// 但只发起一次 `write_all`。接收端逐帧读取即可，因此不需要协议版本协商。
 ///
 /// 这让"一个视频/刷屏突发"从 N 次写系统调用（TLS 下 N 个 record）降为 1 次。
-pub async fn write_udp_frames_buffered<W>(
+pub async fn write_udp_frames_buffered<W, D>(
     w: &mut W,
     scratch: &mut Vec<u8>,
-    data: &[Vec<u8>],
+    data: &[D],
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
+    D: AsRef<[u8]>,
 {
-    let total: usize = data.iter().map(|d| d.len() + 4).sum();
+    let total: usize = data.iter().map(|d| d.as_ref().len() + 4).sum();
     scratch.clear();
     scratch.reserve(total);
     for d in data {
-        if d.len() > MAX_UDP_PACKET_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("udp frame too large: {}", d.len()),
-            ));
-        }
-        scratch.extend_from_slice(&(d.len() as u32).to_be_bytes());
-        scratch.extend_from_slice(d);
+        append_udp_frame(scratch, d.as_ref())?;
     }
     w.write_all(scratch).await
 }
@@ -135,7 +137,7 @@ where
 /// 会让每包都经历一次任务唤醒（实测突发下这是客户端侧的瓶颈之一）。
 #[derive(Default)]
 pub struct UdpFrameBuf {
-    buf: bytes::BytesMut,
+    buf: BytesMut,
 }
 
 impl UdpFrameBuf {
@@ -152,7 +154,7 @@ impl UdpFrameBuf {
     pub async fn read_batch<R>(
         &mut self,
         r: &mut R,
-        out: &mut Vec<Vec<u8>>,
+        out: &mut Vec<Bytes>,
         limit: usize,
     ) -> std::io::Result<usize>
     where
@@ -173,7 +175,7 @@ impl UdpFrameBuf {
                     break; // 半帧：等更多数据
                 }
                 self.buf.advance(4);
-                out.push(self.buf.split_to(len).to_vec());
+                out.push(self.buf.split_to(len).freeze());
             }
             if !out.is_empty() {
                 return Ok(out.len());
@@ -326,7 +328,10 @@ mod tests {
         let mut reader = UdpFrameBuf::new();
         let mut out = Vec::new();
         assert_eq!(reader.read_batch(&mut b, &mut out, 32).await.unwrap(), 3);
-        assert_eq!(out, batch);
+        assert_eq!(out.len(), batch.len());
+        for (got, expect) in out.iter().zip(&batch) {
+            assert_eq!(&got[..], expect);
+        }
     }
 
     #[tokio::test]
@@ -340,10 +345,14 @@ mod tests {
         let mut reader = UdpFrameBuf::new();
         let mut out = Vec::new();
         assert_eq!(reader.read_batch(&mut b, &mut out, 2).await.unwrap(), 2);
-        assert_eq!(out, batch[..2]);
+        for (got, expect) in out.iter().zip(&batch[..2]) {
+            assert_eq!(&got[..], expect);
+        }
         // 剩余帧仍留在内部缓冲，无需再次 read。
         assert_eq!(reader.read_batch(&mut b, &mut out, 32).await.unwrap(), 3);
-        assert_eq!(out, batch[2..]);
+        for (got, expect) in out.iter().zip(&batch[2..]) {
+            assert_eq!(&got[..], expect);
+        }
     }
 
     #[tokio::test]
@@ -360,7 +369,7 @@ mod tests {
         let mut reader = UdpFrameBuf::new();
         let mut out = Vec::new();
         assert_eq!(reader.read_batch(&mut b, &mut out, 32).await.unwrap(), 1);
-        assert_eq!(out[0], b"abc");
+        assert_eq!(&out[0][..], b"abc");
         writer.await.unwrap();
     }
 

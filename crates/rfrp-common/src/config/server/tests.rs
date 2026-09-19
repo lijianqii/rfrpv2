@@ -145,6 +145,31 @@ fn heartbeat_secs_range_and_ordering_validated() {
 }
 
 #[test]
+fn udp_session_timeout_default_and_range_validated() {
+    let base = r#"
+        [server]
+        token = "x"
+        work_conn_tls = false
+    "#;
+    let cfg = |secs: Option<u64>| -> ServerConfig {
+        let mut c: ServerConfig = toml::from_str(base).unwrap();
+        c.server.udp_session_timeout_secs = secs;
+        c
+    };
+
+    // 默认 300 秒：RDP-UDP 空闲期间不应频繁重建工作连接。
+    assert_eq!(cfg(None).server.udp_session_timeout().as_secs(), 300);
+    assert!(cfg(None).validate().is_ok());
+    assert_eq!(cfg(Some(600)).server.udp_session_timeout().as_secs(), 600);
+    assert!(cfg(Some(600)).validate().is_ok());
+    assert!(cfg(Some(1)).validate().is_ok());
+    assert!(cfg(Some(24 * 60 * 60)).validate().is_ok());
+
+    assert!(cfg(Some(0)).validate().is_err());
+    assert!(cfg(Some(24 * 60 * 60 + 1)).validate().is_err());
+}
+
+#[test]
 fn tls_cert_file_missing_rejected() {
     let cfg = ServerConfig {
         server: ServerSection {

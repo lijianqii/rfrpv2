@@ -265,7 +265,8 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
   RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。**两个代理必须使用同一个
   `remote_port`**——mstsc 会把 UDP 发往与 TCP 相同的端口；TCP/UDP 是独立的端口空间，
   rfrp 允许（也只有这样配置）才能让 UDP 生效，否则 RDP 会静默回退到纯 TCP。
-  注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`），且当前不可配置。
+  注意 UDP 代理会话默认 300s 空闲超时，可通过服务端
+  `[server].udp_session_timeout_secs` 调整（RDP-UDP 建议 300-600）。
 
 ### 资源与慢速连接防护
 

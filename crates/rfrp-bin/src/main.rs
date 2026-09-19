@@ -123,6 +123,7 @@ fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
         tls = cfg.server.tls_enable,
         work_conn_tls = cfg.server.work_conn_tls,
         tcp_keepalive_secs = cfg.server.tcp_keepalive_secs.unwrap_or(30),
+        udp_session_timeout_secs = cfg.server.udp_session_timeout().as_secs(),
         allow_ports = if cfg.proxy.allow_ports.trim().is_empty() {
             "all"
         } else {

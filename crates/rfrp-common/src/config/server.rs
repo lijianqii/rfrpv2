@@ -46,6 +46,10 @@ pub struct ServerSection {
     /// 心跳响应等待超时（秒），缺省 10；必须小于 `heartbeat_interval_secs`。
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
+    /// UDP 代理会话无活动超时（秒），缺省 300。
+    /// RDP-UDP 等交互式会话建议保持较大值，避免空闲期间频繁重建工作连接。
+    #[serde(default)]
+    pub udp_session_timeout_secs: Option<u64>,
 }
 
 impl Default for ServerSection {
@@ -61,6 +65,7 @@ impl Default for ServerSection {
             tcp_keepalive_secs: None,
             heartbeat_interval_secs: None,
             heartbeat_timeout_secs: None,
+            udp_session_timeout_secs: None,
         }
     }
 }
@@ -86,6 +91,14 @@ impl ServerSection {
         std::time::Duration::from_secs(
             self.heartbeat_timeout_secs
                 .unwrap_or(crate::constants::HEARTBEAT_TIMEOUT),
+        )
+    }
+
+    /// 生效的 UDP 会话无活动超时（配置缺省时用默认值）。
+    pub fn udp_session_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.udp_session_timeout_secs
+                .unwrap_or(crate::constants::UDP_SESSION_TIMEOUT),
         )
     }
 }
@@ -245,6 +258,18 @@ impl ServerConfig {
             if secs > 3600 {
                 return Err(config(format!(
                     "tcp_keepalive_secs {secs} out of range 0-3600"
+                )));
+            }
+        }
+        if let Some(secs) = self.server.udp_session_timeout_secs {
+            if !(crate::constants::UDP_SESSION_TIMEOUT_MIN_SECS
+                ..=crate::constants::UDP_SESSION_TIMEOUT_MAX_SECS)
+                .contains(&secs)
+            {
+                return Err(config(format!(
+                    "udp_session_timeout_secs {secs} out of range {}-{}",
+                    crate::constants::UDP_SESSION_TIMEOUT_MIN_SECS,
+                    crate::constants::UDP_SESSION_TIMEOUT_MAX_SECS
                 )));
             }
         }

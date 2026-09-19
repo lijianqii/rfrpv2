@@ -83,6 +83,7 @@ pub async fn register_proxy(
                 session,
                 state,
                 &config.server.bind_addr,
+                config.server.udp_session_timeout(),
             )
             .await?
         }

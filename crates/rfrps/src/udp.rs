@@ -5,9 +5,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use rfrp_common::constants::{
     MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, UDP_RECV_BATCH,
-    UDP_SESSION_QUEUE_DEPTH, UDP_SESSION_TIMEOUT, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
+    UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
@@ -24,14 +25,14 @@ use crate::state::ServerState;
 /// 等待工作连接配对的 UDP 会话（首个数据包触发 ReqWorkConn 后暂存）。
 pub struct PendingUdp {
     pub client: SocketAddr,
-    pub tx: mpsc::Sender<Vec<u8>>,
-    pub rx: mpsc::Receiver<Vec<u8>>,
+    pub tx: mpsc::Sender<Bytes>,
+    pub rx: mpsc::Receiver<Bytes>,
     pub created: Instant,
 }
 
 /// 已配对的 UDP 会话。
 pub struct UdpSession {
-    pub tx: mpsc::Sender<Vec<u8>>,
+    pub tx: mpsc::Sender<Bytes>,
     pub last_active: Instant,
 }
 
@@ -53,6 +54,7 @@ pub async fn register_udp_proxy(
     session: &Arc<Session>,
     state: &Arc<ServerState>,
     bind_addr: &str,
+    session_timeout: Duration,
 ) -> std::result::Result<JoinHandle<()>, ProxyError> {
     let socket = match UdpSocket::bind((bind_addr, remote_port)).await {
         Ok(s) => s,
@@ -77,7 +79,7 @@ pub async fn register_udp_proxy(
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
         metrics: state.metrics.clone(),
-        session_timeout: Duration::from_secs(UDP_SESSION_TIMEOUT),
+        session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
     });
     state
@@ -104,7 +106,7 @@ async fn run_udp_listener(
 ) {
     // 清理周期取超时的 1/4：使会话/待配对项的实际存活时间接近配置超时
     // （周期等于超时时，最坏会存活 2× 超时）。
-    let sweep_period = Duration::from_secs((UDP_SESSION_TIMEOUT / 4).max(1));
+    let sweep_period = Duration::from_secs((proxy.session_timeout.as_secs() / 4).max(1));
     let mut sweep_iv = tokio::time::interval(sweep_period);
     sweep_iv.tick().await; // 消耗首次立即 tick
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
@@ -157,7 +159,7 @@ async fn handle_datagram(
             .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // 背压保护：所有客户端共用同一个收包循环，工作连接消费慢时不得在这里
         // await（否则整代理数据报被阻塞）。通道满即丢包并计数——UDP 语义允许丢失。
-        if tx.try_send(data.to_vec()).is_err() {
+        if tx.try_send(Bytes::copy_from_slice(data)).is_err() {
             proxy.metrics.inc_udp_dropped();
             tracing::debug!(
                 proxy = %proxy_name, %peer,
@@ -180,7 +182,7 @@ async fn handle_datagram(
         };
         if let Some(tx) = tx {
             // 同会话背压：待配对窗口期也不得阻塞收包循环。
-            if tx.try_send(data.to_vec()).is_err() {
+            if tx.try_send(Bytes::copy_from_slice(data)).is_err() {
                 proxy.metrics.inc_udp_dropped();
                 tracing::debug!(
                     proxy = %proxy_name, %peer,
@@ -204,13 +206,13 @@ async fn handle_datagram(
 
     // 首个数据包：建立待配对项并请求工作连接，同时把该数据包先入队，
     // 避免工作连接建立期间丢包（DESIGN §8.6）。
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_DEPTH);
+    let (tx, rx) = mpsc::channel::<Bytes>(UDP_SESSION_QUEUE_DEPTH);
     let work_id = state.next_work_id();
     proxy
         .metrics
         .bytes_up
         .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    let _ = tx.send(data.to_vec()).await;
+    let _ = tx.send(Bytes::copy_from_slice(data)).await;
     proxy.pending_by_id.lock().unwrap().insert(
         work_id,
         PendingUdp {
@@ -319,10 +321,10 @@ pub async fn handle_udp_work_conn(
     let mut stream = stream;
     // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
     let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
-    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(UDP_WRITE_BATCH);
+    let mut batch: Vec<Bytes> = Vec::with_capacity(UDP_WRITE_BATCH);
     // 下行：一次 read 解析多帧，避免每包一次任务唤醒。
     let mut reader = UdpFrameBuf::new();
-    let mut down: Vec<Vec<u8>> = Vec::with_capacity(UDP_READ_BATCH);
+    let mut down: Vec<Bytes> = Vec::with_capacity(UDP_READ_BATCH);
 
     loop {
         tokio::select! {
@@ -362,7 +364,7 @@ pub async fn handle_udp_work_conn(
 async fn forward_to_client(
     proxy: &Arc<UdpProxy>,
     client: SocketAddr,
-    frames: &[Vec<u8>],
+    frames: &[Bytes],
     work_id: u64,
 ) {
     for d in frames {
@@ -377,7 +379,7 @@ async fn forward_to_client(
 }
 
 /// 登记已配对的 UDP 会话（工作连接就绪后调用）。
-fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<Vec<u8>>) {
+fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<Bytes>) {
     proxy.sessions.lock().unwrap().insert(
         client,
         UdpSession {

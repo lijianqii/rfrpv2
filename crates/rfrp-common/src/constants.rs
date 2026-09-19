@@ -44,8 +44,15 @@ pub const HEARTBEAT_MAX_SECS: u64 = 3600;
 pub const WORK_CONN_TIMEOUT_RFRPS: u64 = 10;
 /// rfrpc 侧建立工作连接的本地截止。
 pub const WORK_CONN_TIMEOUT_RFRPC: u64 = 8;
-/// UDP 会话无活动超时清理。
-pub const UDP_SESSION_TIMEOUT: u64 = 60;
+/// UDP 会话无活动超时清理（默认值，可通过服务端配置覆盖）。
+///
+/// 取 300 秒而不是早期的 60 秒：RDP-UDP 会话在用户阅读/停顿期间可能长时间没有
+/// 数据，过短的超时会反复关闭工作连接并触发重建，表现为 RDP-UDP 卡顿或回退 TCP。
+pub const UDP_SESSION_TIMEOUT: u64 = 300;
+/// `udp_session_timeout_secs` 可配置下限（秒）。
+pub const UDP_SESSION_TIMEOUT_MIN_SECS: u64 = 1;
+/// `udp_session_timeout_secs` 可配置上限（秒，24 小时）。
+pub const UDP_SESSION_TIMEOUT_MAX_SECS: u64 = 24 * 60 * 60;
 /// 服务端 accept 连续失败达到该次数后判定监听不可恢复，退出进程
 /// 交由进程管理器（systemd/nssm）重启（约 1 分钟持续失败）。
 pub const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 60;
