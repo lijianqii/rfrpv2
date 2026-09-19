@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- **UDP 清理可能误删新会话的映射**：`sweep` 清理过期待配对项时，按源地址无条件删除
+  `pending_client` 反查表；若该源地址在此期间已建立**新的**待配对项，映射会被抹掉，
+  后续数据报被当成新会话处理（重复请求工作连接 + 丢包）。现在仅当反查表仍指向被清理的
+  `work_id` 时才删除，并补了回归测试 `sweep_keeps_newer_pending_for_same_client`。
 - **TCP 与 UDP 代理可共用同一 `remote_port`（RDP-UDP 必需）**：客户端配置校验把 TCP/UDP
   混在一个集合里判重，同号配置直接报 `duplicate remote_port`。但 RDP 客户端（mstsc）启用
   UDP 传输时会把 UDP 发往与 TCP **相同**的端口，于是用户只能给 UDP 换号 → UDP 探测打空 →
@@ -70,6 +74,11 @@
 
 ### Changed
 
+- **代码整理（UDP 数据面与测试辅助）**：`util/udp` 按"socket 配置 / 逐帧原语 / 批量路径"
+  分区，并删掉重复的分配版读取（只保留一个读取原语）；服务端 UDP 处理抽出
+  `remove_pending` / `register_session` / `forward_to_client` / `drain_socket_batch`，
+  `handle_udp_work_conn` 主循环只留调度逻辑；测试辅助（UDP echo、代理构造、就绪等待、
+  metrics 抓取、日志初始化）统一收敛到 `tests/common`，三个测试文件不再各留一份。
 - **UDP 数据面批量化（线格式不变）**：此前每个数据报都要经历"每包一次唤醒 + 每包两次 write
   （TLS 下两个 record）+ 队列深度仅 16"，突发时服务端会大量丢包。现在：收包在同一唤醒内批量
   drain、会话队列 64、服务端按批合并成一次 write、读侧一次 read 解析多帧、双端 UDP 接收缓冲

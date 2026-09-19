@@ -9,80 +9,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
 use common::*;
-use rfrp_common::config::{ClientProxy, DashboardSection};
-use rfrp_common::protocol::msg::ProxyType;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-
-/// 本地 UDP echo 服务。
-async fn spawn_udp_echo() -> u16 {
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let port = s.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65507];
-        while let Ok((n, peer)) = s.recv_from(&mut buf).await {
-            let _ = s.send_to(&buf[..n], peer).await;
-        }
-    });
-    port
-}
-
-fn udp_proxy(local_port: u16, remote_port: u16) -> ClientProxy {
-    ClientProxy {
-        name: "udp".into(),
-        r#type: ProxyType::Udp,
-        local_ip: "127.0.0.1".into(),
-        local_port,
-        remote_port: Some(remote_port),
-        custom_domains: None,
-        pool_size: 0,
-    }
-}
-
-async fn wait_udp_ready(addr: std::net::SocketAddr, remote_port: u16) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        if s.send_to(b"ready", (addr.ip(), remote_port)).await.is_ok() {
-            let mut buf = [0u8; 16];
-            if tokio::time::timeout(Duration::from_secs(1), s.recv_from(&mut buf))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "udp proxy did not become ready"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// 拉取 Dashboard 的 `/metrics`（Basic Auth）。
-async fn fetch_metrics(port: u16) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let auth = base64::engine::general_purpose::STANDARD.encode("admin:secret123");
-    let req = format!(
-        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// 从 Prometheus 文本里取某个 counters 的值（缺失按 0 处理）。
-fn metric_value(metrics: &str, name: &str) -> u64 {
-    let prefix = format!("{name} ");
-    metrics
-        .lines()
-        .find_map(|l| l.strip_prefix(&prefix)?.trim().parse().ok())
-        .unwrap_or(0)
-}
+use rfrp_common::config::DashboardSection;
+use tokio::net::UdpSocket;
 
 /// 突发回归：单会话一次性灌入 N 个数据报，服务端应用层丢包必须被控制在很低水平。
 ///
@@ -114,7 +43,7 @@ async fn udp_burst_drops_stay_bounded() {
     let remote = free_port();
     let cli = start_client(client_config(
         addr,
-        vec![udp_proxy(echo_port, remote)],
+        vec![udp_proxy("udp", echo_port, remote)],
         None,
     ))
     .await;
@@ -132,7 +61,10 @@ async fn udp_burst_drops_stay_bounded() {
         .await
         .expect("warm-up roundtrip timed out")
         .expect("warm-up recv failed");
-    let before = metric_value(&fetch_metrics(dash_port).await, "rfrp_udp_dropped_total");
+    let before = metric_value(
+        &fetch_metrics(dash_port, "admin", "secret123").await,
+        "rfrp_udp_dropped_total",
+    );
 
     let msg = vec![0xABu8; SIZE];
     let sender = {
@@ -160,7 +92,10 @@ async fn udp_burst_drops_stay_bounded() {
     }
     let _ = sender.await;
 
-    let after = metric_value(&fetch_metrics(dash_port).await, "rfrp_udp_dropped_total");
+    let after = metric_value(
+        &fetch_metrics(dash_port, "admin", "secret123").await,
+        "rfrp_udp_dropped_total",
+    );
     let dropped = after.saturating_sub(before);
     // 这里只做**粗粒度闸门**：突发不能把通路打死（丢包必须小于总包数，且突发后仍能正常收发）。
     // 精确的丢包率对调度很敏感（同一台机器上实测 0~90% 双峰），因此不在这里断言比例——

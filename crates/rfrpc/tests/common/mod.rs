@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::Engine;
 use rfrp_common::config::{
     ClientConfig, ClientLogSection, ClientProxy, ClientSection, LogSection, ProxySection,
     ServerConfig, ServerSection,
@@ -13,7 +14,7 @@ use rfrp_common::protocol::msg::ProxyType;
 use rfrpc::client::Client;
 use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -167,6 +168,27 @@ pub async fn spawn_echo() -> u16 {
     port
 }
 
+/// 本地 UDP echo 服务（模拟 RDP 的 UDP 传输 / 通用 UDP 后端）。
+pub async fn spawn_udp_echo() -> u16 {
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = s.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65507];
+        while let Ok((n, peer)) = s.recv_from(&mut buf).await {
+            let _ = s.send_to(&buf[..n], peer).await;
+        }
+    });
+    port
+}
+
+/// 测试内日志（多测试并行时 `try_init` 失败可忽略）。
+pub fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 pub fn server_config(bind_port: u16) -> ServerConfig {
     ServerConfig {
         server: ServerSection {
@@ -197,6 +219,69 @@ pub fn tcp_proxy(name: &str, local_port: u16, remote_port: u16) -> ClientProxy {
         custom_domains: None,
         pool_size: 1,
     }
+}
+
+/// 构造一个 UDP 代理配置条目。
+pub fn udp_proxy(name: &str, local_port: u16, remote_port: u16) -> ClientProxy {
+    ClientProxy {
+        name: name.into(),
+        r#type: ProxyType::Udp,
+        local_ip: "127.0.0.1".into(),
+        local_port,
+        remote_port: Some(remote_port),
+        custom_domains: None,
+        pool_size: 0,
+    }
+}
+
+/// 通过 UDP 代理发一个数据报并等待回声；超时/内容不匹配返回 false。
+pub async fn udp_echo(addr: SocketAddr, remote_port: u16, data: &[u8]) -> bool {
+    let s = match UdpSocket::bind("127.0.0.1:0").await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if s.send_to(data, (addr.ip(), remote_port)).await.is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; data.len()];
+    match tokio::time::timeout(Duration::from_secs(2), s.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => n == data.len() && buf[..n] == *data,
+        _ => false,
+    }
+}
+
+/// 轮询直到 UDP 代理可用（首个数据报会触发按需工作连接）。
+pub async fn wait_udp_ready(server_addr: SocketAddr, remote_port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !udp_echo(server_addr, remote_port, b"ready").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "udp proxy did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 拉取 Dashboard 的 `/metrics`（Basic Auth）。
+pub async fn fetch_metrics(port: u16, user: &str, password: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+    let req = format!(
+        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 从 Prometheus 文本里取某个 counters 的值（缺失按 0 处理）。
+pub fn metric_value(metrics: &str, name: &str) -> u64 {
+    let prefix = format!("{name} ");
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix)?.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 pub fn client_config(

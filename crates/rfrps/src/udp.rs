@@ -114,21 +114,7 @@ async fn run_udp_listener(
                 match r {
                     Ok((n, peer)) => {
                         handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n]).await;
-                        // 同一唤醒内继续排空内核接收缓冲：减少任务唤醒与系统调用次数，
-                        // 突发时也更不容易把数据报堆到应用层队列里丢包（上限见 UDP_RECV_BATCH）。
-                        for _ in 1..UDP_RECV_BATCH {
-                            match proxy.socket.try_recv_from(&mut buf) {
-                                Ok((n, peer)) => {
-                                    handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n])
-                                        .await;
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(e) => {
-                                    tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
-                                    break;
-                                }
-                            }
-                        }
+                        drain_socket_batch(&proxy, &proxy_name, &session, &state, &mut buf).await;
                     }
                     Err(e) => {
                         tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
@@ -252,8 +238,7 @@ async fn handle_datagram(
         )
         .await
         {
-            proxy_cleanup.pending_by_id.lock().unwrap().remove(&work_id);
-            proxy_cleanup.pending_client.lock().unwrap().remove(&peer);
+            remove_pending(&proxy_cleanup, work_id);
         }
     });
 }
@@ -265,15 +250,50 @@ fn sweep(proxy: &Arc<UdpProxy>) {
     sessions.retain(|_, s| now.duration_since(s.last_active) < proxy.session_timeout);
     drop(sessions);
 
-    let mut pending = proxy.pending_by_id.lock().unwrap();
-    let expired: Vec<u64> = pending
+    let expired: Vec<u64> = proxy
+        .pending_by_id
+        .lock()
+        .unwrap()
         .iter()
         .filter(|(_, p)| now.duration_since(p.created) >= proxy.pending_timeout)
         .map(|(id, _)| *id)
         .collect();
     for id in expired {
-        if let Some(p) = pending.remove(&id) {
-            proxy.pending_client.lock().unwrap().remove(&p.client);
+        remove_pending(proxy, id);
+    }
+}
+
+/// 摘除一个待配对项（同时清理 `pending_client` 反查表）。
+fn remove_pending(proxy: &Arc<UdpProxy>, work_id: u64) -> Option<PendingUdp> {
+    let pending = proxy.pending_by_id.lock().unwrap().remove(&work_id)?;
+    let mut by_client = proxy.pending_client.lock().unwrap();
+    // 仅当反查表仍指向该 work_id 时才删除：该源地址期间可能已建立**新的**待配对项，
+    // 无条件按地址删除会误删新映射（导致后续数据报重复建连/丢包）。
+    if by_client.get(&pending.client) == Some(&work_id) {
+        by_client.remove(&pending.client);
+    }
+    Some(pending)
+}
+
+/// 同一唤醒内继续排空 UDP 接收缓冲：减少任务唤醒与系统调用次数，
+/// 突发时也更不容易把数据报堆到应用层队列里丢包（上限 [`UDP_RECV_BATCH`]）。
+async fn drain_socket_batch(
+    proxy: &Arc<UdpProxy>,
+    proxy_name: &str,
+    session: &Arc<Session>,
+    state: &Arc<ServerState>,
+    buf: &mut [u8],
+) {
+    for _ in 1..UDP_RECV_BATCH {
+        match proxy.socket.try_recv_from(buf) {
+            Ok((n, peer)) => {
+                handle_datagram(proxy, proxy_name, session, state, peer, &buf[..n]).await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
+                break;
+            }
         }
     }
 }
@@ -284,28 +304,17 @@ pub async fn handle_udp_work_conn(
     work_id: u64,
     stream: rfrp_common::util::stream::BoxedStream,
 ) -> Result<()> {
-    let pending = proxy.pending_by_id.lock().unwrap().remove(&work_id);
-    let pending = match pending {
+    let pending = match remove_pending(&proxy, work_id) {
         Some(p) => p,
         None => {
             tracing::warn!(work_id, "no pending udp session for work_id");
             return Ok(());
         }
     };
-    proxy.pending_client.lock().unwrap().remove(&pending.client);
+    let client = pending.client;
+    register_session(&proxy, client, pending.tx.clone());
 
-    {
-        let mut sessions = proxy.sessions.lock().unwrap();
-        sessions.insert(
-            pending.client,
-            UdpSession {
-                tx: pending.tx.clone(),
-                last_active: Instant::now(),
-            },
-        );
-    }
-
-    tracing::info!(client = %pending.client, work_id, "udp work connection established");
+    tracing::info!(client = %client, work_id, "udp work connection established");
     let mut rx = pending.rx;
     let mut stream = stream;
     // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
@@ -321,7 +330,7 @@ pub async fn handle_udp_work_conn(
                 if n == 0 {
                     break; // 通道关闭（会话结束）
                 }
-                touch_session(&proxy, pending.client);
+                touch_session(&proxy, client);
                 if let Err(e) = write_udp_frames_buffered(&mut stream, &mut write_buf, &batch).await {
                     tracing::warn!(work_id, error = %e, "udp write frames error");
                     break;
@@ -331,16 +340,8 @@ pub async fn handle_udp_work_conn(
             r = reader.read_batch(&mut stream, &mut down, UDP_READ_BATCH) => {
                 match r {
                     Ok(n) if n > 0 => {
-                        touch_session(&proxy, pending.client);
-                        for d in &down {
-                            proxy.metrics.bytes_down.fetch_add(
-                                d.len() as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            if let Err(e) = proxy.socket.send_to(d, pending.client).await {
-                                tracing::warn!(work_id, error = %e, "udp send_to client error");
-                            }
-                        }
+                        touch_session(&proxy, client);
+                        forward_to_client(&proxy, client, &down, work_id).await;
                     }
                     Ok(_) => break, // EOF
                     Err(e) => {
@@ -352,9 +353,38 @@ pub async fn handle_udp_work_conn(
         }
     }
 
-    proxy.sessions.lock().unwrap().remove(&pending.client);
-    tracing::debug!(client = %pending.client, work_id, "udp work connection closed");
+    proxy.sessions.lock().unwrap().remove(&client);
+    tracing::debug!(client = %client, work_id, "udp work connection closed");
     Ok(())
+}
+
+/// 把一批下行数据报回发给用户侧（统计下行字节；单个 send 失败不影响其余包）。
+async fn forward_to_client(
+    proxy: &Arc<UdpProxy>,
+    client: SocketAddr,
+    frames: &[Vec<u8>],
+    work_id: u64,
+) {
+    for d in frames {
+        proxy
+            .metrics
+            .bytes_down
+            .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = proxy.socket.send_to(d, client).await {
+            tracing::warn!(work_id, error = %e, "udp send_to client error");
+        }
+    }
+}
+
+/// 登记已配对的 UDP 会话（工作连接就绪后调用）。
+fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<Vec<u8>>) {
+    proxy.sessions.lock().unwrap().insert(
+        client,
+        UdpSession {
+            tx,
+            last_active: Instant::now(),
+        },
+    );
 }
 
 /// 更新 UDP 会话的最后活跃时间（双向流量都算活跃）。

@@ -84,6 +84,56 @@ async fn sweep_removes_expired_session_and_pending() {
     assert!(proxy.pending_client.lock().unwrap().is_empty());
 }
 
+/// 回归：清理过期待配对项时，不能误删**同一源地址**在此期间新建的映射。
+///
+/// 场景：客户端 X 的待配对项 A 过期；清理动作发生前，X 又发了新包建了待配对项 B。
+/// 若按地址无条件删除反查表，B 的映射会被抹掉 → X 的后续数据报会被当成新会话，
+/// 重复请求工作连接并丢包。
+#[tokio::test]
+async fn sweep_keeps_newer_pending_for_same_client() {
+    let proxy = test_proxy(Duration::from_millis(50), Duration::from_millis(50)).await;
+    let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+    let old = Instant::now() - Duration::from_secs(1);
+    let client: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    // A：已过期；反查表已被指向新条目 B。
+    proxy.pending_by_id.lock().unwrap().insert(
+        1,
+        PendingUdp {
+            client,
+            tx: tx.clone(),
+            rx: mpsc::channel(4).1,
+            created: old,
+        },
+    );
+    proxy.pending_by_id.lock().unwrap().insert(
+        2,
+        PendingUdp {
+            client,
+            tx: tx.clone(),
+            rx: mpsc::channel(4).1,
+            created: Instant::now(),
+        },
+    );
+    proxy.pending_client.lock().unwrap().insert(client, 2);
+
+    sweep(&proxy);
+
+    assert!(
+        !proxy.pending_by_id.lock().unwrap().contains_key(&1),
+        "过期待配对项应被清理"
+    );
+    assert!(
+        proxy.pending_by_id.lock().unwrap().contains_key(&2),
+        "新待配对项必须保留"
+    );
+    assert_eq!(
+        proxy.pending_client.lock().unwrap().get(&client),
+        Some(&2),
+        "反查表必须仍指向新条目"
+    );
+}
+
 #[tokio::test]
 async fn datagram_forwarded_to_paired_session() {
     // 已配对会话：数据直接转发到会话通道，不触发新 ReqWorkConn（§8.6）。

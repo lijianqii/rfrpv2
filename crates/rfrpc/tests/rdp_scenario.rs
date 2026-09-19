@@ -12,62 +12,9 @@
 
 mod common;
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::*;
-use rfrp_common::config::ClientProxy;
-use rfrp_common::protocol::msg::ProxyType;
-use tokio::net::UdpSocket;
-
-/// 本地 UDP echo（模拟 RDP 的 UDP 传输对端）。
-async fn spawn_udp_echo() -> u16 {
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let port = s.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65507];
-        while let Ok((n, peer)) = s.recv_from(&mut buf).await {
-            let _ = s.send_to(&buf[..n], peer).await;
-        }
-    });
-    port
-}
-
-fn udp_proxy(name: &str, local_port: u16, remote_port: u16) -> ClientProxy {
-    ClientProxy {
-        name: name.into(),
-        r#type: ProxyType::Udp,
-        local_ip: "127.0.0.1".into(),
-        local_port,
-        remote_port: Some(remote_port),
-        custom_domains: None,
-        pool_size: 0,
-    }
-}
-
-/// 测试内日志（诊断用；多测试并行时 try_init 失败可忽略）。
-fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .with_writer(std::io::stderr)
-        .try_init();
-}
-
-/// 发一个 UDP 包并等待回声；超时/不匹配返回 false。
-async fn udp_echo(addr: SocketAddr, port: u16, data: &[u8]) -> bool {
-    let s = match UdpSocket::bind("127.0.0.1:0").await {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    if s.send_to(data, (addr.ip(), port)).await.is_err() {
-        return false;
-    }
-    let mut buf = vec![0u8; data.len()];
-    match tokio::time::timeout(Duration::from_secs(2), s.recv_from(&mut buf)).await {
-        Ok(Ok((n, _))) => n == data.len() && buf[..n] == *data,
-        _ => false,
-    }
-}
 
 #[tokio::test]
 async fn rdp_tcp_and_udp_share_remote_port() {

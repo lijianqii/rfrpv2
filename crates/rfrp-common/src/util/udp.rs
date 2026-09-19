@@ -1,11 +1,22 @@
-//! UDP 代理工作连接上的分帧工具。
+//! UDP 代理工作连接上的分帧工具（DESIGN §8.6）。
 //!
-//! UDP 无连接，工作连接上按「4 字节大端长度前缀 + 数据」分帧（DESIGN §8.6）。
+//! UDP 无连接，工作连接上按「4 字节大端长度前缀 + 数据」分帧。**线格式只有这一种**：
+//! 无论逐帧写还是批量写，接收端都按同一格式逐帧解析。
+//!
+//! 生产路径（突发优化后）用的是批量 API：
+//! - 写：[`write_udp_frame_buffered`]（单包一次 write）/ [`write_udp_frames_buffered`]（一批一次 write）
+//! - 读：[`UdpFrameBuf::read_batch`]（一次 read 解析多帧）
+//! - socket：[`enlarge_recv_buffer`]（突发时先由内核缓冲吸收）
+//!
+//! 逐帧 API（[`read_udp_frame_into`] / [`write_udp_frame`]）保留给简单场景与单元测试，
+//! 语义与批量版本完全一致。
 
+use bytes::Buf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::constants::{MAX_UDP_PACKET_SIZE, UDP_SOCKET_RECV_BUF_BYTES};
-use bytes::Buf;
+
+// ---------------------------------------------------------------- socket 配置
 
 /// best-effort 调大 UDP socket 的接收缓冲（返回内核实际生效的值）。
 ///
@@ -18,20 +29,9 @@ pub fn enlarge_recv_buffer(sock: &tokio::net::UdpSocket) -> std::io::Result<usiz
     s.recv_buffer_size()
 }
 
-/// 从流上读取一个 UDP 帧，返回数据；EOF 返回 `None`。
-pub async fn read_udp_frame<R>(r: &mut R) -> std::io::Result<Option<Vec<u8>>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut data = Vec::new();
-    match read_udp_frame_into(r, &mut data).await? {
-        Some(()) => Ok(Some(data)),
-        None => Ok(None),
-    }
-}
+// ---------------------------------------------------------------- 逐帧读写（原语）
 
-/// 同 [`read_udp_frame`]，但把数据写入复用的 `buf`（清空后追加），
-/// 避免高频 UDP 转发下每包一次分配。EOF 返回 `Ok(None)`。
+/// 读取一个 UDP 帧到复用的 `buf`（清空后追加），避免每包一次分配。EOF 返回 `Ok(None)`。
 pub async fn read_udp_frame_into<R>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<()>>
 where
     R: AsyncRead + Unpin,
@@ -98,6 +98,8 @@ where
     scratch.extend_from_slice(data);
     w.write_all(scratch).await
 }
+
+// ---------------------------------------------------------------- 批量读写（生产路径）
 
 /// 把多个 UDP 数据报批量写入工作连接：每包仍保留独立的 4 字节长度前缀（**线格式不变**），
 /// 但只发起一次 `write_all`。接收端逐帧读取即可，因此不需要协议版本协商。
@@ -202,7 +204,11 @@ mod tests {
     async fn frame_roundtrip() {
         let (mut a, mut b) = duplex(1024);
         write_udp_frame(&mut a, b"hello").await.unwrap();
-        let data = read_udp_frame(&mut b).await.unwrap().unwrap();
+        let mut data = Vec::new();
+        read_udp_frame_into(&mut b, &mut data)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(data, b"hello");
     }
 
@@ -210,7 +216,11 @@ mod tests {
     async fn eof_returns_none() {
         let (a, mut b) = duplex(1024);
         drop(a);
-        assert!(read_udp_frame(&mut b).await.unwrap().is_none());
+        let mut data = Vec::new();
+        assert!(read_udp_frame_into(&mut b, &mut data)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -245,7 +255,8 @@ mod tests {
             .await
             .unwrap();
         a.write_all(&[0u8; 1]).await.unwrap();
-        assert!(read_udp_frame(&mut b).await.is_err());
+        let mut data = Vec::new();
+        assert!(read_udp_frame_into(&mut b, &mut data).await.is_err());
     }
 
     #[tokio::test]
@@ -257,12 +268,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scratch.len(), 9, "4 字节前缀 + 5 字节载荷");
-        assert_eq!(read_udp_frame(&mut b).await.unwrap().unwrap(), b"hello");
+        let mut out = Vec::new();
+        read_udp_frame_into(&mut b, &mut out)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, b"hello");
 
         write_udp_frame_buffered(&mut a, &mut scratch, b"xy")
             .await
             .unwrap();
-        assert_eq!(read_udp_frame(&mut b).await.unwrap().unwrap(), b"xy");
+        read_udp_frame_into(&mut b, &mut out)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, b"xy");
     }
 
     #[tokio::test]
