@@ -8,6 +8,11 @@
 
 ### Fixed
 
+- **TCP 与 UDP 代理可共用同一 `remote_port`（RDP-UDP 必需）**：客户端配置校验把 TCP/UDP
+  混在一个集合里判重，同号配置直接报 `duplicate remote_port`。但 RDP 客户端（mstsc）启用
+  UDP 传输时会把 UDP 发往与 TCP **相同**的端口，于是用户只能给 UDP 换号 → UDP 探测打空 →
+  **静默回退纯 TCP**（弱网体验变差）。现按协议分别判重（同协议内仍拒绝重复），并新增
+  RDP 场景集成测试：同端口 TCP+UDP 同时注册、各自独立通流。
 - **性能基准（`cargo bench`）已恢复可用**：协议升到 v2 后，`benches/forward.rs` 里的帧版本仍
   写死 `1`，被 `FrameCodec` 直接拒绝（`unsupported protocol version`），整个基准跑不起来；
   bridge 基准还每轮新建两对 TCP，跑满一万轮后本地端口被 TIME_WAIT 耗尽（`AddrNotAvailable`）。

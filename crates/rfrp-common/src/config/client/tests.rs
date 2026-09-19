@@ -229,6 +229,95 @@ fn duplicate_names_fails() {
     assert!(cfg.validate().is_err());
 }
 
+/// RDP 场景：客户端会把 UDP 发往与 TCP 相同的端口，因此 TCP 与 UDP 代理必须允许
+/// 使用同一个 `remote_port`（两者是独立的端口空间）。
+#[test]
+fn tcp_and_udp_may_share_remote_port() {
+    let cfg = ClientConfig {
+        client: ClientSection {
+            server_addr: "s.example.com".into(),
+            server_port: 7000,
+            token: "x".into(),
+            work_conn_tls: false,
+            ..Default::default()
+        },
+        proxies: vec![
+            ClientProxy {
+                name: "rdp-tcp".into(),
+                r#type: ProxyType::Tcp,
+                local_ip: "127.0.0.1".into(),
+                local_port: 3389,
+                remote_port: Some(33890),
+                custom_domains: None,
+                pool_size: 2,
+            },
+            ClientProxy {
+                name: "rdp-udp".into(),
+                r#type: ProxyType::Udp,
+                local_ip: "127.0.0.1".into(),
+                local_port: 3389,
+                remote_port: Some(33890),
+                custom_domains: None,
+                pool_size: 0,
+            },
+        ],
+        log: Default::default(),
+    };
+    cfg.validate()
+        .expect("TCP/UDP 共用 remote_port 必须通过校验（RDP 场景）");
+}
+
+#[test]
+fn duplicate_remote_port_within_same_protocol_fails() {
+    let proxy = |name: &str, t: ProxyType, remote: u16| ClientProxy {
+        name: name.into(),
+        r#type: t,
+        local_ip: "127.0.0.1".into(),
+        local_port: 22,
+        remote_port: Some(remote),
+        custom_domains: None,
+        pool_size: 0,
+    };
+    let cfg = |proxies| ClientConfig {
+        client: ClientSection {
+            server_addr: "s.example.com".into(),
+            server_port: 7000,
+            token: "x".into(),
+            work_conn_tls: false,
+            ..Default::default()
+        },
+        proxies,
+        log: Default::default(),
+    };
+
+    // 同协议内重复端口仍必须拒绝。
+    let err = cfg(vec![
+        proxy("a", ProxyType::Tcp, 6000),
+        proxy("b", ProxyType::Tcp, 6000),
+    ])
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("duplicate remote_port for tcp: 6000"), "{err}");
+
+    let err = cfg(vec![
+        proxy("a", ProxyType::Udp, 6001),
+        proxy("b", ProxyType::Udp, 6001),
+    ])
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("duplicate remote_port for udp: 6001"), "{err}");
+
+    // 不同类型、不同端口各自独立，不应互相影响。
+    cfg(vec![
+        proxy("a", ProxyType::Tcp, 6000),
+        proxy("b", ProxyType::Udp, 6001),
+    ])
+    .validate()
+    .expect("不同端口应通过");
+}
+
 #[test]
 fn full_client_config_validates() {
     let toml = r#"

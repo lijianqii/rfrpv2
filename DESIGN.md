@@ -444,7 +444,8 @@ rfrpc 重连复用 `run_id`，rfrps 处理流程：
 #### 多 rfrpc 同名/同端口
 
 - 同 `proxy_name` Proxy：第二个注册请求被拒绝（名字全局唯一）。
-- 同 `remote_port`：第二个注册请求被拒绝（端口占用）。
+- 同 `remote_port`：**同协议**的第二个注册请求被拒绝（端口占用）；TCP 与 UDP 端口空间独立，
+  允许同一端口号上分别存在一个 TCP 代理与一个 UDP 代理（RDP 的 TCP + UDP 传输即此用法）。
 - 不做负载均衡，不允许多个 rfrpc 共享同一 Proxy 条目。
 
 ---
@@ -896,7 +897,9 @@ CLI 参数 > 配置文件 > 默认值。
 - **字段一致性**：客户端 `tls_enable = true` 时 `tls_server_name` 必填且非空（rustls 用于证书 SNI 与校验），缺省或空串启动报错；rfrps 的 `tls_cert` / `tls_key` 成对存在。
 - **token 校验**：M3 起 `token` 必须非空（客户端与服务端均校验），空 token 启动报错；M1 阶段跳过校验（见 12 阶段 1 说明）。
 - **文件存在性**：`tls_cert`、`tls_key`、`vhost_tls_cert`、`vhost_tls_key` 指向的文件存在且可读。
-- **proxy 唯一性**：客户端配置内 `[[proxy]]` 的 `name` 不重复，`remote_port` 不重复（同一客户端内）。服务端另有全局唯一校验，见 6.6。
+- **proxy 唯一性**：客户端配置内 `[[proxy]]` 的 `name` 不重复；**同一协议内** `remote_port` 不重复。
+  TCP 与 UDP 是相互独立的端口空间，允许一个 TCP 代理与一个 UDP 代理共用同一端口号
+  （RDP 场景必需：mstsc 启用 UDP 传输时把 UDP 发往与 TCP 相同的端口）。服务端另有全局唯一校验，见 6.6。
 - **类型与字段匹配**：`type = http/https` 必须有 `custom_domains`；`type = tcp/udp` 必须有 `remote_port`。
 - **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时必须可解析为合法 IPv4/IPv6 地址（`std::net::IpAddr` 解析）。
 - **tcp_keepalive_secs 范围**：0–3600（0 = 禁用 keepalive）。

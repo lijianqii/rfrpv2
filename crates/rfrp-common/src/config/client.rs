@@ -232,7 +232,11 @@ impl ClientConfig {
         }
 
         let mut names = std::collections::HashSet::new();
-        let mut ports = std::collections::HashSet::new();
+        // TCP 与 UDP 是**相互独立**的端口空间：同一个端口号可以同时被一个 TCP 代理和
+        // 一个 UDP 代理使用（RDP 就是典型场景——客户端会把 UDP 发往与 TCP 相同的端口，
+        // 见 DESIGN §9.4）。因此按协议分别判重。
+        let mut tcp_ports = std::collections::HashSet::new();
+        let mut udp_ports = std::collections::HashSet::new();
         for p in &self.proxies {
             if p.name.is_empty() {
                 return Err(config("proxy name must not be empty"));
@@ -241,11 +245,15 @@ impl ClientConfig {
                 return Err(config(format!("duplicate proxy name: {}", p.name)));
             }
             p.validate()?;
-            if matches!(p.r#type, ProxyType::Tcp | ProxyType::Udp) {
-                let rp = p.remote_port.expect("validated above");
-                if !ports.insert(rp) {
-                    return Err(config(format!("duplicate remote_port: {rp}")));
-                }
+            let (ports, kind) = match p.r#type {
+                ProxyType::Tcp => (&mut tcp_ports, "tcp"),
+                ProxyType::Udp => (&mut udp_ports, "udp"),
+                // vhost 代理不占用独立端口（走共享监听），无端口唯一性问题。
+                ProxyType::Http | ProxyType::Https => continue,
+            };
+            let rp = p.remote_port.expect("validated above");
+            if !ports.insert(rp) {
+                return Err(config(format!("duplicate remote_port for {kind}: {rp}")));
             }
         }
         Ok(())

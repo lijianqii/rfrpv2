@@ -262,8 +262,10 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
 - **TCP keepalive**：默认启用（空闲 30s、探测间隔 5s，Linux/Windows 一致），可用
   `tcp_keepalive_secs` 调整或设为 0 关闭。
 - **RDP 可选 UDP 传输**：rfrp 支持 UDP 代理。给 `3389` 同时配置 TCP 与 UDP 代理后，
-  RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。需自行验证 RDP 版本是否协商成功；
-  注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`）。
+  RDP 客户端可能协商启用 UDP 传输（弱网/高丢包场景体验更好）。**两个代理必须使用同一个
+  `remote_port`**——mstsc 会把 UDP 发往与 TCP 相同的端口；TCP/UDP 是独立的端口空间，
+  rfrp 允许（也只有这样配置）才能让 UDP 生效，否则 RDP 会静默回退到纯 TCP。
+  注意 UDP 代理会话默认 60s 空闲超时（`UDP_SESSION_TIMEOUT`），且当前不可配置。
 
 ### 资源与慢速连接防护
 
