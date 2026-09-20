@@ -104,13 +104,15 @@ password = "change-me"      # 至少 6 位
 |---|---|
 | `GET /login` | 登录页（`POST /login` 提交表单） |
 | `GET /logout` | 退出登录（清除会话 Cookie） |
-| `GET /` | 状态页（版本、uptime、会话/代理/池计数，5s 自动刷新） |
+| `GET /` | 看板（KPI 卡片、流量走势、代理卡片、会话列表；内嵌初始状态，5s 轮询刷新） |
 | `GET /api/status` | JSON：会话与代理清单、pending、UDP 会话、池、指标 |
 | `GET /metrics` | Prometheus 文本 |
 | `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
 
 > 会话 Cookie 存的是 base64 编码的 `user:password`（与 Basic Auth 同级的凭据载体）。
 > 在不可信网络暴露 Dashboard 时请启用 HTTPS 反向代理，或只绑回环地址。
+>
+> 看板页面需要启用 JavaScript（首屏用内嵌状态渲染，随后每 5s 轮询 `/api/status`）。
 
 `/metrics` 指标：
 

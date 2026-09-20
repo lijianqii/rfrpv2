@@ -439,6 +439,10 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
             "active_connections": state.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),
             "bytes_up": state.metrics.bytes_up.load(std::sync::atomic::Ordering::Relaxed),
             "bytes_down": state.metrics.bytes_down.load(std::sync::atomic::Ordering::Relaxed),
+            "accepted_total": state.metrics.accepted_total.load(std::sync::atomic::Ordering::Relaxed),
+            "accept_errors_total": state.metrics.accept_errors_total.load(std::sync::atomic::Ordering::Relaxed),
+            "udp_dropped_total": state.metrics.udp_dropped_total.load(std::sync::atomic::Ordering::Relaxed),
+            "accepting": state.metrics.is_accepting(),
         },
     })
 }
@@ -447,92 +451,18 @@ fn render_metrics(state: &Arc<ServerState>) -> String {
     crate::metrics::render_prometheus(state)
 }
 
+/// 渲染看板页面：内嵌初始状态（首屏立即可见），随后由页面脚本每 5s 轮询刷新。
 fn render_html(state: &Arc<ServerState>) -> String {
-    let json = status_json(state);
-    let sessions_html = json["sessions"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|s| {
-                    let proxies = s["proxies"]
-                        .as_array()
-                        .map(|ps| {
-                            ps.iter()
-                                .map(|p| {
-                                    format!(
-                                        "{} ({})",
-                                        html_escape(p["name"].as_str().unwrap_or("")),
-                                        html_escape(p["kind"].as_str().unwrap_or(""))
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_default();
-                    format!(
-                        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                        html_escape(s["run_id"].as_str().unwrap_or("")),
-                        html_escape(s["session_id"].as_str().unwrap_or("")),
-                        proxies
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default();
-
-    let g = state.gauges();
-    let uptime = state.metrics.uptime_secs();
-    let mut stats_rows: Vec<(String, u64, u64, u64, i64)> = state
-        .proxy_stats
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(k, st)| {
-            (
-                k.clone(),
-                st.bytes_up.load(std::sync::atomic::Ordering::Relaxed),
-                st.bytes_down.load(std::sync::atomic::Ordering::Relaxed),
-                st.connections_total
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                st.active_connections
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
-        })
-        .collect();
-    stats_rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let proxy_table: String = stats_rows
-        .iter()
-        .map(|(name, up, down, total, active)| {
-            format!(
-                "<tr><td>{}</td><td>{up}</td><td>{down}</td><td>{total}</td><td>{active}</td></tr>",
-                html_escape(name)
-            )
-        })
-        .collect();
-    format!(
-        "<html><head><title>rfrp dashboard</title>\
-         <meta http-equiv=\"refresh\" content=\"5\"></head><body>\
-         <h1>rfrp dashboard <small>v{}</small></h1>\
-         <p><a href=\"/logout\">退出登录</a></p>\
-         <p>uptime: {}s | sessions: {} | proxies: {} | pending work: {} | udp sessions: {} | pooled work conns: {}</p>\
-         <h2>Metrics</h2><pre>{}</pre>\
-         <h2>Proxies</h2>\
-         <table border=1><tr><th>name</th><th>bytes_up</th><th>bytes_down</th><th>connections</th><th>active</th></tr>{}</table>\
-         <h2>Sessions</h2>\
-         <table border=1><tr><th>run_id</th><th>session_id</th><th>proxies</th></tr>{}</table>\
-         </body></html>",
-        env!("CARGO_PKG_VERSION"),
-        uptime,
-        g.sessions,
-        g.proxies,
-        g.pending_work,
-        g.udp_sessions,
-        g.pooled_work_conns,
-        html_escape(&crate::metrics::render_prometheus(state)),
-        proxy_table,
-        sessions_html
-    )
+    // 内嵌 JSON 到 `<script type="application/json">`：把 `<`/`>`/`&` 转义为
+    // `\uXXXX`，防止代理名等数据里的 `</script>` 提前结束脚本块（存储型 XSS）。
+    let bootstrap = serde_json::to_string(&status_json(state))
+        .unwrap_or_else(|_| "{}".into())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    include_str!("dashboard/page.html")
+        .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+        .replace("__BOOTSTRAP__", &bootstrap)
 }
 
 #[cfg(test)]
@@ -666,8 +596,8 @@ mod metrics_tests {
 
     #[test]
     fn render_html_escapes_proxy_names() {
-        // 代理名由认证客户端控制，直接拼进 HTML 会造成存储型 XSS。
-        // 名字同时出现在每代理表格与 Prometheus `<pre>` 中，两处都必须转义。
+        // 代理名由认证客户端控制。看板把它内嵌进 `<script type="application/json">`，
+        // 必须把 `<`/`>`/`&` 转义为 `\uXXXX`，否则 `</script>` 会提前结束脚本块（XSS）。
         let state = ServerState::new();
         let evil = "<script>alert(1)</script>";
         let st = state.proxy_stats_for(evil);
@@ -680,8 +610,8 @@ mod metrics_tests {
             "raw proxy name must not be injected: {html}"
         );
         assert!(
-            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "escaped proxy name expected: {html}"
+            html.contains("\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"),
+            "escaped JSON proxy name expected: {html}"
         );
     }
 }

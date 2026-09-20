@@ -44,7 +44,16 @@ async fn dashboard_metrics_and_page() {
 
     let (status, body) = http_get(port, "/", Some(&auth)).await;
     assert_eq!(status, 200);
-    assert!(body.contains("<html>"), "expected html page: {body}");
+    assert!(body.contains("<!DOCTYPE html>"), "expected html page: {body}");
+    assert!(body.contains("rfrp dashboard"), "expected board title: {body}");
+    assert!(
+        body.contains("rfrp-bootstrap"),
+        "expected bootstrap status data: {body}"
+    );
+    assert!(
+        body.contains("id=\"k-sessions\""),
+        "expected kpi cards: {body}"
+    );
 
     let (status, _) = http_get(port, "/nope", Some(&auth)).await;
     assert_eq!(status, 404);
@@ -83,6 +92,32 @@ async fn dashboard_browser_gets_login_page() {
         body.contains("action=\"/login\"") && body.contains("type=\"password\""),
         "expected a login form: {body}"
     );
+
+    srv.abort();
+}
+
+#[tokio::test]
+async fn dashboard_page_embeds_valid_bootstrap_json() {
+    // 看板把初始状态内嵌为 JSON，前端首屏直接渲染。转义必须正确（可被 JSON.parse 解析），
+    // 否则页面会白屏。
+    let port = free_port();
+    let (srv, _addr) = start_server(dashboard_config(port)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let auth = basic_auth("admin", "secret123");
+    let (status, body) = http_get(port, "/", Some(&auth)).await;
+    assert_eq!(status, 200);
+
+    let anchor = body
+        .find("id=\"rfrp-bootstrap\"")
+        .expect("bootstrap script tag present");
+    let open = body[anchor..].find('>').expect("script open tag") + anchor + 1;
+    let close = body[open..].find("</script>").expect("script close tag") + open;
+    let json = &body[open..close];
+    let v: serde_json::Value =
+        serde_json::from_str(json).expect("bootstrap must be valid JSON");
+    assert!(v.get("sessions").is_some());
+    assert_eq!(v["metrics"]["accepting"], serde_json::json!(true));
 
     srv.abort();
 }

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rfrp dashboard</title>
+<style>
+:root{
+  --bg:#eef1f6; --card:#ffffff; --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb;
+  --accent:#2563eb; --up:#2563eb; --down:#16a34a; --ok:#16a34a; --warn:#d97706; --err:#dc2626;
+  --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.5}
+
+.topbar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;gap:.5rem 1rem;
+  align-items:center;justify-content:space-between;padding:.7rem 1.2rem;
+  background:#111827;color:#f9fafb;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.brand{font-size:1.05rem;font-weight:600;letter-spacing:.2px}
+.brand .ver{font-size:.75rem;font-weight:400;color:#9ca3af;margin-left:.4rem}
+.topright{display:flex;flex-wrap:wrap;align-items:center;gap:.15rem .7rem;font-size:.85rem;color:#d1d5db}
+.topright b{color:#fff;font-weight:600}
+.sep{width:1px;height:14px;background:#374151}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:.35rem;vertical-align:middle}
+.dot.ok{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.2)}
+.dot.bad{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.2)}
+.logout{color:#93c5fd;text-decoration:none;border:1px solid #374151;border-radius:6px;padding:.15rem .6rem}
+.logout:hover{background:#1f2937}
+
+main{max-width:1180px;margin:1.2rem auto 3rem;padding:0 1.2rem;display:flex;flex-direction:column;gap:1.1rem}
+
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.75rem .9rem;box-shadow:var(--shadow)}
+.kpi .k-label{font-size:.78rem;color:var(--muted)}
+.kpi .k-value{font-size:1.5rem;font-weight:650;margin-top:.15rem;font-variant-numeric:tabular-nums}
+.kpis.small .kpi .k-value{font-size:1.15rem}
+
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem 1.1rem;box-shadow:var(--shadow)}
+.panel h2{margin:0 0 .8rem;font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:.5rem}
+.panel h2 .count{font-size:.78rem;font-weight:400;color:var(--muted)}
+
+.traffic{display:grid;grid-template-columns:180px 1fr;gap:1rem;align-items:center}
+.t-num{font-size:.85rem;color:var(--muted)}
+.t-num b{display:block;font-size:1.35rem;color:var(--ink);font-variant-numeric:tabular-nums}
+.t-num .up{color:var(--up);font-weight:700}
+.t-num .down{color:var(--down);font-weight:700}
+.t-num+.t-num{margin-top:.8rem}
+#spark{width:100%;height:120px;background:linear-gradient(#fafbfc,#f4f6f9);border:1px solid var(--line);border-radius:8px}
+#spark .line-up{fill:none;stroke:var(--up);stroke-width:2;vector-effect:non-scaling-stroke}
+#spark .line-down{fill:none;stroke:var(--down);stroke-width:2;vector-effect:non-scaling-stroke}
+
+.proxy-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.8rem}
+.proxy{border:1px solid var(--line);border-radius:9px;padding:.7rem .8rem;background:#fcfdff}
+.proxy-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:.55rem}
+.proxy-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{font-size:.72rem;text-transform:uppercase;letter-spacing:.4px;color:#1e40af;
+  background:#dbeafe;border-radius:999px;padding:.1rem .5rem;flex:0 0 auto}
+.proxy-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.3rem .6rem;font-size:.82rem;color:var(--muted)}
+.proxy-stats b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.proxy-stats .full{grid-column:1/-1}
+
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500;font-size:.78rem}
+td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.8rem}
+tr:last-child td{border-bottom:0}
+
+.empty{color:var(--muted);font-size:.85rem;padding:.4rem 0}
+.noscript{max-width:1180px;margin:1rem auto;padding:0 1.2rem;color:var(--err)}
+
+@media (max-width:640px){
+  .traffic{grid-template-columns:1fr}
+  .kpi .k-value{font-size:1.3rem}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">rfrp dashboard <span class="ver">v__VERSION__</span></div>
+  <div class="topright">
+    <span><span id="health" class="dot ok"></span><span id="health-text">正常</span></span>
+    <span class="sep"></span><span>RTT <b id="rtt">-</b></span>
+    <span class="sep"></span><span>运行 <b id="uptime">-</b></span>
+    <span class="sep"></span><span id="updated">-</span>
+    <a class="logout" href="/logout">退出登录</a>
+  </div>
+</header>
+
+<main>
+  <section class="kpis">
+    <div class="kpi"><div class="k-label">控制会话</div><div class="k-value" id="k-sessions">-</div></div>
+    <div class="kpi"><div class="k-label">已注册代理</div><div class="k-value" id="k-proxies">-</div></div>
+    <div class="kpi"><div class="k-label">活跃连接</div><div class="k-value" id="k-active">-</div></div>
+    <div class="kpi"><div class="k-label">累计连接</div><div class="k-value" id="k-total">-</div></div>
+    <div class="kpi"><div class="k-label">待配对连接</div><div class="k-value" id="k-pending">-</div></div>
+    <div class="kpi"><div class="k-label">UDP 会话</div><div class="k-value" id="k-udp">-</div></div>
+    <div class="kpi"><div class="k-label">池中空闲</div><div class="k-value" id="k-pooled">-</div></div>
+    <div class="kpi"><div class="k-label">控制链路 RTT</div><div class="k-value" id="k-rtt">-</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>流量 <span class="count">最近 60 个采样点的速率</span></h2>
+    <div class="traffic">
+      <div>
+        <div class="t-num"><span class="up">↑ 累计上行</span><b id="bytes-up">-</b></div>
+        <div class="t-num"><span class="down">↓ 累计下行</span><b id="bytes-down">-</b></div>
+      </div>
+      <svg id="spark" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>代理 <span class="count" id="proxy-count"></span></h2>
+    <div id="proxies" class="proxy-grid"></div>
+  </section>
+
+  <section class="panel">
+    <h2>会话 <span class="count" id="session-count"></span></h2>
+    <table>
+      <thead><tr><th>run_id</th><th>session_id</th><th>代理</th></tr></thead>
+      <tbody id="sessions"></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>运行指标</h2>
+    <div class="kpis small">
+      <div class="kpi"><div class="k-label">控制端口累计接受</div><div class="k-value" id="ops-accepted">-</div></div>
+      <div class="kpi"><div class="k-label">accept 错误</div><div class="k-value" id="ops-accept-err">-</div></div>
+      <div class="kpi"><div class="k-label">UDP 丢包</div><div class="k-value" id="ops-udp-drop">-</div></div>
+      <div class="kpi"><div class="k-label">accept 循环</div><div class="k-value" id="ops-accepting">-</div></div>
+    </div>
+  </section>
+</main>
+
+<noscript><p class="noscript">此看板需要启用 JavaScript 才能实时刷新。</p></noscript>
+
+<script id="rfrp-bootstrap" type="application/json">__BOOTSTRAP__</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var boot = JSON.parse($("rfrp-bootstrap").textContent);
+  var UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    var i = 0;
+    while (n >= 1024 && i < UNITS.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? Math.round(n) : n.toFixed(n < 10 ? 2 : 1)) + " " + UNITS[i];
+  }
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+        m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    if (m) return m + "m " + s + "s";
+    return s + "s";
+  }
+  function text(id, v) { var e = $(id); if (e) e.textContent = v; }
+
+  // ---- 流量走势：轮询差分得到速率 ----
+  var prev = null, hist = [], MAXPTS = 60;
+  function pushHistory(up, down) {
+    var now = Date.now();
+    if (prev) {
+      var dt = Math.max(0.001, (now - prev.t) / 1000);
+      hist.push({
+        up: Math.max(0, up - prev.up) / dt,
+        down: Math.max(0, down - prev.down) / dt
+      });
+      if (hist.length > MAXPTS) hist.shift();
+    }
+    prev = { t: now, up: up, down: down };
+  }
+  function drawSpark() {
+    var svg = $("spark");
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    if (hist.length < 2) return;
+    var W = 600, H = 120, PAD = 4, max = 1;
+    hist.forEach(function (p) { max = Math.max(max, p.up, p.down); });
+    function line(key, cls) {
+      var pts = hist.map(function (p, i) {
+        var x = PAD + (W - 2 * PAD) * i / (hist.length - 1);
+        var y = H - PAD - (H - 2 * PAD) * p[key] / max;
+        return x.toFixed(1) + "," + y.toFixed(1);
+      }).join(" ");
+      var el = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      el.setAttribute("points", pts);
+      el.setAttribute("class", cls);
+      svg.appendChild(el);
+    }
+    line("up", "line-up");
+    line("down", "line-down");
+  }
+
+  // ---- 代理：合并会话登记（含未产生流量的代理）与每代理统计 ----
+  function collectProxies(s) {
+    var map = new Map();
+    (s.sessions || []).forEach(function (sess) {
+      (sess.proxies || []).forEach(function (p) {
+        if (!map.has(p.name)) {
+          map.set(p.name, {
+            name: p.name, kind: p.kind, bytes_up: 0, bytes_down: 0,
+            connections_total: 0, active_connections: 0
+          });
+        }
+      });
+    });
+    (s.proxy_stats || []).forEach(function (st) {
+      var cur = map.get(st.name) || { name: st.name, kind: "-" };
+      map.set(st.name, Object.assign(
+        { bytes_up: 0, bytes_down: 0, connections_total: 0, active_connections: 0 },
+        cur, st));
+    });
+    return Array.from(map.values()).sort(function (a, b) { return a.name.localeCompare(b.name); });
+  }
+
+  function stat(label, value) {
+    var d = document.createElement("div");
+    d.appendChild(document.createTextNode(label + " "));
+    var b = document.createElement("b");
+    b.textContent = value;
+    d.appendChild(b);
+    return d;
+  }
+  function renderProxies(list) {
+    var box = $("proxies");
+    box.textContent = "";
+    if (!list.length) {
+      var e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = "暂无已注册代理";
+      box.appendChild(e);
+      return;
+    }
+    list.forEach(function (p) {
+      var card = document.createElement("div");
+      card.className = "proxy";
+      var head = document.createElement("div");
+      head.className = "proxy-head";
+      var name = document.createElement("span");
+      name.className = "proxy-name";
+      name.textContent = p.name;
+      name.title = p.name;
+      var badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = p.kind;
+      head.appendChild(name);
+      head.appendChild(badge);
+      var stats = document.createElement("div");
+      stats.className = "proxy-stats";
+      stats.appendChild(stat("活跃", p.active_connections));
+      stats.appendChild(stat("累计", p.connections_total));
+      stats.appendChild(stat("上行", fmtBytes(p.bytes_up)));
+      stats.appendChild(stat("下行", fmtBytes(p.bytes_down)));
+      card.appendChild(head);
+      card.appendChild(stats);
+      box.appendChild(card);
+    });
+  }
+
+  function renderSessions(list) {
+    var body = $("sessions");
+    body.textContent = "";
+    if (!list.length) {
+      var tr = document.createElement("tr");
+      var td = document.createElement("td");
+      td.colSpan = 3;
+      td.className = "empty";
+      td.textContent = "暂无活跃控制会话";
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+    list.forEach(function (s) {
+      var tr = document.createElement("tr");
+      ["run_id", "session_id"].forEach(function (k) {
+        var td = document.createElement("td");
+        td.className = "mono";
+        td.textContent = s[k];
+        td.title = s[k];
+        tr.appendChild(td);
+      });
+      var td = document.createElement("td");
+      td.textContent = (s.proxies || []).map(function (p) {
+        return p.name + " (" + p.kind + ")";
+      }).join(", ") || "-";
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+  }
+
+  function setHealth(accepting) {
+    var dot = $("health");
+    dot.className = "dot " + (accepting ? "ok" : "bad");
+    text("health-text", accepting ? "正常" : "异常");
+  }
+  function setOffline() {
+    $("health").className = "dot bad";
+    text("health-text", "连接失败");
+  }
+
+  function render(s) {
+    var m = s.metrics || {};
+    text("k-sessions", (s.sessions || []).length);
+    text("k-proxies", s.proxies);
+    text("k-active", m.active_connections);
+    text("k-total", m.total_connections);
+    text("k-pending", s.pending_work);
+    text("k-udp", s.udp_sessions);
+    text("k-pooled", s.pooled_work_conns);
+    text("k-rtt", s.rtt_ms ? s.rtt_ms + " ms" : "-");
+    text("rtt", s.rtt_ms ? s.rtt_ms + " ms" : "-");
+    text("uptime", fmtDur(s.uptime_seconds));
+    text("bytes-up", fmtBytes(m.bytes_up));
+    text("bytes-down", fmtBytes(m.bytes_down));
+    text("ops-accepted", m.accepted_total);
+    text("ops-accept-err", m.accept_errors_total);
+    text("ops-udp-drop", m.udp_dropped_total);
+    text("ops-accepting", m.accepting ? "正常" : "异常");
+
+    var proxies = collectProxies(s);
+    text("proxy-count", proxies.length ? "共 " + proxies.length + " 个" : "");
+    renderProxies(proxies);
+    text("session-count", (s.sessions || []).length ? "共 " + s.sessions.length + " 个" : "");
+    renderSessions(s.sessions || []);
+
+    setHealth(!!m.accepting);
+    pushHistory(m.bytes_up || 0, m.bytes_down || 0);
+    drawSpark();
+    text("updated", "更新 " + new Date().toLocaleTimeString());
+  }
+
+  async function tick() {
+    try {
+      var r = await fetch("/api/status", { cache: "no-store" });
+      if (r.status === 401) { location.href = "/login"; return; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      render(await r.json());
+    } catch (e) {
+      setOffline();
+    }
+  }
+
+  render(boot);
+  // 5s 轮询：与旧版 meta refresh 节奏一致，同时避免多标签页触发限频（100 次/分钟/IP）。
+  setInterval(tick, 5000);
+})();
+</script>
+</body>
+</html>
