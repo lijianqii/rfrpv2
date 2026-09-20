@@ -56,6 +56,7 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
     let mut cfg: ClientConfig = toml::from_str(&text)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.client.tls_ca, base);
+    cfg.normalize();
     cfg.validate()?;
     tracing::debug!(path = %path.display(), "client config loaded");
     Ok(cfg)

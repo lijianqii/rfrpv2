@@ -252,6 +252,53 @@ async fn register_http_proxy_registers_domains() {
 }
 
 #[tokio::test]
+async fn register_http_proxy_normalizes_domain_case() {
+    // 域名统一小写登记：含大写字母的域名也必须能被小写 Host 路由命中；
+    // 大小写不同的同名域名必须按冲突处理，不能绕过 §6.6 的全局唯一约束。
+    let state = ServerState::new();
+    let session = test_session();
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    let web = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["Dev.Example.COM".into()]),
+    };
+    assert!(register_proxy(&web, &session, &state, &cfg).await.is_ok());
+
+    // 路由按小写查表（vhost::route_and_dispatch），必须命中。
+    assert!(state.session_for_domain("dev.example.com").is_some());
+    // 会话内登记的键也已归一化。
+    assert_eq!(
+        session
+            .proxy_domains
+            .lock()
+            .unwrap()
+            .get("dev.example.com")
+            .map(|s| s.as_str()),
+        Some("web")
+    );
+
+    // 另一代理用不同大小写注册同一域名：必须判定冲突。
+    let tcp = NewProxy {
+        proxy_name: "raw".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: Some(vec!["DEV.example.com".into()]),
+    };
+    let err = register_proxy(&tcp, &session, &state, &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ProxyError::DomainConflict);
+    assert!(!session.proxies.lock().unwrap().contains_key("raw"));
+}
+
+#[tokio::test]
 async fn register_tcp_with_conflicting_domain_rejected() {
     // 域名为全局唯一资源：TCP/UDP 代理即使不走 vhost 路由，也不得抢占已被
     // vhost 代理登记的域名（否则同名 vhost 请求会路由到类型不匹配的代理，

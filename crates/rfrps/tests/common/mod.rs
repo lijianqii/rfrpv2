@@ -54,14 +54,44 @@ pub async fn start_server(cfg: ServerConfig) -> (JoinHandle<()>, SocketAddr) {
 
 /// 极简 GET：返回（状态码, 响应体）。
 pub async fn http_get(port: u16, path: &str, auth: Option<&str>) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
     if let Some(auth) = auth {
         req.push_str(&format!("Authorization: Basic {auth}\r\n"));
     }
     req.push_str("\r\n");
-    s.write_all(req.as_bytes()).await.unwrap();
+    http_request(port, &req).await
+}
 
+/// 浏览器风格的 GET（带 `Accept: text/html`），用于验证登录页返回。
+pub async fn http_get_browser(port: u16, path: &str) -> (u16, String) {
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html,application/xhtml+xml\r\nConnection: close\r\n\r\n"
+    );
+    http_request(port, &req).await
+}
+
+/// 带额外头部（如 Cookie）的 GET。
+pub async fn http_get_with_headers(port: u16, path: &str, extra_headers: &str) -> (u16, String) {
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{extra_headers}\r\n"
+    );
+    http_request(port, &req).await
+}
+
+/// 表单 POST（`application/x-www-form-urlencoded`）。
+pub async fn http_post_form(port: u16, path: &str, form: &str) -> (u16, String) {
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    );
+    http_request(port, &req).await
+}
+
+/// 发送原始请求，返回（状态码, 完整响应文本）。
+pub async fn http_request(port: u16, req: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
     let mut resp = Vec::new();
     s.read_to_end(&mut resp).await.unwrap();
     let text = String::from_utf8_lossy(&resp).to_string();
@@ -72,6 +102,15 @@ pub async fn http_get(port: u16, path: &str, auth: Option<&str>) -> (u16, String
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
     (status, text)
+}
+
+/// 从响应文本中提取指定 `Set-Cookie` 的 `name=value`（不含属性）。
+pub fn response_cookie(resp: &str, name: &str) -> Option<String> {
+    resp.lines()
+        .find_map(|l| l.strip_prefix("Set-Cookie: "))
+        .and_then(|v| v.split(';').next())
+        .filter(|kv| kv.starts_with(&format!("{name}=")))
+        .map(|kv| kv.to_string())
 }
 
 /// Basic Auth 头的 base64 值。

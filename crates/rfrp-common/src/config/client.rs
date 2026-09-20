@@ -186,6 +186,20 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// 归一化域名（小写），与 rfrps 的 vhost 路由/冲突判定保持一致。
+    ///
+    /// 服务端注册入口也会归一化（权威位置），这里提前做一次使客户端配置、
+    /// 状态端点与上送协议的表示一致。
+    pub fn normalize(&mut self) {
+        for p in &mut self.proxies {
+            if let Some(domains) = p.custom_domains.as_mut() {
+                for d in domains.iter_mut() {
+                    *d = d.to_lowercase();
+                }
+            }
+        }
+    }
+
     /// 校验配置（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
         if self.client.server_port == 0 {

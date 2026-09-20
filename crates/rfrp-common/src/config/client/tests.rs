@@ -40,6 +40,34 @@ fn http_proxy_requires_domains() {
 }
 
 #[test]
+fn normalize_lowercases_custom_domains() {
+    // 域名统一小写，才能被服务端按小写 Host 路由命中（与 rfrps 注册入口一致）。
+    let toml = r#"
+        [client]
+        server_addr = "127.0.0.1"
+        server_port = 7000
+        token = "secret"
+        work_conn_tls = false
+
+        [[proxy]]
+        name = "web"
+        type = "https"
+        local_port = 8080
+        custom_domains = ["Dev.Example.COM", "API.Example.com"]
+    "#;
+    let mut cfg: ClientConfig = toml::from_str(toml).unwrap();
+    cfg.normalize();
+    assert_eq!(
+        cfg.proxies[0].custom_domains,
+        Some(vec![
+            "dev.example.com".to_string(),
+            "api.example.com".to_string()
+        ])
+    );
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn http_without_domains_fails() {
     let p = proxy(
         r#"

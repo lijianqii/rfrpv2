@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use rfrp_common::config::ClientConfig;
 use rfrp_common::util::accept::AcceptRetry;
-use rfrp_common::util::http::{read_request_head, write_response};
+use rfrp_common::util::http::{html_escape, read_request_head, write_response};
 use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
@@ -160,7 +160,12 @@ fn render_html(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> String {
         .map(|p| {
             format!(
                 "<tr><td>{}</td><td>{:?}</td><td>{}:{}</td><td>{:?}</td><td>{}</td></tr>",
-                p.name, p.r#type, p.local_ip, p.local_port, p.remote_port, p.pool_size
+                html_escape(&p.name),
+                p.r#type,
+                html_escape(&p.local_ip),
+                p.local_port,
+                p.remote_port,
+                p.pool_size
             )
         })
         .collect();
@@ -174,11 +179,11 @@ fn render_html(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> String {
          <table border=1><tr><th>name</th><th>type</th><th>local</th><th>remote_port</th><th>pool</th></tr>{}</table>\
          </body></html>",
         env!("CARGO_PKG_VERSION"),
-        cfg.client.server_addr,
+        html_escape(&cfg.client.server_addr),
         cfg.client.server_port,
         metrics.is_connected(),
         metrics.uptime_secs(),
-        metrics.render(),
+        html_escape(&metrics.render()),
         rows
     )
 }

@@ -10,6 +10,26 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// 请求头上限（超过后按已读内容处理，解析失败按 `/` 处理）。
 pub const MAX_REQUEST_HEAD: usize = 8192;
 
+/// HTML 转义（`&`、`<`、`>`、`"`、`'`）。
+///
+/// Dashboard / 状态页会把运行期数据（代理名、run_id、指标标签等）拼进 HTML。
+/// 代理名由认证客户端控制，若直接拼接，恶意名字会在管理员浏览器中执行脚本
+/// （存储型 XSS）。所有插入 HTML 的动态文本都必须经过本函数。
+pub fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// 读取 HTTP 请求头（读到 `\r\n\r\n` 或超过 [`MAX_REQUEST_HEAD`]）。
 ///
 /// `timeout` 为**整体截止时间**：慢速请求（slowloris）超过后返回 `Ok(None)`。
@@ -59,6 +79,8 @@ where
 {
     let reason = match status {
         200 => "OK",
+        302 => "Found",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         429 => "Too Many Requests",
@@ -171,5 +193,15 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(text.contains("WWW-Authenticate: Basic realm=\"x\"\r\n"));
+    }
+
+    #[test]
+    fn html_escape_covers_all_special_chars() {
+        assert_eq!(
+            html_escape("<script>alert(\"x&y\")</script>'"),
+            "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;&#39;"
+        );
+        assert_eq!(html_escape("plain-proxy_1"), "plain-proxy_1");
+        assert_eq!(html_escape(""), "");
     }
 }

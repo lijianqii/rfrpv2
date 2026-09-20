@@ -51,7 +51,16 @@ pub async fn register_proxy(
         return Err(ProxyError::NameExists);
     }
 
-    let domains = np.custom_domains.clone().unwrap_or_default();
+    // 域名统一小写归一化：vhost 路由按小写 Host 查表（见 vhost::route_and_dispatch），
+    // 若按原样登记，配置中含大写字母的域名将永远无法命中；大小写不同的同名域名
+    // 也会绕过冲突检测。归一化后路由与冲突判定使用同一表示。
+    let domains: Vec<String> = np
+        .custom_domains
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.to_lowercase())
+        .collect();
     if matches!(np.r#type, ProxyType::Http | ProxyType::Https) && domains.is_empty() {
         return Err(ProxyError::InvalidField);
     }
