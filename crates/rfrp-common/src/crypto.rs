@@ -14,7 +14,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::config::ClientSection;
-use crate::error::{config, Error, Result};
+use crate::error::{config, describe_io_error, Error, Result};
 
 /// 确保 rustls 使用 ring 作为默认 CryptoProvider。
 /// 项目通过 `rustls` 的 `ring` feature 提供加密后端；
@@ -121,7 +121,7 @@ impl ServerTls {
         self.acceptor
             .accept(stream)
             .await
-            .map_err(|e| Error::Other(format!("TLS accept failed: {e}")))
+            .map_err(|e| Error::Other(format!("TLS accept failed: {}", describe_io_error(&e))))
     }
 }
 
@@ -163,7 +163,7 @@ impl ClientTls {
         self.connector
             .connect(self.server_name.clone(), stream)
             .await
-            .map_err(|e| Error::Other(format!("TLS connect failed: {e}")))
+            .map_err(|e| Error::Other(format!("TLS connect failed: {}", describe_io_error(&e))))
     }
 }
 
