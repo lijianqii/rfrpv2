@@ -79,7 +79,7 @@ fn server_validate_basic() {
 
 #[test]
 fn work_conn_tls_requires_certs() {
-    // M3：work_conn_tls=true 时即使 tls_enable=false 也必须提供证书/私钥。
+    // work_conn_tls=true 时即使 tls_enable=false 也必须提供证书/私钥。
     let cfg = ServerConfig {
         server: ServerSection {
             token: "x".into(),
@@ -167,6 +167,28 @@ fn udp_session_timeout_default_and_range_validated() {
 
     assert!(cfg(Some(0)).validate().is_err());
     assert!(cfg(Some(24 * 60 * 60 + 1)).validate().is_err());
+}
+
+#[test]
+fn grace_secs_default_and_range_validated() {
+    let base = r#"
+        [server]
+        token = "x"
+        work_conn_tls = false
+    "#;
+    let cfg = |secs: Option<u64>| -> ServerConfig {
+        let mut c: ServerConfig = toml::from_str(base).unwrap();
+        c.server.grace_secs = secs;
+        c
+    };
+
+    // 默认 30 秒；0 = 不等待（立即返回），允许；上限 3600。
+    assert_eq!(cfg(None).server.grace().as_secs(), 30);
+    assert!(cfg(None).validate().is_ok());
+    assert_eq!(cfg(Some(5)).server.grace().as_secs(), 5);
+    assert!(cfg(Some(0)).validate().is_ok());
+    assert!(cfg(Some(3600)).validate().is_ok());
+    assert!(cfg(Some(3601)).validate().is_err());
 }
 
 #[test]

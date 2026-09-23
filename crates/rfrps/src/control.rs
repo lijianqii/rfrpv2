@@ -7,9 +7,10 @@
 //! 心跳（§8.3）：本端周期性发送 `Heartbeat`，若 `HEARTBEAT_TIMEOUT` 内未收到对端
 //! `HeartbeatResp`，经 `Notify` 通知控制循环断开并清理 Session。
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -33,6 +34,8 @@ use crate::listener;
 use crate::state::ServerState;
 
 mod session;
+#[cfg(test)]
+pub(crate) use session::{test_entry, test_entry_with, test_session, test_session_with_token};
 pub use session::{ProxyEntry, Session};
 
 /// 拒绝登录并下发失败 LoginResp（`error=None` 表示鉴权失败，不回显原因，§10.2）。
@@ -104,7 +107,7 @@ where
         return Ok(());
     }
 
-    // M3：token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
+    // token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
         state.record_login_failure(peer_ip);
         tracing::warn!(run_id = %run_id, %peer_ip, "login rejected: token mismatch");
@@ -113,6 +116,29 @@ where
     }
     state.clear_login_failures(peer_ip);
 
+    // 并发会话上限（全局 + 每来源 IP）：同一 run_id 的重连替换不计新增。
+    // 登录限速只统计失败次数，若无此上限，持有效 token 的客户端可用随机 run_id
+    // 无限建立控制会话（每个都会注册代理、占用 fd 与内存）。
+    let over_limit = {
+        let reg = state.sessions.lock();
+        if reg.contains_key(&run_id) {
+            None
+        } else if reg.len() >= state.max_sessions.load(Ordering::Relaxed) {
+            Some(format!("global limit reached ({})", reg.len()))
+        } else if reg.values().filter(|s| s.peer_ip == peer_ip).count()
+            >= state.max_sessions_per_ip.load(Ordering::Relaxed)
+        {
+            Some("per-ip limit reached".to_string())
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = over_limit {
+        tracing::warn!(%peer_ip, %run_id, %reason, "login rejected: session limit reached");
+        reject_login(stream, Some("too many sessions")).await?;
+        return Ok(());
+    }
+
     let session_id = uuid::Uuid::new_v4().to_string();
     // 工作连接鉴权令牌：per-session 随机值，不写日志、不经 Dashboard 暴露。
     let work_conn_token = uuid::Uuid::new_v4().to_string();
@@ -120,6 +146,7 @@ where
     let session = Arc::new(Session {
         run_id,
         session_id: session_id.clone(),
+        peer_ip,
         work_conn_token: work_conn_token.clone(),
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
@@ -131,7 +158,7 @@ where
     // 重连去重（§8.3）：同一 run_id 的旧会话先清理再接受新登录。
     // 注意：cleanup 在锁外执行，避免 sessions→proxy_index 锁序嵌套。
     let old = {
-        let mut reg = state.sessions.lock().unwrap();
+        let mut reg = state.sessions.lock();
         let old = reg.remove(&session.run_id);
         reg.insert(session.run_id.clone(), session.clone());
         old
@@ -208,6 +235,9 @@ where
     .await
     {
         tracing::warn!(session = %session_id, "login resp send failed/timeout");
+        // 会话已登记：必须注销并清理，否则会留下幽灵会话（Dashboard 可见、run_id 被占）。
+        unregister_session(&state, &session);
+        cleanup(&session, &state);
         return Ok(());
     }
     tracing::info!(session = %session_id, "control connection established");
@@ -232,9 +262,17 @@ where
             iv.tick().await;
             let ts = now_ms();
             tracing::debug!(session = %session_id_hb, ts, "heartbeat sent");
-            if !try_send(&hb_tx, Message::Heartbeat(Heartbeat { ts })) {
-                tracing::warn!(session = %session_id_hb, "heartbeat send failed (channel full), skipping tick");
-                continue;
+            // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
+            // 说明控制写路径已不可用：此时等不到 pong，必须直接判定连接失效。
+            // 旧实现此处 `continue` 跳过本轮，会让看门狗在写侧已死时永不触发——
+            // 半开连接下 reader 也不会返回，表现为服务端不清理、客户端不重连。
+            if !send_with_timeout(&hb_tx, Message::Heartbeat(Heartbeat { ts })).await {
+                tracing::warn!(
+                    session = %session_id_hb,
+                    "heartbeat send failed; control connection considered dead"
+                );
+                hb_disconnect.notify_one();
+                break;
             }
             // 等待对端心跳回应；超时则判定断连（§8.3）。
             // 等待本轮心跳被回应（pong_ts 必须推进到本轮 ts）。
@@ -267,7 +305,18 @@ where
             frame = reader.next() => {
                 match frame {
                     Some(Ok(f)) => {
-                        let msg = Message::from_frame(&f)?;
+                        // 解码失败不能让函数经 `?` 提前返回：那会跳过会话注销与 cleanup，
+                        // 留下幽灵会话、占用的端口与泄漏的任务。改为结束循环走统一清理。
+                        let msg = match Message::from_frame(&f) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::warn!(
+                                    session = %session_id, error = %e,
+                                    "control frame decode error; closing session"
+                                );
+                                break;
+                            }
+                        };
                         match msg {
                             Message::NewProxy(np) => {
                                 tracing::info!(proxy = %np.proxy_name, typ = ?np.r#type, "received NewProxy");
@@ -358,17 +407,19 @@ where
     if done.is_err() {
         writer_task.abort();
     }
-    // 从会话注册表移除自身（仅当仍是当前条目，避免误删重连后的新会话）。
-    {
-        let mut reg = state.sessions.lock().unwrap();
-        if let Some(s) = reg.get(&session.run_id) {
-            if s.session_id == session.session_id {
-                reg.remove(&session.run_id);
-            }
-        }
-    }
+    unregister_session(&state, &session);
     cleanup(&session, &state);
     Ok(())
+}
+
+/// 从会话注册表移除自身（仅当仍是当前条目，避免误删重连后的新会话）。
+fn unregister_session(state: &ServerState, session: &Session) {
+    let mut reg = state.sessions.lock();
+    if let Some(s) = reg.get(&session.run_id) {
+        if s.session_id == session.session_id {
+            reg.remove(&session.run_id);
+        }
+    }
 }
 
 /// NewProxy 字段校验（DESIGN §6.2.3），返回错误标识或 None。
@@ -397,37 +448,33 @@ fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
 fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
     // 先收集代理名，用于清理全局归属索引（proxy_name → run_id）。
-    let proxy_names: Vec<String> = session.proxies.lock().unwrap().keys().cloned().collect();
+    let proxy_names: Vec<String> = session.proxies.lock().keys().cloned().collect();
     // 先收集 UDP 代理名，用于清理全局注册表。
     let udp_names: Vec<String> = session
         .proxies
         .lock()
-        .unwrap()
         .iter()
         .filter(|(_, e)| e.kind == ProxyType::Udp)
         .map(|(n, _)| n.clone())
         .collect();
     // 收集 vhost 域名，用于清理全局域名索引（domain → 归属）。
-    let domain_names: Vec<String> = session
-        .proxy_domains
-        .lock()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let domain_names: Vec<String> = session.proxy_domains.lock().keys().cloned().collect();
     state.remove_proxy_stats(&proxy_names);
     state.unindex_proxies(proxy_names);
     state.unindex_domains(domain_names);
-    for (_, entry) in session.proxies.lock().unwrap().drain() {
+    for (_, entry) in session.proxies.lock().drain() {
         entry.handle.abort();
     }
-    let mut udp = state.udp.lock().unwrap();
+    let mut udp = state.udp.lock();
     for n in udp_names {
-        udp.remove(&n);
+        // 取消会话级停止信号：结束仍在途的 UDP 工作连接，释放 UDP 端口。
+        if let Some(p) = udp.remove(&n) {
+            p.stop.cancel();
+        }
     }
-    session.proxy_domains.lock().unwrap().clear();
+    session.proxy_domains.lock().clear();
     // 关闭并丢弃所有预热的工作连接池（§8.2）。
-    for (_, mut v) in session.pools.lock().unwrap().drain() {
+    for (_, mut v) in session.pools.lock().drain() {
         for _s in v.drain(..) {
             // 丢弃 TcpStream 即关闭连接。
         }
@@ -435,7 +482,6 @@ fn cleanup(session: &Session, state: &ServerState) {
     state
         .pending
         .lock()
-        .unwrap()
         .retain(|_, p| p.session_id != session.session_id);
 }
 

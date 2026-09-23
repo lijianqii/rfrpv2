@@ -5,6 +5,8 @@
 
 use std::fs::File;
 use std::io::IsTerminal;
+// 这里保持 `std::sync::Mutex`：`tracing-subscriber` 的 `MakeWriter` 针对标准库
+// `Mutex` 实现，且日志写者与运行期共享状态无关（其余共享锁统一用 parking_lot）。
 use std::sync::Mutex;
 
 use tracing_subscriber::fmt;

@@ -48,6 +48,9 @@ pub enum Commands {
         /// 优雅退出宽限期（秒），覆盖默认 30s（见 §14.4）
         #[arg(long)]
         grace_secs: Option<u64>,
+        /// 只加载并校验配置、打印生效摘要后退出，不监听端口
+        #[arg(long)]
+        check: bool,
     },
     /// 以客户端模式运行（主动连接服务端，暴露本地服务）
     Client {
@@ -66,6 +69,32 @@ pub enum Commands {
         /// 覆盖 `work_conn_tls`
         #[arg(long)]
         work_conn_tls: Option<bool>,
+        /// 只加载并校验配置、打印生效摘要后退出，不建立连接
+        #[arg(long)]
+        check: bool,
+        /// 可选子命令（如 `rfrp client status`）；省略则以隧道模式运行
+        #[command(subcommand)]
+        action: Option<ClientAction>,
+    },
+    /// 生成 shell 补全脚本（输出到 stdout）
+    Completions {
+        /// 目标 shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+/// `rfrp client` 的可选子命令。
+#[derive(Subcommand, Debug)]
+pub enum ClientAction {
+    /// 查询本地客户端状态端点并打印 `/api/status`（需配置 `[client].status_addr`）
+    Status {
+        /// 配置文件路径（用于读取 `[client].status_addr`）
+        #[arg(short, long)]
+        config: PathBuf,
+        /// 覆盖状态端点地址（默认取 `[client].status_addr`）
+        #[arg(long)]
+        addr: Option<String>,
     },
 }
 
@@ -102,6 +131,7 @@ mod tests {
                 tls_enable,
                 work_conn_tls,
                 grace_secs,
+                check,
             } => {
                 assert_eq!(config, Some(PathBuf::from("examples/rfrp-server.toml")));
                 assert_eq!(bind.as_deref(), Some("0.0.0.0:8000"));
@@ -109,6 +139,7 @@ mod tests {
                 assert_eq!(tls_enable, Some(true));
                 assert_eq!(work_conn_tls, Some(true));
                 assert_eq!(grace_secs, Some(5));
+                assert!(!check);
             }
             other => panic!("expected server command, got {other:?}"),
         }
@@ -136,12 +167,15 @@ mod tests {
                 token,
                 tls_enable,
                 work_conn_tls,
+                check,
+                ..
             } => {
                 assert_eq!(config, Some(PathBuf::from("examples/rfrp-client.toml")));
                 assert_eq!(server.as_deref(), Some("127.0.0.1:7000"));
                 assert_eq!(token, None);
                 assert_eq!(tls_enable, Some(false));
                 assert_eq!(work_conn_tls, None);
+                assert!(!check);
             }
             other => panic!("expected client command, got {other:?}"),
         }
@@ -166,5 +200,43 @@ mod tests {
     fn unknown_subcommand_rejected() {
         let err = Cli::try_parse_from(["rfrp", "bogus"]).unwrap_err();
         assert!(err.to_string().contains("unrecognized subcommand"), "{err}");
+    }
+
+    #[test]
+    fn check_flag_parses_for_both_subcommands() {
+        let cli = Cli::try_parse_from(["rfrp", "server", "-c", "x.toml", "--check"]).unwrap();
+        match cli.command {
+            Commands::Server { check, .. } => assert!(check),
+            other => panic!("expected server command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["rfrp", "client", "-c", "x.toml", "--check"]).unwrap();
+        match cli.command {
+            Commands::Client { check, .. } => assert!(check),
+            other => panic!("expected client command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_status_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "rfrp",
+            "client",
+            "status",
+            "-c",
+            "x.toml",
+            "--addr",
+            "127.0.0.1:7400",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Client {
+                action: Some(ClientAction::Status { config, addr }),
+                ..
+            } => {
+                assert_eq!(config, PathBuf::from("x.toml"));
+                assert_eq!(addr.as_deref(), Some("127.0.0.1:7400"));
+            }
+            other => panic!("expected client status, got {other:?}"),
+        }
     }
 }

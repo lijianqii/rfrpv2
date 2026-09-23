@@ -1,9 +1,10 @@
 //! 客户端主控：连接服务端、登录、按配置串行注册代理，长驻控制循环；
 //! 断开后按指数退避重连，并复用 run_id 恢复代理（DESIGN §8.1 / §8.3 / §6.6）。
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
@@ -195,7 +196,8 @@ impl Client {
         run_id: &str,
         shutdown: &CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
-        let server_addr = self.config.client.server_socket_addr()?;
+        // 允许 server_addr 为域名：每次建连都重新解析（IP 字面量则直接使用）。
+        let server_addr = self.config.client.resolve_server_addr().await?;
         let tls = self.tls.clone();
         // 带超时建连：防火墙静默丢包时 connect 可能阻塞约 2 分钟（Linux），
         // 期间无法感知失败、也无法进入退避重试。
@@ -255,7 +257,7 @@ impl Client {
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
         let (login_otx, login_orx) = oneshot::channel();
-        state.login_tx.lock().unwrap().replace(login_otx);
+        state.login_tx.lock().replace(login_otx);
 
         let ctrl = tokio::spawn(control::control_loop(
             stream,
@@ -271,10 +273,10 @@ impl Client {
         match tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT), login_orx).await {
             Ok(Ok(resp)) => {
                 if resp.ok {
-                    *state.work_conn_tls.lock().unwrap() = resp
+                    *state.work_conn_tls.lock() = resp
                         .work_conn_tls
                         .unwrap_or(self.config.client.work_conn_tls);
-                    *state.work_conn_token.lock().unwrap() = resp.work_conn_token.clone();
+                    *state.work_conn_token.lock() = resp.work_conn_token.clone();
                     self.metrics.set_connected(true);
                 }
                 if !resp.ok {
@@ -286,20 +288,29 @@ impl Client {
                         || lower.contains("auth failed")
                     {
                         tracing::error!(error = %reason, "login fatal; not reconnecting");
+                        // 中止控制任务：服务端若未主动断开，await 会永久挂住导致进程无法退出。
+                        ctrl.abort();
                         let _ = ctrl.await;
                         return Ok(ConnectOutcome::Fatal(reason));
                     }
                     tracing::warn!(error = ?resp.error, "login rejected; reconnecting");
+                    ctrl.abort();
                     let _ = ctrl.await;
                     return Ok(ConnectOutcome::Reconnect { connected: false });
                 }
             }
             Ok(Err(_)) => {
                 tracing::warn!("login response channel dropped; reconnecting");
+                // 必须中止控制任务：仅 return 会把任务分离，导致心跳/写任务与旧连接泄漏，
+                // 每次登录失败都累积一个常驻任务。
+                ctrl.abort();
+                let _ = ctrl.await;
                 return Ok(ConnectOutcome::Reconnect { connected: false });
             }
             Err(_) => {
                 tracing::warn!("login response timeout; reconnecting");
+                ctrl.abort();
+                let _ = ctrl.await;
                 return Ok(ConnectOutcome::Reconnect { connected: false });
             }
         }
@@ -325,12 +336,15 @@ impl Client {
         if !retryable.is_empty() {
             let tx_retry = tx.clone();
             let state_retry = state.clone();
+            let shutdown_retry = shutdown.clone();
             tokio::spawn(async move {
-                retry_registration(tx_retry, state_retry, retryable).await;
+                retry_registration(tx_retry, state_retry, retryable, shutdown_retry).await;
             });
         }
 
         let _ = ctrl.await;
+        // 兜底清理未消费的注册响应通道（正常情况下各路径已各自移除）。
+        state.resps.lock().clear();
         self.metrics.set_connected(false);
         Ok(ConnectOutcome::Reconnect { connected: true })
     }
@@ -413,8 +427,10 @@ async fn register_one_proxy(
     p: &ClientProxy,
 ) -> RegisterOutcome {
     let (otx, orx) = oneshot::channel();
-    state.resps.lock().unwrap().insert(p.name.clone(), otx);
+    state.resps.lock().insert(p.name.clone(), otx);
     if !send_with_timeout(tx, Message::NewProxy(new_proxy_from_config(p))).await {
+        // 控制连接已断：清理未消费的响应通道，避免条目随连接生命周期累积。
+        state.resps.lock().remove(&p.name);
         return RegisterOutcome::ConnLost;
     }
     match tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx).await {
@@ -424,11 +440,8 @@ async fn register_one_proxy(
             RegisterOutcome::Ok
         }
         Ok(Ok(resp)) => {
-            let retryable = resp
-                .error
-                .as_deref()
-                .and_then(ProxyError::from_code)
-                .is_some_and(ProxyError::is_retryable);
+            let code = resp.error.as_deref().and_then(ProxyError::from_code);
+            let retryable = code.is_some_and(ProxyError::is_retryable);
             state.metrics.inc_proxy_register_failure();
             if retryable {
                 tracing::warn!(
@@ -439,19 +452,40 @@ async fn register_one_proxy(
             } else {
                 tracing::error!(
                     proxy = %p.name, code = ?resp.error,
+                    hint = registration_hint(code),
                     "proxy registration rejected (not retryable)"
                 );
                 RegisterOutcome::Failed
             }
         }
         Ok(Err(_)) => {
+            state.resps.lock().remove(&p.name);
             tracing::warn!(proxy = %p.name, "registration response channel dropped");
             RegisterOutcome::Failed
         }
         Err(_) => {
+            // 超时后服务端可能仍会回包，但已按可重试处理；此处移除条目避免累积，
+            // 迟到的响应由控制循环查不到条目而丢弃。
+            state.resps.lock().remove(&p.name);
             tracing::warn!(proxy = %p.name, "registration response timeout");
             RegisterOutcome::Retryable
         }
+    }
+}
+
+/// 针对不可重试的注册失败给出可操作提示（避免用户去翻文档）。
+fn registration_hint(code: Option<ProxyError>) -> &'static str {
+    match code {
+        Some(ProxyError::PortNotAllowed) => "检查服务端 [proxy].allow_ports 是否放行该 remote_port",
+        Some(ProxyError::NameExists) => "代理名已被占用：修改 [[proxy]].name，或等待旧会话释放",
+        Some(ProxyError::InvalidType) => "代理 type 非法：仅支持 tcp/udp/http/https",
+        Some(ProxyError::InvalidField) => {
+            "[[proxy]] 字段缺失或格式错误：检查 remote_port / custom_domains 等"
+        }
+        Some(ProxyError::TooManyProxies) => "单会话代理数超过服务端上限：减少 [[proxy]] 条目",
+        Some(ProxyError::DomainConflict) => "域名与其他代理冲突（通常可重试）",
+        Some(ProxyError::PortOccupied) => "端口被占用（通常可重试）",
+        Some(ProxyError::Internal) | None => "查看服务端日志获取详细原因",
     }
 }
 
@@ -478,10 +512,15 @@ async fn retry_registration(
     tx: mpsc::Sender<Message>,
     state: Arc<ClientState>,
     mut pending: Vec<ClientProxy>,
+    shutdown: CancellationToken,
 ) {
     let mut delay = Duration::from_secs(PROXY_REGISTER_RETRY_INITIAL);
     for round in 1..=PROXY_REGISTER_RETRY_MAX {
-        tokio::time::sleep(delay).await;
+        // 退避期间响应退出信号，避免进程退出时还要等满一个退避周期。
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.cancelled() => return,
+        }
         delay = (delay * 2).min(Duration::from_secs(PROXY_REGISTER_RETRY_MAX_DELAY));
         let mut still = Vec::new();
         for p in pending {
@@ -516,6 +555,27 @@ pub fn new_proxy_from_config(p: &ClientProxy) -> NewProxy {
         remote_port: p.remote_port,
         custom_domains: p.custom_domains.clone(),
     }
+}
+
+/// 测试用客户端状态构造器：所有测试共用一份，避免 `ClientState` 增字段时逐个构造点修改。
+#[cfg(test)]
+pub(crate) fn test_state(
+    server_addr: std::net::SocketAddr,
+    run_id: &str,
+    proxies: HashMap<String, ClientProxy>,
+    work_conn_tls: bool,
+) -> Arc<ClientState> {
+    Arc::new(ClientState {
+        server_addr,
+        run_id: run_id.to_string(),
+        proxies,
+        resps: Mutex::new(HashMap::new()),
+        login_tx: Mutex::new(None),
+        tls: None,
+        work_conn_tls: Mutex::new(work_conn_tls),
+        work_conn_token: Mutex::new(None),
+        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+    })
 }
 
 #[cfg(test)]

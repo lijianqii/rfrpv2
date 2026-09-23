@@ -13,6 +13,7 @@ tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默
 heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
 udp_session_timeout_secs = 300   # UDP 会话空闲超时（秒，默认 300；RDP-UDP 建议 300-600）
+grace_secs = 30                  # 优雅退出宽限期（秒，默认 30；停止接收后等待在途连接结束）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps<->rfrpc 控制连接

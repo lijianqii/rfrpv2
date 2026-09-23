@@ -1,4 +1,4 @@
-//! TCP 全链路集成测试（DESIGN §14.2 M1）。
+//! TCP 全链路集成测试（DESIGN §14.2）。
 
 mod common;
 

@@ -1,4 +1,4 @@
-//! M5：Dashboard 与真实客户端会话的集成测试。
+//! Dashboard 与真实客户端会话的集成测试。
 
 mod common;
 

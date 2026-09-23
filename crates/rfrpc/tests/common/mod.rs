@@ -12,8 +12,8 @@ pub use http::*;
 #[allow(unused_imports)]
 pub use udp::*;
 
+use parking_lot::Mutex;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use rfrp_common::config::{
@@ -111,7 +111,7 @@ impl TestServer {
     /// 用于测试自行取消退出令牌后等待收尾；若任务句柄已被 [`Self::stop`] 取走，
     /// 则立即返回。
     pub async fn wait(&self) {
-        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -119,7 +119,7 @@ impl TestServer {
 
     pub async fn stop_with_timeout(&self, timeout: Duration) {
         self.shutdown.cancel();
-        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = tokio::time::timeout(timeout, task).await;
         }
@@ -151,7 +151,7 @@ impl TestClient {
     /// 触发优雅退出并等待客户端任务结束（最多 5s）。
     pub async fn stop(&self) {
         self.shutdown.cancel();
-        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }

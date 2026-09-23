@@ -48,7 +48,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     if let Err(e) = configure_tcp_stream(&work) {
         tracing::warn!(proxy = %req.proxy_name, error = %e, "failed to configure work TCP stream");
     }
-    let use_tls = *state.work_conn_tls.lock().unwrap();
+    let use_tls = *state.work_conn_tls.lock();
     let work: BoxedStream = if use_tls {
         let tls = state.tls.as_ref().ok_or_else(|| {
             state.metrics.inc_work_conn_failure();
@@ -74,12 +74,19 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     if proxy.r#type == ProxyType::Udp {
         // UDP：本地用 UDP socket，工作连接上按长度前缀分帧（DESIGN §8.6）。
         let local = UdpSocket::bind("0.0.0.0:0").await?;
-        if let Err(e) = local.connect(&local_addr).await {
+        // 用 `(host, port)` 元组形式：允许域名，且 IPv6 字面量无需手工加方括号。
+        if let Err(e) = local
+            .connect((proxy.local_ip.as_str(), proxy.local_port))
+            .await
+        {
             state.metrics.inc_work_conn_failure();
-            tracing::warn!(proxy = %req.proxy_name, error = %e, "local udp connect failed; closing work connection");
+            tracing::warn!(
+                proxy = %req.proxy_name, local = %local_addr, error = %e,
+                "local udp connect failed; closing work connection"
+            );
             return Ok(());
         }
-        let work_conn_token = state.work_conn_token.lock().unwrap().clone();
+        let work_conn_token = state.work_conn_token.lock().clone();
         // 本地服务回包（RDP 服务端 → 用户方向）也走这个 socket：突发时先由内核缓冲吸收。
         if let Err(e) = enlarge_recv_buffer(&local) {
             tracing::debug!(proxy = %req.proxy_name, error = %e, "failed to enlarge local udp recv buffer");
@@ -104,7 +111,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     // 这条工作连接放入预热池，避免池中出现“死连接”（DESIGN §8.2 预建场景）。
     let local = match timeout(
         Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
-        TcpStream::connect(&local_addr),
+        TcpStream::connect((proxy.local_ip.as_str(), proxy.local_port)),
     )
     .await
     {
@@ -117,17 +124,23 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         Ok(Err(e)) => {
             // 本地连不上：直接关闭工作连接（TCP FIN），服务端不会入池。
             state.metrics.inc_work_conn_failure();
-            tracing::warn!(proxy = %req.proxy_name, error = %e, "local connect failed; closing work connection");
+            tracing::warn!(
+                proxy = %req.proxy_name, local = %local_addr, error = %e,
+                "local connect failed; closing work connection"
+            );
             return Ok(());
         }
         Err(_) => {
             state.metrics.inc_work_conn_failure();
-            tracing::warn!(proxy = %req.proxy_name, "local connect timeout; closing work connection");
+            tracing::warn!(
+                proxy = %req.proxy_name, local = %local_addr,
+                "local connect timeout; closing work connection"
+            );
             return Ok(());
         }
     };
 
-    let work_conn_token = state.work_conn_token.lock().unwrap().clone();
+    let work_conn_token = state.work_conn_token.lock().clone();
     framed
         .send(
             Message::StartWorkConn(StartWorkConn {

@@ -1,4 +1,4 @@
-//! M4：HTTP/HTTPS vhost 集成测试。
+//! HTTP/HTTPS vhost 集成测试。
 
 mod common;
 

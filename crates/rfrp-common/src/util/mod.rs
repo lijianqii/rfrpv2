@@ -1,5 +1,6 @@
 //! 通用工具模块。
 pub mod accept;
+pub mod addr;
 pub mod bridge;
 pub mod control;
 pub mod counting;

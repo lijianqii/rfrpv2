@@ -4,7 +4,6 @@ use super::*;
 use rfrp_common::protocol::msg::{Close, Heartbeat, LoginResp, Message, NewProxyResp, ReqWorkConn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{duplex, AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -23,34 +22,48 @@ async fn recv_msg<R: AsyncRead + Unpin>(r: &mut FramedRead<R, FrameCodec>) -> Me
 }
 
 fn client_state_with_resp(name: &str) -> (Arc<ClientState>, oneshot::Receiver<NewProxyResp>) {
-    let state = Arc::new(ClientState {
-        server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
-        run_id: String::new(),
-        proxies: HashMap::new(),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+    let state = crate::client::test_state(
+        "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+        "",
+        HashMap::new(),
+        false,
+    );
     let (otx, orx) = oneshot::channel();
-    state.resps.lock().unwrap().insert(name.into(), otx);
+    state.resps.lock().insert(name.into(), otx);
     (state, orx)
 }
 
 fn default_state() -> Arc<ClientState> {
-    Arc::new(ClientState {
-        server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
-        run_id: String::new(),
-        proxies: HashMap::new(),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    })
+    crate::client::test_state(
+        "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+        "",
+        HashMap::new(),
+        false,
+    )
+}
+
+#[tokio::test]
+async fn dead_write_side_triggers_heartbeat_disconnect() {
+    // 回归：写侧已死但读侧静默时，心跳看门狗必须判定连接失效并结束控制循环，让上层重连。
+    // 旧实现发送失败后 `continue` 跳过本轮，客户端会永久卡住、不重连。
+    // 注意保留 `_tx`（不发送、不 drop），否则 rx 关闭会走其它分支，测不到心跳路径。
+    let (_tx, rx) = mpsc::channel::<Message>(64);
+    let task = tokio::spawn(control_loop(
+        rfrp_common::testutil::DeadWriteStream,
+        rx,
+        default_state(),
+        ClientConfig::default(),
+        CancellationToken::new(),
+        Duration::from_millis(30), // interval
+        Duration::from_millis(60), // timeout
+    ));
+
+    let res = tokio::time::timeout(Duration::from_secs(3), task).await;
+    assert!(
+        res.is_ok(),
+        "control loop must end when the write path is dead"
+    );
+    res.unwrap().unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -221,19 +234,14 @@ async fn login_resp_routed_to_state() {
     let (client_end, server_end) = duplex(8192);
     let (_tx, rx) = mpsc::channel::<Message>(64);
     let config = ClientConfig::default();
-    let state = Arc::new(ClientState {
-        server_addr: "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
-        run_id: "rid".into(),
-        proxies: HashMap::new(),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+    let state = crate::client::test_state(
+        "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+        "rid",
+        HashMap::new(),
+        false,
+    );
     let (lotx, lorx) = oneshot::channel();
-    state.login_tx.lock().unwrap().replace(lotx);
+    state.login_tx.lock().replace(lotx);
 
     let task = tokio::spawn(control_loop(
         client_end,

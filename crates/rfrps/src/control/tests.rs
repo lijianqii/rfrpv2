@@ -16,15 +16,18 @@ async fn recv_msg<R: tokio::io::AsyncRead + Unpin>(r: &mut FramedRead<R, FrameCo
     Message::from_frame(&r.next().await.unwrap().unwrap()).unwrap()
 }
 
-fn login_frame(run_id: &str) -> Frame {
-    // 用确定性 UUID（由 run_id 字节派生）保证同名 run_id 稳定，同时满足服务端 UUID 校验。
+/// 由名字派生确定性 UUID：同名稳定，同时满足服务端 UUID 校验。
+fn login_run_id(run_id: &str) -> String {
     let mut b = [0u8; 16];
     for (i, byte) in run_id.as_bytes().iter().take(16).enumerate() {
         b[i] = *byte;
     }
-    let rid = uuid::Uuid::from_bytes(b).to_string();
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+fn login_frame(run_id: &str) -> Frame {
     Message::Login(Login {
-        run_id: rid,
+        run_id: login_run_id(run_id),
         token: String::new(),
         version: PROTOCOL_VERSION,
     })
@@ -35,57 +38,42 @@ fn login_frame(run_id: &str) -> Frame {
 #[tokio::test]
 async fn cleanup_clears_proxy_domains() {
     let state = ServerState::new();
-    let (tx, _rx) = mpsc::channel::<Message>(8);
-    let session = Arc::new(Session {
-        run_id: "r".into(),
-        session_id: "s".into(),
-        work_conn_token: "tok".into(),
-        tx,
-        proxies: Mutex::new(HashMap::new()),
-        proxy_domains: Mutex::new(HashMap::new()),
-        stop: Arc::new(Notify::new()),
-        pools: Mutex::new(HashMap::new()),
-    });
+    let session = test_session("r");
     session
         .proxy_domains
         .lock()
-        .unwrap()
         .insert("dev.example.com".into(), "web".into());
-    session.proxies.lock().unwrap().insert(
-        "udp".into(),
-        ProxyEntry {
-            handle: tokio::spawn(async {}),
-            kind: ProxyType::Udp,
-        },
-    );
-    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    state.udp.lock().unwrap().insert(
-        "udp".into(),
-        Arc::new(crate::udp::UdpProxy {
-            socket,
-            sessions: Mutex::new(HashMap::new()),
-            pending_by_id: Mutex::new(HashMap::new()),
-            pending_client: Mutex::new(HashMap::new()),
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            packet_pool: Arc::new(Mutex::new(Vec::new())),
-            session_timeout: std::time::Duration::from_secs(60),
-            pending_timeout: std::time::Duration::from_secs(10),
-        }),
-    );
-    state
-        .sessions
+    session
+        .proxies
         .lock()
-        .unwrap()
-        .insert("r".into(), session.clone());
+        .insert("udp".into(), test_entry(ProxyType::Udp));
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let udp_proxy = Arc::new(crate::udp::UdpProxy {
+        socket,
+        sessions: Mutex::new(HashMap::new()),
+        pending_by_id: Mutex::new(HashMap::new()),
+        pending_client: Mutex::new(HashMap::new()),
+        metrics: Arc::new(crate::metrics::Metrics::new()),
+        packet_pool: Arc::new(Mutex::new(Vec::new())),
+        session_timeout: std::time::Duration::from_secs(60),
+        pending_timeout: std::time::Duration::from_secs(10),
+        stop: tokio_util::sync::CancellationToken::new(),
+    });
+    state.udp.lock().insert("udp".into(), udp_proxy.clone());
+    state.sessions.lock().insert("r".into(), session.clone());
 
     cleanup(&session, &state);
     assert!(
-        session.proxy_domains.lock().unwrap().is_empty(),
+        session.proxy_domains.lock().is_empty(),
         "cleanup must clear vhost domain mappings"
     );
     assert!(
-        state.udp.lock().unwrap().is_empty(),
+        state.udp.lock().is_empty(),
         "cleanup must remove udp proxy registry"
+    );
+    assert!(
+        udp_proxy.stop.is_cancelled(),
+        "cleanup must cancel the udp stop token so in-flight work conns release the port"
     );
 }
 
@@ -205,6 +193,127 @@ async fn heartbeat_keeps_alive_when_client_responds() {
 }
 
 #[tokio::test]
+async fn dead_write_side_triggers_heartbeat_disconnect() {
+    // 回归：写侧已死（写任务退出 → 出站通道关闭）但读侧静默时，心跳看门狗必须判定断连。
+    // 旧实现在发送失败后 `continue` 跳过本轮，导致永不判定超时；半开连接下 reader 也不会
+    // 返回，服务端就会一直保留该会话（Dashboard 幽灵会话、端口不释放）。
+    let state = ServerState::new();
+    let task = tokio::spawn(handle_control_login(
+        login_frame("deadWrite"),
+        rfrp_common::testutil::DeadWriteStream,
+        "127.0.0.1".parse().unwrap(),
+        state.clone(),
+        ServerConfig::default(),
+        Duration::from_millis(30), // interval
+        Duration::from_millis(60), // timeout
+    ));
+
+    let res = tokio::time::timeout(Duration::from_secs(3), task).await;
+    assert!(
+        res.is_ok(),
+        "control task must end when the write path is dead"
+    );
+    res.unwrap().unwrap().unwrap();
+    assert!(
+        state.sessions.lock().is_empty(),
+        "session must be removed from the registry"
+    );
+}
+
+#[tokio::test]
+async fn session_limit_rejects_new_login() {
+    // 全局会话上限：达到上限后新 run_id 的登录被拒（防止用随机 run_id 无限建会话）。
+    let state = ServerState::new();
+    state
+        .max_sessions
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .sessions
+        .lock()
+        .insert(login_run_id("existing"), test_session("existing"));
+
+    let (server_end, client_end) = duplex(8192);
+    let task = tokio::spawn(handle_control_login(
+        login_frame("newcomer"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        state,
+        ServerConfig::default(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, _cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    match recv_msg(&mut cr).await {
+        Message::LoginResp(r) => assert!(!r.ok, "over-limit login must be rejected"),
+        other => panic!("expected LoginResp, got {other:?}"),
+    }
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn session_limit_allows_same_run_id_reconnect() {
+    // 同一 run_id 的重连替换不计新增：即使全局额度已满也应放行。
+    let state = ServerState::new();
+    state
+        .max_sessions
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .sessions
+        .lock()
+        .insert(login_run_id("dup"), test_session("dup"));
+
+    let (server_end, client_end) = duplex(8192);
+    let task = tokio::spawn(handle_control_login(
+        login_frame("dup"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        state,
+        ServerConfig::default(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, _cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    match recv_msg(&mut cr).await {
+        Message::LoginResp(r) => assert!(r.ok, "same-run_id reconnect must be allowed at the cap"),
+        other => panic!("expected LoginResp, got {other:?}"),
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn per_ip_session_limit_rejects_new_login() {
+    // 每来源 IP 上限：同一 IP 的新 run_id 被拒（全局额度仍有余量）。
+    let state = ServerState::new();
+    state
+        .max_sessions_per_ip
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .sessions
+        .lock()
+        .insert(login_run_id("existing"), test_session("existing"));
+
+    let (server_end, client_end) = duplex(8192);
+    let task = tokio::spawn(handle_control_login(
+        login_frame("newcomer"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        state,
+        ServerConfig::default(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, _cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    match recv_msg(&mut cr).await {
+        Message::LoginResp(r) => assert!(!r.ok, "per-ip over-limit login must be rejected"),
+        other => panic!("expected LoginResp, got {other:?}"),
+    }
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn non_login_first_frame_errors() {
     let (server_end, _client_end) = duplex(8192);
     let state = ServerState::new();
@@ -312,7 +421,7 @@ async fn login_version_mismatch_rejected() {
 
 #[tokio::test]
 async fn auth_failure_rejects_without_echo() {
-    // M3：token 错误时返回 LoginResp{ok=false, error=None}，不建立会话（DESIGN §10.2）。
+    // token 错误时返回 LoginResp{ok=false, error=None}，不建立会话（DESIGN §10.2）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
     let mut config = ServerConfig::default();
@@ -345,7 +454,7 @@ async fn auth_failure_rejects_without_echo() {
         other => panic!("expected LoginResp, got {other:?}"),
     }
     task.await.unwrap().unwrap();
-    assert!(state.sessions.lock().unwrap().is_empty());
+    assert!(state.sessions.lock().is_empty());
 }
 
 #[tokio::test]
@@ -406,7 +515,7 @@ async fn login_ok_returns_session_id_and_registers() {
         }
         other => panic!("expected LoginResp, got {other:?}"),
     }
-    assert_eq!(state.sessions.lock().unwrap().len(), 1);
+    assert_eq!(state.sessions.lock().len(), 1);
     send_msg(&mut cw, Message::Close(Close { reason: None })).await;
     task.await.unwrap().unwrap();
 }

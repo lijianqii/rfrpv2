@@ -168,3 +168,61 @@ async fn read_one_frame_version_mismatch_errors() {
     let (server, _peer) = listener.accept().await.unwrap();
     assert!(read_one_frame(server).await.is_err());
 }
+
+/// 帧解码的属性测试（协议解析是攻击面：任意字节流都不得 panic，长度/版本必须先校验）。
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// 编解码往返：任意 msg_type 与 payload 经 encode → decode 应还原，且缓冲被消费干净。
+        #[test]
+        fn encode_decode_roundtrip_arbitrary(
+            msg_type in any::<u8>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let frame = Frame::new(PROTOCOL_VERSION, msg_type, payload);
+            let mut buf = BytesMut::new();
+            FrameCodec.encode(frame.clone(), &mut buf).unwrap();
+            let decoded = FrameCodec.decode(&mut buf).unwrap().unwrap();
+            prop_assert_eq!(decoded, frame);
+            prop_assert!(buf.is_empty());
+        }
+
+        /// 任意字节流不得让解码器 panic；反复解码覆盖"缓冲里有多帧"的情形。
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let mut buf = BytesMut::from(&bytes[..]);
+            for _ in 0..bytes.len() {
+                match FrameCodec.decode(&mut buf) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+
+        /// 声称超长 length 的帧头必须在等待 payload 之前被拒绝（防缓冲无界增长）。
+        #[test]
+        fn oversized_length_rejected(extra in any::<u32>()) {
+            let len = FRAME_MAX_PAYLOAD.saturating_add(1).saturating_add(extra);
+            let mut buf = BytesMut::new();
+            buf.put_u8(PROTOCOL_VERSION);
+            buf.put_u8(0x01);
+            buf.put_u32(len);
+            prop_assert!(FrameCodec.decode(&mut buf).is_err());
+        }
+
+        /// 版本不符必须被拒绝（不做任何 payload 处理）。
+        #[test]
+        fn wrong_version_rejected(version in any::<u8>()) {
+            prop_assume!(version != PROTOCOL_VERSION);
+            let mut buf = BytesMut::new();
+            buf.put_u8(version);
+            buf.put_u8(0x01);
+            buf.put_u32(0);
+            prop_assert!(FrameCodec.decode(&mut buf).is_err());
+        }
+    }
+}

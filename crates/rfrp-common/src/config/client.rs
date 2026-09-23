@@ -7,7 +7,6 @@ use crate::constants::{
 use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
 use serde::Deserialize;
-use std::net::IpAddr;
 use std::path::Path;
 
 fn default_local_ip() -> String {
@@ -71,11 +70,27 @@ pub struct ClientSection {
 }
 
 impl ClientSection {
-    /// 服务端地址（`server_addr:server_port`）。
-    pub fn server_socket_addr(&self) -> Result<std::net::SocketAddr> {
-        let s = format!("{}:{}", self.server_addr, self.server_port);
-        s.parse()
-            .map_err(|e| config(format!("invalid server addr '{s}': {e}")))
+    /// 解析服务端地址为 `SocketAddr`：IP 字面量直接使用，域名走 DNS 解析。
+    ///
+    /// 每次建连都会调用，因此重连时会重新解析，能拿到 DNS 变更后的地址。
+    pub async fn resolve_server_addr(&self) -> Result<std::net::SocketAddr> {
+        if let Ok(ip) = self.server_addr.parse::<std::net::IpAddr>() {
+            return Ok(std::net::SocketAddr::new(ip, self.server_port));
+        }
+        let mut addrs = tokio::net::lookup_host((self.server_addr.as_str(), self.server_port))
+            .await
+            .map_err(|e| {
+                config(format!(
+                    "cannot resolve server_addr '{}': {e}",
+                    self.server_addr
+                ))
+            })?;
+        addrs.next().ok_or_else(|| {
+            config(format!(
+                "server_addr '{}' resolved to no address",
+                self.server_addr
+            ))
+        })
     }
 
     /// 生效的心跳发送间隔（配置缺省时用默认值）。
@@ -115,9 +130,11 @@ pub struct ClientProxy {
 impl ClientProxy {
     /// 校验本代理条目字段一致性（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
-        self.local_ip
-            .parse::<IpAddr>()
-            .map_err(|_| config(format!("invalid local_ip: {}", self.local_ip)))?;
+        // local_ip 允许域名（如 `db.internal`）：实际解析发生在建连时
+        // （`TcpStream::connect((host, port))`）。这里只做非空/无空白的基础校验。
+        if self.local_ip.trim().is_empty() || self.local_ip.chars().any(char::is_whitespace) {
+            return Err(config(format!("invalid local_ip: {}", self.local_ip)));
+        }
         if !(1..=65535).contains(&self.local_port) {
             return Err(config(format!(
                 "proxy {} local_port {} out of range",
@@ -202,6 +219,14 @@ impl ClientConfig {
 
     /// 校验配置（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
+        if self.client.server_addr.trim().is_empty()
+            || self.client.server_addr.chars().any(char::is_whitespace)
+        {
+            return Err(config(format!(
+                "invalid server_addr: '{}'",
+                self.client.server_addr
+            )));
+        }
         if self.client.server_port == 0 {
             return Err(config("server_port must be > 0"));
         }

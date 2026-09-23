@@ -68,6 +68,73 @@ fn normalize_lowercases_custom_domains() {
 }
 
 #[test]
+fn local_ip_accepts_hostname_and_rejects_empty() {
+    // local_ip 允许域名（实际解析发生在建连时）。
+    let p = proxy(
+        r#"
+        name = "db"
+        type = "tcp"
+        local_ip = "db.internal"
+        local_port = 5432
+        remote_port = 6001
+    "#,
+    );
+    p.validate().unwrap();
+
+    for bad in ["", "  ", "has space"] {
+        let p = ClientProxy {
+            name: "db".into(),
+            r#type: ProxyType::Tcp,
+            local_ip: bad.into(),
+            local_port: 5432,
+            remote_port: Some(6001),
+            custom_domains: None,
+            pool_size: 1,
+        };
+        assert!(p.validate().is_err(), "local_ip '{bad}' must be rejected");
+    }
+}
+
+#[test]
+fn server_addr_rejects_empty() {
+    let toml = r#"
+        [client]
+        server_addr = ""
+        server_port = 7000
+        token = "secret"
+        work_conn_tls = false
+    "#;
+    let cfg: ClientConfig = toml::from_str(toml).unwrap();
+    assert!(cfg.validate().is_err());
+}
+
+#[tokio::test]
+async fn resolve_server_addr_handles_ip_literal_and_hostname() {
+    use crate::config::ClientSection;
+
+    // IP 字面量：直接使用，不做 DNS。
+    let s = ClientSection {
+        server_addr: "127.0.0.1".into(),
+        server_port: 7000,
+        ..Default::default()
+    };
+    assert_eq!(
+        s.resolve_server_addr().await.unwrap(),
+        "127.0.0.1:7000".parse().unwrap()
+    );
+
+    // 域名：走解析（localhost 由 hosts 提供，离线可用）。
+    let s = ClientSection {
+        server_addr: "localhost".into(),
+        server_port: 7000,
+        ..Default::default()
+    };
+    let addr = s.resolve_server_addr().await.unwrap();
+    assert_eq!(addr.port(), 7000);
+    assert!(addr.ip().is_loopback());
+}
+
+#[test]
 fn http_without_domains_fails() {
     let p = proxy(
         r#"
@@ -112,7 +179,7 @@ fn custom_domains_at_limit_ok() {
 
 #[test]
 fn work_conn_tls_requires_server_name() {
-    // M3：work_conn_tls=true 时即使 tls_enable=false 也需要 tls_server_name。
+    // work_conn_tls=true 时即使 tls_enable=false 也需要 tls_server_name。
     let cfg = ClientConfig {
         client: ClientSection {
             server_addr: "s.example.com".into(),

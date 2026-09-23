@@ -86,7 +86,7 @@ where
         }
     });
 
-    // 登录（token 由服务端在 M3 校验；run_id 来自状态以便重连复用，§6.6 / §8.3）。
+    // 登录（token 由服务端校验；run_id 来自状态以便重连复用，§6.6 / §8.3）。
     if !send_with_timeout(
         &out_tx,
         Message::Login(Login {
@@ -119,9 +119,14 @@ where
         loop {
             iv.tick().await;
             let ts = now_ms();
-            if !try_send(&hb_tx, Message::Heartbeat(Heartbeat { ts })) {
-                // 写通道满：跳过本轮，避免本地拥塞误判断连。
-                continue;
+            // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
+            // 说明控制写路径已不可用：此时等不到 pong，必须判定连接失效并重连。
+            // 旧实现此处 `continue` 跳过本轮，会让看门狗在写侧已死时永不触发——
+            // 半开连接下 reader 也不会返回，表现为客户端永久卡住、不重连。
+            if !send_with_timeout(&hb_tx, Message::Heartbeat(Heartbeat { ts })).await {
+                tracing::warn!("heartbeat send failed; control connection considered dead");
+                hb_disconnect.notify_one();
+                break;
             }
             // 等待本轮心跳被回应（pong_ts 必须推进到本轮 ts）。
             let deadline = tokio::time::Instant::now() + heartbeat_timeout;
@@ -153,10 +158,18 @@ where
             frame = reader.next() => {
                 match frame {
                     Some(Ok(f)) => {
-                        let msg = Message::from_frame(&f)?;
+                        // 解码失败不能让函数经 `?` 提前返回：那会跳过心跳/写任务的收尾，
+                        // 每次重连都泄漏一个心跳任务与写任务。改为结束循环走统一收尾。
+                        let msg = match Message::from_frame(&f) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "control frame decode error; reconnecting");
+                                break;
+                            }
+                        };
                         match msg {
                             Message::NewProxyResp(r) => {
-                                if let Some(tx) = state.resps.lock().unwrap().remove(&r.proxy_name) {
+                                if let Some(tx) = state.resps.lock().remove(&r.proxy_name) {
                                     let _ = tx.send(r);
                                 }
                             }
@@ -181,7 +194,7 @@ where
                             }
                             Message::LoginResp(r) => {
                                 // 路由到连接阶段，供 run() 区分致命 / 可恢复失败（§8.1）。
-                                if let Some(tx) = state.login_tx.lock().unwrap().take() {
+                                if let Some(tx) = state.login_tx.lock().take() {
                                     let _ = tx.send(r);
                                 }
                             }

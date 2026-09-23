@@ -51,7 +51,7 @@ mod tests {
 
     /// 环境变量是进程级全局状态：涉及修改的测试用同一把锁串行化，
     /// 避免并发读取到中间态。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// 恢复环境变量（None = 删除）。
     fn restore(key: &str, value: Option<std::ffi::OsString>) {
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn default_run_id_path_under_home_dot_rfrp() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         // HOME 存在（常见环境）：路径应为 ~/.rfrp/run_id（§6.2.1）。
         if let Some(home) = home_dir() {
             let p = default_run_id_path();
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn default_run_id_path_falls_back_to_current_dir() {
         // 无 HOME（服务/容器环境）：回退到当前目录下的 .rfrp/run_id，不 panic。
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         #[cfg(unix)]
         {
             let old = std::env::var_os("HOME");
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn default_run_id_path_uses_home_drive_fallback() {
         // USERPROFILE 缺失（服务/精简环境）时回退 HOMEDRIVE + HOMEPATH。
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         let old = [
             ("USERPROFILE", std::env::var_os("USERPROFILE")),
             ("HOMEDRIVE", std::env::var_os("HOMEDRIVE")),

@@ -185,7 +185,6 @@ pub fn render_prometheus(state: &crate::state::ServerState) -> String {
     let mut stats: Vec<(String, Arc<ProxyStats>)> = state
         .proxy_stats
         .lock()
-        .unwrap()
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -281,7 +280,7 @@ mod tests {
 
     #[test]
     fn render_reflects_all_counter_values() {
-        // 渲染文本应包含各计数器的实际数值（Prometheus 兼容，§M5）。
+        // 渲染文本应包含各计数器的实际数值（Prometheus 兼容）。
         let m = Metrics::new();
         m.total_connections.fetch_add(10, Ordering::Relaxed);
         m.active_connections.fetch_add(4, Ordering::Relaxed);

@@ -1,4 +1,4 @@
-//! M4：UDP 代理集成测试（DESIGN §8.6）。
+//! UDP 代理集成测试（DESIGN §8.6）。
 
 mod common;
 

@@ -24,10 +24,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { version = "1", features = ["v4"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
@@ -45,5 +47,5 @@ strip = true
 
 # 注意：这里**不**设置 `panic = "abort"`。
 # 服务端/客户端以“每条连接一个任务”的方式运行，panic=abort 会让任何一个任务的
-# panic（例如 PoisonError 上的 unwrap）直接终止整个进程。保留 unwind 后，任务级
-# panic 只影响该任务，由 tokio 转换为 JoinError，进程继续服务其他连接。
+# panic 直接终止整个进程。保留 unwind 后，任务级 panic 只影响该任务，由 tokio 转换为
+# JoinError，进程继续服务其他连接（共享状态锁用 parking_lot，不会因 panic 中毒）。

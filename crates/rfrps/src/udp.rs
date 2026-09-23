@@ -1,9 +1,10 @@
 //! UDP 代理：会话映射 + 4 字节长度前缀分帧（DESIGN §8.6）。
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -59,7 +60,6 @@ impl Deref for UdpPacket {
 fn alloc_udp_packet(pool: &Arc<Mutex<Vec<BytesMut>>>, data: &[u8]) -> UdpPacket {
     let mut buf = pool
         .lock()
-        .unwrap()
         .pop()
         .unwrap_or_else(|| BytesMut::with_capacity(data.len().max(2048)));
     buf.clear();
@@ -72,7 +72,7 @@ fn recycle_packets(pool: &Arc<Mutex<Vec<BytesMut>>>, packets: &mut Vec<UdpPacket
     if packets.is_empty() {
         return;
     }
-    let mut pool = pool.lock().unwrap();
+    let mut pool = pool.lock();
     for p in packets.drain(..) {
         if pool.len() >= UDP_PACKET_POOL_MAX {
             break;
@@ -105,6 +105,9 @@ pub struct UdpProxy {
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
     pub session_timeout: Duration,
     pub pending_timeout: Duration,
+    /// 会话级停止信号：控制会话被清理时触发，用于结束仍在途的 UDP 工作连接，
+    /// 释放其持有的 `Arc<UdpProxy>`（进而释放 UDP socket / 端口）。
+    pub stop: CancellationToken,
 }
 
 /// 注册 UDP 代理：绑定 UDP socket 并启动监听循环。
@@ -142,12 +145,9 @@ pub async fn register_udp_proxy(
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
+        stop: CancellationToken::new(),
     });
-    state
-        .udp
-        .lock()
-        .unwrap()
-        .insert(proxy_name.clone(), proxy.clone());
+    state.udp.lock().insert(proxy_name.clone(), proxy.clone());
 
     let session = session.clone();
     let state = state.clone();
@@ -204,7 +204,7 @@ async fn handle_datagram(
 ) {
     // 已配对会话：直接转发到工作连接。
     let tx = {
-        let mut sessions = proxy.sessions.lock().unwrap();
+        let mut sessions = proxy.sessions.lock();
         match sessions.get_mut(&peer) {
             Some(s) => {
                 s.last_active = Instant::now();
@@ -234,16 +234,9 @@ async fn handle_datagram(
     }
 
     // 已有待配对请求：继续投递到暂存通道。
-    let id = { proxy.pending_client.lock().unwrap().get(&peer).copied() };
+    let id = { proxy.pending_client.lock().get(&peer).copied() };
     if let Some(id) = id {
-        let tx = {
-            proxy
-                .pending_by_id
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|p| p.tx.clone())
-        };
+        let tx = { proxy.pending_by_id.lock().get(&id).map(|p| p.tx.clone()) };
         if let Some(tx) = tx {
             // 同会话背压：待配对窗口期也不得阻塞收包循环。
             if tx
@@ -262,7 +255,7 @@ async fn handle_datagram(
 
     // 待配对会话上限：伪造源地址可制造大量 pending，并把每个包放大为一次
     // 工作连接请求（客户端 → 服务端 + 本地服务），超限直接丢弃。
-    if proxy.pending_by_id.lock().unwrap().len() >= MAX_PENDING_UDP_SESSIONS {
+    if proxy.pending_by_id.lock().len() >= MAX_PENDING_UDP_SESSIONS {
         proxy.metrics.inc_udp_dropped();
         tracing::debug!(
             proxy = %proxy_name, %peer,
@@ -280,7 +273,7 @@ async fn handle_datagram(
         .bytes_up
         .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let _ = tx.send(alloc_udp_packet(&proxy.packet_pool, data)).await;
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         work_id,
         PendingUdp {
             client: peer,
@@ -289,7 +282,7 @@ async fn handle_datagram(
             created: Instant::now(),
         },
     );
-    proxy.pending_client.lock().unwrap().insert(peer, work_id);
+    proxy.pending_client.lock().insert(peer, work_id);
     tracing::debug!(proxy = %proxy_name, work_id, %peer, "udp session pending; requesting work conn");
 
     // 请求工作连接：与按需 TCP 路径一致，用带超时发送避免控制通道拥堵时挂起
@@ -315,14 +308,13 @@ async fn handle_datagram(
 /// 清理超时会话与超时待配对项。
 fn sweep(proxy: &Arc<UdpProxy>) {
     let now = Instant::now();
-    let mut sessions = proxy.sessions.lock().unwrap();
+    let mut sessions = proxy.sessions.lock();
     sessions.retain(|_, s| now.duration_since(s.last_active) < proxy.session_timeout);
     drop(sessions);
 
     let expired: Vec<u64> = proxy
         .pending_by_id
         .lock()
-        .unwrap()
         .iter()
         .filter(|(_, p)| now.duration_since(p.created) >= proxy.pending_timeout)
         .map(|(id, _)| *id)
@@ -334,8 +326,8 @@ fn sweep(proxy: &Arc<UdpProxy>) {
 
 /// 摘除一个待配对项（同时清理 `pending_client` 反查表）。
 fn remove_pending(proxy: &Arc<UdpProxy>, work_id: u64) -> Option<PendingUdp> {
-    let pending = proxy.pending_by_id.lock().unwrap().remove(&work_id)?;
-    let mut by_client = proxy.pending_client.lock().unwrap();
+    let pending = proxy.pending_by_id.lock().remove(&work_id)?;
+    let mut by_client = proxy.pending_client.lock();
     // 仅当反查表仍指向该 work_id 时才删除：该源地址期间可能已建立**新的**待配对项，
     // 无条件按地址删除会误删新映射（导致后续数据报重复建连/丢包）。
     if by_client.get(&pending.client) == Some(&work_id) {
@@ -419,10 +411,16 @@ pub async fn handle_udp_work_conn(
                     }
                 }
             }
+            // 控制会话已清理：结束本工作连接，避免其 Arc<UdpProxy> 一直占着 UDP 端口
+            // （否则客户端重连后重新注册同一 UDP 代理会得到 port occupied）。
+            _ = proxy.stop.cancelled() => {
+                tracing::debug!(work_id, "udp work connection stopped by session cleanup");
+                break;
+            }
         }
     }
 
-    proxy.sessions.lock().unwrap().remove(&client);
+    proxy.sessions.lock().remove(&client);
     tracing::debug!(client = %client, work_id, "udp work connection closed");
     Ok(())
 }
@@ -447,7 +445,7 @@ async fn forward_to_client(
 
 /// 登记已配对的 UDP 会话（工作连接就绪后调用）。
 fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<UdpPacket>) {
-    proxy.sessions.lock().unwrap().insert(
+    proxy.sessions.lock().insert(
         client,
         UdpSession {
             tx,
@@ -458,19 +456,19 @@ fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<
 
 /// 更新 UDP 会话的最后活跃时间（双向流量都算活跃）。
 fn touch_session(proxy: &Arc<UdpProxy>, client: SocketAddr) {
-    if let Some(s) = proxy.sessions.lock().unwrap().get_mut(&client) {
+    if let Some(s) = proxy.sessions.lock().get_mut(&client) {
         s.last_active = Instant::now();
     }
 }
 
 /// 判断代理是否为 UDP 类型。
 pub fn is_udp_proxy(state: &ServerState, proxy_name: &str) -> bool {
-    state.udp.lock().unwrap().contains_key(proxy_name)
+    state.udp.lock().contains_key(proxy_name)
 }
 
 /// 取 UDP 代理运行状态。
 pub fn get_udp_proxy(state: &ServerState, proxy_name: &str) -> Option<Arc<UdpProxy>> {
-    state.udp.lock().unwrap().get(proxy_name).cloned()
+    state.udp.lock().get(proxy_name).cloned()
 }
 
 #[cfg(test)]

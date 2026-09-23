@@ -2,21 +2,9 @@
 
 use super::*;
 use crate::metrics::Metrics;
-use tokio::sync::Notify;
 
 fn test_session() -> (Arc<Session>, mpsc::Receiver<Message>) {
-    let (tx, rx) = mpsc::channel::<Message>(16);
-    let session = Arc::new(Session {
-        run_id: "r".into(),
-        session_id: "s".into(),
-        work_conn_token: "tok".into(),
-        tx,
-        proxies: Mutex::new(HashMap::new()),
-        proxy_domains: Mutex::new(HashMap::new()),
-        stop: Arc::new(Notify::new()),
-        pools: Mutex::new(HashMap::new()),
-    });
-    (session, rx)
+    crate::control::test_session_with_token("r", "tok")
 }
 
 async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc<UdpProxy> {
@@ -30,6 +18,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout,
+        stop: CancellationToken::new(),
     })
 }
 
@@ -39,14 +28,14 @@ async fn sweep_removes_expired_session_and_pending() {
     let (tx, _rx) = mpsc::channel::<UdpPacket>(4);
     let old = Instant::now() - Duration::from_secs(1);
 
-    proxy.sessions.lock().unwrap().insert(
+    proxy.sessions.lock().insert(
         "127.0.0.1:1".parse().unwrap(),
         UdpSession {
             tx: tx.clone(),
             last_active: old,
         },
     );
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         1,
         PendingUdp {
             client: "127.0.0.1:2".parse().unwrap(),
@@ -58,10 +47,9 @@ async fn sweep_removes_expired_session_and_pending() {
     proxy
         .pending_client
         .lock()
-        .unwrap()
         .insert("127.0.0.1:2".parse().unwrap(), 1);
     // 新鲜会话应保留。
-    proxy.sessions.lock().unwrap().insert(
+    proxy.sessions.lock().insert(
         "127.0.0.1:3".parse().unwrap(),
         UdpSession {
             tx: tx.clone(),
@@ -74,15 +62,13 @@ async fn sweep_removes_expired_session_and_pending() {
     assert!(!proxy
         .sessions
         .lock()
-        .unwrap()
         .contains_key(&"127.0.0.1:1".parse().unwrap()));
     assert!(proxy
         .sessions
         .lock()
-        .unwrap()
         .contains_key(&"127.0.0.1:3".parse().unwrap()));
-    assert!(proxy.pending_by_id.lock().unwrap().is_empty());
-    assert!(proxy.pending_client.lock().unwrap().is_empty());
+    assert!(proxy.pending_by_id.lock().is_empty());
+    assert!(proxy.pending_client.lock().is_empty());
 }
 
 /// 回归：清理过期待配对项时，不能误删**同一源地址**在此期间新建的映射。
@@ -98,7 +84,7 @@ async fn sweep_keeps_newer_pending_for_same_client() {
     let client: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
     // A：已过期；反查表已被指向新条目 B。
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         1,
         PendingUdp {
             client,
@@ -107,7 +93,7 @@ async fn sweep_keeps_newer_pending_for_same_client() {
             created: old,
         },
     );
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         2,
         PendingUdp {
             client,
@@ -116,20 +102,20 @@ async fn sweep_keeps_newer_pending_for_same_client() {
             created: Instant::now(),
         },
     );
-    proxy.pending_client.lock().unwrap().insert(client, 2);
+    proxy.pending_client.lock().insert(client, 2);
 
     sweep(&proxy);
 
     assert!(
-        !proxy.pending_by_id.lock().unwrap().contains_key(&1),
+        !proxy.pending_by_id.lock().contains_key(&1),
         "过期待配对项应被清理"
     );
     assert!(
-        proxy.pending_by_id.lock().unwrap().contains_key(&2),
+        proxy.pending_by_id.lock().contains_key(&2),
         "新待配对项必须保留"
     );
     assert_eq!(
-        proxy.pending_client.lock().unwrap().get(&client),
+        proxy.pending_client.lock().get(&client),
         Some(&2),
         "反查表必须仍指向新条目"
     );
@@ -144,7 +130,7 @@ async fn datagram_forwarded_to_paired_session() {
     let peer: SocketAddr = "127.0.0.1:1001".parse().unwrap();
 
     let (tx, mut rx) = mpsc::channel::<UdpPacket>(4);
-    proxy.sessions.lock().unwrap().insert(
+    proxy.sessions.lock().insert(
         peer,
         UdpSession {
             tx,
@@ -168,7 +154,7 @@ async fn datagram_delivered_to_pending_session() {
     let peer: SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
     let (tx, mut rx) = mpsc::channel::<UdpPacket>(4);
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         5,
         PendingUdp {
             client: peer,
@@ -177,7 +163,7 @@ async fn datagram_delivered_to_pending_session() {
             created: Instant::now(),
         },
     );
-    proxy.pending_client.lock().unwrap().insert(peer, 5);
+    proxy.pending_client.lock().insert(peer, 5);
 
     handle_datagram(&proxy, "udp-x", &session, &state, peer, b"again").await;
 
@@ -197,7 +183,7 @@ async fn datagram_dropped_when_session_channel_full() {
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
     tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
         .expect("fill channel");
-    proxy.sessions.lock().unwrap().insert(
+    proxy.sessions.lock().insert(
         peer,
         UdpSession {
             tx,
@@ -233,7 +219,7 @@ async fn datagram_dropped_when_pending_channel_full() {
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
     tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
         .expect("fill channel");
-    proxy.pending_by_id.lock().unwrap().insert(
+    proxy.pending_by_id.lock().insert(
         7,
         PendingUdp {
             client: peer,
@@ -242,7 +228,7 @@ async fn datagram_dropped_when_pending_channel_full() {
             created: Instant::now(),
         },
     );
-    proxy.pending_client.lock().unwrap().insert(peer, 7);
+    proxy.pending_client.lock().insert(peer, 7);
 
     tokio::time::timeout(
         Duration::from_millis(500),
@@ -285,14 +271,12 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
     let id = proxy
         .pending_client
         .lock()
-        .unwrap()
         .get(&peer)
         .copied()
         .expect("client mapped to work_id");
     let mut p = proxy
         .pending_by_id
         .lock()
-        .unwrap()
         .remove(&id)
         .expect("pending exists");
     let first = tokio::time::timeout(Duration::from_secs(1), p.rx.recv())
@@ -312,7 +296,7 @@ async fn datagram_dropped_when_pending_limit_reached() {
     for i in 0..MAX_PENDING_UDP_SESSIONS {
         let (tx, rx) = mpsc::channel::<UdpPacket>(4);
         let client: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 20000 + i as u16));
-        proxy.pending_by_id.lock().unwrap().insert(
+        proxy.pending_by_id.lock().insert(
             i as u64 + 1,
             PendingUdp {
                 client,
@@ -321,23 +305,19 @@ async fn datagram_dropped_when_pending_limit_reached() {
                 created: Instant::now(),
             },
         );
-        proxy
-            .pending_client
-            .lock()
-            .unwrap()
-            .insert(client, i as u64 + 1);
+        proxy.pending_client.lock().insert(client, i as u64 + 1);
     }
 
     let peer: SocketAddr = "127.0.0.1:65500".parse().unwrap();
     handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop-me").await;
 
     assert_eq!(
-        proxy.pending_by_id.lock().unwrap().len(),
+        proxy.pending_by_id.lock().len(),
         MAX_PENDING_UDP_SESSIONS,
         "no new pending entry beyond the limit"
     );
     assert!(
-        !proxy.pending_client.lock().unwrap().contains_key(&peer),
+        !proxy.pending_client.lock().contains_key(&peer),
         "dropped peer must not be registered"
     );
     assert!(

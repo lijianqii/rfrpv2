@@ -71,7 +71,7 @@ where
 
     // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
     if work_id == WORK_ID_POOL_RESERVED {
-        let mut pools = session.pools.lock().unwrap();
+        let mut pools = session.pools.lock();
         let pool = pools.entry(proxy_name.clone()).or_default();
         // 池上限：`pool_size` 是客户端本地配置、不上送协议，服务端必须自设上限，
         // 否则持有合法 token 的连接可以把池子灌满（每条都是常驻 socket + 内存）。
@@ -91,7 +91,7 @@ where
 
     // 待处理用户连接：必须属于同一会话且 proxy_name 一致（防止跨会话/跨代理认领）。
     let pending = {
-        let mut map = state.pending.lock().unwrap();
+        let mut map = state.pending.lock();
         let owned = map
             .get(&work_id)
             .is_some_and(|e| e.session_id == session.session_id && e.proxy_name == proxy_name);
@@ -123,13 +123,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use rfrp_common::constants::{MAX_POOLED_WORK_CONNS_PER_PROXY, PROTOCOL_VERSION};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
 
     fn start_frame(proxy_name: &str, work_id: u64, token: Option<&str>) -> Frame {
         Message::StartWorkConn(StartWorkConn {
@@ -144,22 +144,8 @@ mod tests {
     /// 构造"已登录且已注册 ssh 代理"的状态：`session_for_proxy` 需要它才能校验工作连接。
     fn state_with_session(token: &str) -> (Arc<ServerState>, Arc<Session>) {
         let state = ServerState::new();
-        let (tx, _rx) = mpsc::channel::<Message>(8);
-        let session = Arc::new(Session {
-            run_id: "r1".into(),
-            session_id: "s1".into(),
-            work_conn_token: token.into(),
-            tx,
-            proxies: Mutex::new(HashMap::new()),
-            proxy_domains: Mutex::new(HashMap::new()),
-            stop: Arc::new(tokio::sync::Notify::new()),
-            pools: Mutex::new(HashMap::new()),
-        });
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert("r1".into(), session.clone());
+        let session = crate::control::test_session_with_token("r1", token).0;
+        state.sessions.lock().insert("r1".into(), session.clone());
         state.index_proxy("ssh", "r1");
         (state, session)
     }
@@ -235,11 +221,11 @@ mod tests {
         )
         .await
         .is_ok());
-        assert_eq!(session.pools.lock().unwrap()["ssh"].len(), 1);
+        assert_eq!(session.pools.lock()["ssh"].len(), 1);
 
         // 灌满到上限。
         {
-            let mut pools = session.pools.lock().unwrap();
+            let mut pools = session.pools.lock();
             let pool = pools.entry("ssh".into()).or_default();
             while pool.len() < MAX_POOLED_WORK_CONNS_PER_PROXY {
                 pool.push(Box::new(tokio::io::duplex(8).0));
@@ -256,7 +242,7 @@ mod tests {
         .await
         .is_ok());
         assert_eq!(
-            session.pools.lock().unwrap()["ssh"].len(),
+            session.pools.lock()["ssh"].len(),
             MAX_POOLED_WORK_CONNS_PER_PROXY,
             "rejected connection must not be pooled"
         );
@@ -280,6 +266,6 @@ mod tests {
         )
         .await
         .is_ok());
-        assert!(session.pools.lock().unwrap().is_empty());
+        assert!(session.pools.lock().is_empty());
     }
 }

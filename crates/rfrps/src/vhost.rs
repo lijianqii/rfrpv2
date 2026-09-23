@@ -177,7 +177,6 @@ async fn route_and_dispatch(
     let kind_ok = session
         .proxies
         .lock()
-        .unwrap()
         .get(&proxy_name)
         .map(|e| e.kind == expected_kind)
         .unwrap_or(false);
@@ -285,22 +284,11 @@ mod tests {
     use super::*;
     use crate::control::Session;
     use crate::state::ServerState;
-    use tokio::sync::mpsc;
 
     fn test_session(run_id: &str, domains: &[&str]) -> Arc<Session> {
-        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
-        let session = Arc::new(Session {
-            run_id: run_id.into(),
-            session_id: "s".into(),
-            work_conn_token: "tok".into(),
-            tx,
-            proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
-            proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),
-            stop: Arc::new(tokio::sync::Notify::new()),
-            pools: std::sync::Mutex::new(std::collections::HashMap::new()),
-        });
+        let session = crate::control::test_session(run_id);
         {
-            let mut map = session.proxy_domains.lock().unwrap();
+            let mut map = session.proxy_domains.lock();
             for d in domains {
                 map.insert(d.to_string(), "web".to_string());
             }
@@ -325,7 +313,7 @@ mod tests {
         let s1 = test_session("r1", &["dev.example.com"]);
         let s2 = test_session("r2", &["other.example.com"]);
         {
-            let mut sessions = state.sessions.lock().unwrap();
+            let mut sessions = state.sessions.lock();
             sessions.insert("r1".into(), s1.clone());
             sessions.insert("r2".into(), s2.clone());
         }
@@ -354,11 +342,10 @@ mod tests {
 #[cfg(test)]
 mod head_tests {
     use super::*;
-    use crate::control::ProxyEntry;
-    use crate::control::Session;
+    use crate::control::test_entry;
+
     use crate::state::ServerState;
     use tokio::io::{duplex, AsyncWriteExt};
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn read_request_head_partial_eof_returns_none() {
@@ -381,30 +368,17 @@ mod head_tests {
     async fn route_and_dispatch_type_mismatch_ok() {
         // 会话里代理是 Tcp 类型，但 vhost 期望 Http：应返回 Ok 且不建立连接。
         let state = ServerState::new();
-        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
-        let session = Arc::new(Session {
-            run_id: "r".into(),
-            session_id: "s".into(),
-            work_conn_token: "tok".into(),
-            tx,
-            proxies: std::sync::Mutex::new(std::collections::HashMap::new()),
-            proxy_domains: std::sync::Mutex::new(std::collections::HashMap::new()),
-            stop: Arc::new(tokio::sync::Notify::new()),
-            pools: std::sync::Mutex::new(std::collections::HashMap::new()),
-        });
+        let session = crate::control::test_session("r");
         {
-            let mut m = session.proxy_domains.lock().unwrap();
+            let mut m = session.proxy_domains.lock();
             m.insert("dev.example.com".into(), "web".into());
         }
-        session.proxies.lock().unwrap().insert(
-            "web".into(),
-            ProxyEntry {
-                handle: tokio::spawn(async {}),
-                kind: ProxyType::Tcp,
-            },
-        );
+        session
+            .proxies
+            .lock()
+            .insert("web".into(), test_entry(ProxyType::Tcp));
         {
-            let mut sessions = state.sessions.lock().unwrap();
+            let mut sessions = state.sessions.lock();
             sessions.insert("r".into(), session);
         }
         state.index_domain("dev.example.com", "r", "web");

@@ -1,10 +1,11 @@
 //! 客户端 CLI 参数覆盖配置。
 
 use rfrp_common::config::ClientConfig;
+use rfrp_common::util::addr::split_host_port;
 
 /// 将 CLI 参数覆盖到客户端配置（DESIGN §9.3）。
 ///
-/// 返回 `Err` 表示参数解析失败（如 `--server` 不是合法 `ADDR:PORT`）。
+/// 返回 `Err` 表示参数解析失败（如 `--server` 不是合法 `HOST:PORT`）。
 pub fn apply_cli_overrides(
     cfg: &mut ClientConfig,
     server: Option<String>,
@@ -13,11 +14,10 @@ pub fn apply_cli_overrides(
     work_conn_tls: Option<bool>,
 ) -> std::result::Result<(), String> {
     if let Some(server) = server {
-        let addr: std::net::SocketAddr = server
-            .parse()
-            .map_err(|e| format!("invalid --server '{server}': {e}"))?;
-        cfg.client.server_addr = addr.ip().to_string();
-        cfg.client.server_port = addr.port();
+        // HOST 允许域名 / IPv4 / `[IPv6]`。
+        let (host, port) = split_host_port(&server).map_err(|e| e.to_string())?;
+        cfg.client.server_addr = host;
+        cfg.client.server_port = port;
     }
     if let Some(token) = token {
         cfg.client.token = token;
@@ -59,5 +59,20 @@ mod tests {
         assert!(
             apply_cli_overrides(&mut cfg, Some("not-an-addr".into()), None, None, None).is_err()
         );
+    }
+
+    #[test]
+    fn apply_cli_overrides_accepts_hostname() {
+        let mut cfg = ClientConfig::default();
+        apply_cli_overrides(
+            &mut cfg,
+            Some("frp.example.com:7000".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.client.server_addr, "frp.example.com");
+        assert_eq!(cfg.client.server_port, 7000);
     }
 }

@@ -37,3 +37,45 @@ pub fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     l.local_addr().expect("local_addr").port()
 }
+
+/// 读端永远 `Pending`、写端立即报错的测试流：模拟"写侧已死但读侧静默"的半开连接。
+///
+/// 用于验证心跳看门狗在写路径失效时仍能判定断连（rfrps / rfrpc 两侧共用一份实现）。
+pub struct DeadWriteStream;
+
+impl tokio::io::AsyncRead for DeadWriteStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tokio::io::AsyncWrite for DeadWriteStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "dead write side",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}

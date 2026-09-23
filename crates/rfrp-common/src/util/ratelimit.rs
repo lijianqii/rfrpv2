@@ -1,8 +1,8 @@
 //! 简单的每 IP 请求限频（滑动窗口计数），Dashboard 与客户端状态端点共用。
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 限频表条目上限：达到后先清理过期项再插入（防不同源 IP 导致内存增长）。
@@ -27,7 +27,7 @@ impl RateLimiter {
 
     /// 是否允许该 IP 的本次请求（`now` 由调用方提供，便于测试）。
     pub fn allow(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut m = self.inner.lock().unwrap();
+        let mut m = self.inner.lock();
         if let Some((count, start)) = m.get_mut(&ip) {
             if now.duration_since(*start) >= self.window {
                 *count = 1;
@@ -79,6 +79,6 @@ mod tests {
             let _ = limiter.allow(ip, now - Duration::from_secs(1));
         }
         let _ = limiter.allow("9.9.9.9".parse().unwrap(), now);
-        assert!(limiter.inner.lock().unwrap().len() < MAX_ENTRIES);
+        assert!(limiter.inner.lock().len() < MAX_ENTRIES);
     }
 }

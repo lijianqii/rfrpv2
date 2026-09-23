@@ -6,8 +6,72 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`--check` 配置校验模式**：`rfrp server -c x.toml --check` / `rfrp client -c x.toml --check`
+  只加载、覆盖、校验配置并打印生效摘要（token 只显示"已设置 + 长度"，不打印明文），
+  不监听端口、不建立连接，便于部署前与 CI 校验。
+- **地址支持域名**：`server_addr`、`bind_addr`、`local_ip` 以及 `--server` / `--bind` 均支持
+  域名（`frp.example.com`、`localhost`）与 `[IPv6]` 字面量。客户端每次重连都会重新解析
+  `server_addr`，可跟上 DNS 变更；本地服务回连改用 `(host, port)` 形式，顺带修正了
+  IPv6 字面量拼接成 `::1:22` 的隐患。
+- **`rfrp client status`**：查询本地 `[client].status_addr` 端点并打印 `/api/status` 的 JSON，
+  不必开浏览器；未启用状态端点时给出配置提示。
+- **`rfrp completions <shell>`**：生成 bash / zsh / fish / PowerShell / elvish 补全脚本。
+- **`[server].grace_secs`**：优雅退出宽限期从"只能 CLI 覆盖"变为可写入配置（默认 30，上限 3600），
+  与其它运行参数一致。
+- **看板展示代理细节**：代理卡片新增公网端口 / 域名（此前只有名字与类型，排障要跳到客户端页面）。
+
+### Changed
+
+- **并发控制会话上限**：新增全局 `MAX_SESSIONS`(1024) 与单来源 IP `MAX_SESSIONS_PER_IP`(256)。
+  登录限速只统计失败次数，此前持有效 token 的客户端可用随机 `run_id` 无限建立控制会话
+  （每个都会注册代理、占用 fd 与内存）；同一 `run_id` 的重连替换不计新增。
+- **测试构造器去重**：`Session` / `ClientState` / `ProxyEntry` 的测试构造收敛到各自 crate 的
+  `#[cfg(test)]` 助手（`test_session` / `test_state` / `test_entry`），后续增字段只需改一处。
+- **清理陈旧的里程碑注释**：`auth` / `control` / 测试文件头部等处的 `M1`–`M5` 标记改为
+  描述性文字（DESIGN 中的里程碑记录保留）。
+- **帧解码属性测试**：新增 proptest 覆盖"任意字节流不 panic""编解码往返""超长 length 与
+  版本不符先于 payload 被拒"，强化协议解析这一攻击面的保障。
+- **未提供 `-c` 时返回非零退出码**：此前打印一句提示后返回 0，脚本 / 服务管理器会误判为
+  "启动成功"。现改为打印提示（含示例路径与 `--help` 指引）并返回失败码。
+- **失败日志补充上下文与可操作提示**：控制 / vhost / Dashboard 端口绑定失败会带上具体地址；
+  服务端对 `port not allowed` 记录被拒端口与 `allow_ports` 范围；客户端对不可重试的注册失败
+  输出 `hint=` 修正方向；本地服务回连失败日志带上 `local=<host:port>`。
+- **配置文件与证书读取失败使用稳定错误文案**（如 `not found (os error 2)`），不再透出操作
+  系统本地化文案。
+- **共享状态锁改用 `parking_lot::Mutex`**：原 `std::sync::Mutex` 一旦某任务持锁 panic 就会
+  中毒，之后所有 `lock().unwrap()` 都跟着 panic，导致相关功能整体失效——这与"保留
+  `panic = "unwind"` 让单任务 panic 不影响进程"的设计相悖。现改用无中毒语义的
+  `parking_lot::Mutex`（`rfrps` / `rfrpc` / `rfrp-common::util::ratelimit`），并去掉全部
+  `lock().unwrap()`。日志写者与测试内的独立锁保持 `std::sync::Mutex`。
+- **待处理工作连接改为单周期扫描清理**：原实现为每个按需用户连接派生一个 sleep 任务等待
+  `WORK_CONN_TIMEOUT_RFRPS`，高连接速率下会同时存在大量睡眠任务。现由 `Server::run` 里的
+  单个 1s 周期任务扫描 `pending` 表（`PendingWork` 记录登记时刻），超时项统一关闭；
+  对应单测不再需要真实等待 10s。
+- **客户端代理注册重试感知退出信号**：`retry_registration` 的退避等待改为 `select!` 监听
+  shutdown，进程退出时不再需要等满一个退避周期（最长约 30s）。
+- **客户端注册响应通道不再累积**：`register_one_proxy` 在发送失败 / 响应超时 / 通道关闭时
+  移除 `state.resps` 条目，控制循环结束后再统一清空兜底。
+- **文档**：README 补充 TCP 与 UDP 数据连接在控制面重连时的语义差异（TCP 数据连接保留、
+  UDP 会话随控制会话清理）。
+
 ### Fixed
 
+- **心跳看门狗在写侧失效时不再"装死"（客户端不重连 / 服务端不清理会话）**：心跳任务发送
+  `Heartbeat` 失败时（出站通道已关闭，或写任务阻塞超过 `CONTROL_SEND_TIMEOUT` 导致通道满）
+  旧实现直接 `continue` 跳过本轮——既不判定超时也不再尝试发送。半开连接（链路静默中断、
+  无 FIN/RST）下读侧也不会返回，于是**客户端永久卡住不重连、服务端永久保留会话与其端口**。
+  现在发送失败即判定控制连接失效，触发断开/重连；两侧各有回归测试
+  `dead_write_side_triggers_heartbeat_disconnect`。
+- **控制循环异常退出不再跳过清理**：服务端控制循环里 `Message::from_frame` 解码失败经 `?`
+  提前返回，会跳过会话注销与 `cleanup`（幽灵会话、`remote_port` 不释放、心跳/写任务泄漏）；
+  客户端同样会泄漏心跳与写任务。登录响应发送失败、客户端登录响应失败/超时也各自漏掉收尾
+  （后者还会把控制任务分离、连旧连接一起泄漏）。现统一改为结束循环走收尾路径或显式 `abort`。
+- **控制会话清理时结束在途 UDP 工作连接**：会话断开后 `cleanup` 只移除 UDP 代理注册并中止
+  监听循环，但已在途的 UDP 工作连接仍持有 `Arc<UdpProxy>`（含 UDP socket），端口不会释放；
+  客户端重连后重新注册同一 UDP 代理会持续得到 `port occupied`。现 `UdpProxy` 增加会话级
+  `stop` 令牌，`cleanup` 时取消，工作连接据此退出并释放端口。
 - **UDP 清理可能误删新会话的映射**：`sweep` 清理过期待配对项时，按源地址无条件删除
   `pending_client` 反查表；若该源地址在此期间已建立**新的**待配对项，映射会被抹掉，
   后续数据报被当成新会话处理（重复请求工作连接 + 丢包）。现在仅当反查表仍指向被清理的

@@ -82,6 +82,23 @@ cargo run -- client -c examples/rfrp-client.toml
 
 服务端示例监听 `0.0.0.0:7000`（`bind_addr` 默认值，可按需改为回环地址），客户端通过 TLS 连接并注册 TCP 代理。
 
+启动前可先用 `--check` 只校验配置并打印生效摘要（不监听端口、不建连，不会打印 token 明文）：
+
+```bash
+rfrp server -c examples/rfrp-server.toml --check
+rfrp client -c examples/rfrp-client.toml --check
+```
+
+`server_addr`、`bind_addr`、`local_ip` 以及 `--server` / `--bind` 都支持域名（如
+`frp.example.com`、`localhost`）；IPv6 字面量写作 `[::1]:7000`。客户端每次重连都会重新
+解析 `server_addr`，可跟上 DNS 变更。
+
+其它子命令：
+
+- `rfrp client status -c <config> [--addr <host:port>]`：查询本地 `[client].status_addr`
+  状态端点并打印 `/api/status` 的 JSON，不必开浏览器。
+- `rfrp completions <bash|zsh|fish|powershell|elvish>`：输出 shell 补全脚本。
+
 ## 监控与运维
 
 ### 服务端 Dashboard
@@ -104,7 +121,7 @@ password = "change-me"      # 至少 6 位
 |---|---|
 | `GET /login` | 登录页（`POST /login` 提交表单） |
 | `GET /logout` | 退出登录（清除会话 Cookie） |
-| `GET /` | 看板（KPI 卡片、流量走势、代理卡片、会话列表；内嵌初始状态，5s 轮询刷新） |
+| `GET /` | 看板（KPI 卡片、流量走势、代理卡片含公网端口/域名、会话列表；内嵌初始状态，5s 轮询刷新） |
 | `GET /api/status` | JSON：会话与代理清单、pending、UDP 会话、池、指标 |
 | `GET /metrics` | Prometheus 文本 |
 | `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
@@ -209,6 +226,8 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
   heartbeat_interval_secs = 30
   heartbeat_timeout_secs = 10
   ```
+- **优雅退出宽限期可配**：`[server].grace_secs`（默认 30，上限 3600）控制停止接收新连接后
+  等待在途连接结束的最长时间；也可用 `--grace-secs` 覆盖。
 - **HTTP vhost 按连接路由**：rfrps 只按**首个请求**的 `Host`（HTTPS 优先 SNI）选择后端，之后整条连接透传。
   因此不要在同一条 HTTP/1.1 keep-alive 连接上混用多个域名；未匹配到代理的请求会收到 `404 Not Found`
   （而不是被静默断连）。
@@ -220,7 +239,8 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
 - **代理注册被拒**：客户端日志会给出稳定错误码（`invalid type` / `invalid field` / `proxy_name exists` /
   `port not allowed` / `port occupied` / `domain conflict` / `internal error`）。`port occupied` 与
   `domain conflict` 为运行时冲突，客户端会自动退避重试（2s→30s，约 2 分钟）；其余为配置问题，需修正配置。
-  服务端日志同时记录详细原因（端口、占用者等）。
+  客户端日志同时带 `hint=` 给出对应的修正方向；服务端日志记录详细原因（端口、占用者、
+  不在 `allow_ports` 内的具体端口与允许范围等）。
 - **`remote_port` 无法绑定**：检查 `allow_ports` 是否放行、端口是否被其他进程占用、是否使用了特权端口（<1024）。
 
 ### 服务端连不上（客户端反复 `connect timeout`）
@@ -263,7 +283,12 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
 
 - **控制连接异常**：客户端每 30s 心跳、10s 未收到回应判定失联并重连（指数退避 1s→30s）；
   两个参数均可配置（`heartbeat_interval_secs` / `heartbeat_timeout_secs`，见"注意事项"）；
-  已建立的数据连接（SSH/RDP 会话）在控制面重连期间**不受影响**（有集成测试覆盖）。
+  心跳看门狗同时覆盖**写侧失效**：出站发送失败（写任务退出或阻塞超时）即判定控制连接
+  失效并触发重连 / 会话清理，不会出现"链路半开却一直不重连、服务端不清理"的僵死状态。
+- **TCP 与 UDP 数据连接的语义差异**：已建立的 **TCP** 数据连接（SSH/RDP 会话）在控制面
+  重连期间**不受影响**（有集成测试覆盖）；而 **UDP** 代理会话绑定在控制会话上——控制会话
+  被清理时服务端会结束其 UDP 工作连接并释放端口，客户端重连后重新注册、重建会话
+  （避免端口被旧会话长期占用导致 `port occupied`）。
 - **RTT 观测**：`rfrp_rtt_ms` / `rfrp_client_rtt_ms` 给出控制链路往返时延，可用于判断链路质量与抖动。
 
 ### 长连接与空闲会话（RDP/SSH）
@@ -287,6 +312,9 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
   连接后不发数据不会长期占用资源。
 - **UDP 放大防护**：单个 UDP 代理的待配对会话上限 `MAX_PENDING_UDP_SESSIONS`(256)，
   超限丢包并计入 `rfrp_udp_dropped_total`（伪造源地址无法把 1 个 UDP 包放大成大量工作连接）。
+- **并发会话上限**：全局控制会话上限 `MAX_SESSIONS`(1024)、单来源 IP 上限
+  `MAX_SESSIONS_PER_IP`(256)。登录限速只统计失败次数，因此还需要这道闸门，防止持有效 token
+  的客户端用随机 `run_id` 无限建立控制会话；同一 `run_id` 的重连替换不计新增。
 - **连接累积**：accept 循环持续回收已完成任务（避免按连接数累积内存）。
 
 ### 日志与高延迟链路

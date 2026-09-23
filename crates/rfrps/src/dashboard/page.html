@@ -60,6 +60,8 @@ main{max-width:1180px;margin:1.2rem auto 3rem;padding:0 1.2rem;display:flex;flex
 .proxy-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.3rem .6rem;font-size:.82rem;color:var(--muted)}
 .proxy-stats b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
 .proxy-stats .full{grid-column:1/-1}
+.proxy-meta{margin-top:.45rem;font-size:.78rem;color:var(--muted);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--line)}
@@ -205,7 +207,9 @@ tr:last-child td{border-bottom:0}
       (sess.proxies || []).forEach(function (p) {
         if (!map.has(p.name)) {
           map.set(p.name, {
-            name: p.name, kind: p.kind, bytes_up: 0, bytes_down: 0,
+            name: p.name, kind: p.kind,
+            remote_port: p.remote_port, domains: p.domains,
+            bytes_up: 0, bytes_down: 0,
             connections_total: 0, active_connections: 0
           });
         }
@@ -258,8 +262,18 @@ tr:last-child td{border-bottom:0}
       stats.appendChild(stat("累计", p.connections_total));
       stats.appendChild(stat("上行", fmtBytes(p.bytes_up)));
       stats.appendChild(stat("下行", fmtBytes(p.bytes_down)));
+      var meta = "";
+      if (p.remote_port) meta = "远程端口 " + p.remote_port;
+      else if (p.domains && p.domains.length) meta = "域名 " + p.domains.join(", ");
       card.appendChild(head);
       card.appendChild(stats);
+      if (meta) {
+        var metaEl = document.createElement("div");
+        metaEl.className = "proxy-meta";
+        metaEl.textContent = meta;
+        metaEl.title = meta;
+        card.appendChild(metaEl);
+      }
       box.appendChild(card);
     });
   }

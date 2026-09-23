@@ -1,4 +1,4 @@
-//! M5：Dashboard / 指标集成测试。
+//! Dashboard / 指标集成测试。
 
 mod common;
 
@@ -44,8 +44,14 @@ async fn dashboard_metrics_and_page() {
 
     let (status, body) = http_get(port, "/", Some(&auth)).await;
     assert_eq!(status, 200);
-    assert!(body.contains("<!DOCTYPE html>"), "expected html page: {body}");
-    assert!(body.contains("rfrp dashboard"), "expected board title: {body}");
+    assert!(
+        body.contains("<!DOCTYPE html>"),
+        "expected html page: {body}"
+    );
+    assert!(
+        body.contains("rfrp dashboard"),
+        "expected board title: {body}"
+    );
     assert!(
         body.contains("rfrp-bootstrap"),
         "expected bootstrap status data: {body}"
@@ -87,7 +93,10 @@ async fn dashboard_browser_gets_login_page() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (status, body) = http_get_browser(port, "/").await;
-    assert_eq!(status, 401, "login page is returned for unauthenticated users");
+    assert_eq!(
+        status, 401,
+        "login page is returned for unauthenticated users"
+    );
     assert!(
         body.contains("action=\"/login\"") && body.contains("type=\"password\""),
         "expected a login form: {body}"
@@ -114,8 +123,7 @@ async fn dashboard_page_embeds_valid_bootstrap_json() {
     let open = body[anchor..].find('>').expect("script open tag") + anchor + 1;
     let close = body[open..].find("</script>").expect("script close tag") + open;
     let json = &body[open..close];
-    let v: serde_json::Value =
-        serde_json::from_str(json).expect("bootstrap must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(json).expect("bootstrap must be valid JSON");
     assert!(v.get("sessions").is_some());
     assert_eq!(v["metrics"]["accepting"], serde_json::json!(true));
 
@@ -146,14 +154,12 @@ async fn dashboard_form_login_grants_cookie_session() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 正确凭据：302 回首页并下发会话 Cookie。
-    let (status, resp) =
-        http_post_form(port, "/login", "user=admin&password=secret123").await;
+    let (status, resp) = http_post_form(port, "/login", "user=admin&password=secret123").await;
     assert_eq!(status, 302, "successful login should redirect: {resp}");
     let cookie = response_cookie(&resp, "rfrp_dashboard").expect("session cookie set");
 
     // 带上 Cookie 访问首页：应放行。
-    let (status, body) =
-        http_get_with_headers(port, "/", &format!("Cookie: {cookie}\r\n")).await;
+    let (status, body) = http_get_with_headers(port, "/", &format!("Cookie: {cookie}\r\n")).await;
     assert_eq!(status, 200, "cookie session should be authorized: {body}");
     assert!(body.contains("rfrp dashboard"));
 

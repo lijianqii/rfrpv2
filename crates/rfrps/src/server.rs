@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
-    FIRST_FRAME_TIMEOUT, GRACEFUL_SHUTDOWN_TIMEOUT, SERVER_ALIVE_LOG_INTERVAL,
-    TLS_HANDSHAKE_TIMEOUT,
+    FIRST_FRAME_TIMEOUT, SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::crypto::{ServerTls, ServerTlsStream};
 use rfrp_common::error::{Error, Result};
@@ -51,7 +50,13 @@ pub struct Server {
 impl Server {
     /// 绑定 `config.server.bind_addr:bind_port`。`bind_port=0` 由 OS 分配。
     pub async fn new(config: ServerConfig) -> Result<Self> {
-        let listener = TcpListener::bind(config.server.bind_socket_addr()?).await?;
+        // 用 `(host, port)` 元组形式绑定：允许 `bind_addr` 为域名（如 `localhost`），
+        // 与 vhost / 代理端口监听保持一致。
+        let bind = format!("{}:{}", config.server.bind_addr, config.server.bind_port);
+        let listener =
+            TcpListener::bind((config.server.bind_addr.as_str(), config.server.bind_port))
+                .await
+                .map_err(|e| bind_error("control listener", &bind, e))?;
         let vhost_http =
             bind_optional(&config.server.bind_addr, config.proxy.vhost_http_port).await?;
         let dashboard = bind_dashboard(&config).await?;
@@ -60,11 +65,12 @@ impl Server {
         // 在 config 移入 Arc 之前取出生效的心跳参数。
         let heartbeat_interval = config.server.heartbeat_interval();
         let heartbeat_timeout = config.server.heartbeat_timeout();
+        let grace = config.server.grace();
         Ok(Self {
             config: Arc::new(config),
             listener,
             state: ServerState::new(),
-            grace: Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT),
+            grace,
             heartbeat_interval,
             heartbeat_timeout,
             tls,
@@ -163,6 +169,29 @@ impl Server {
                 }
             });
         }
+        // 待处理工作连接超时清理：单周期扫描整张表，替代"每个用户连接派生一个 sleep
+        // 任务"（高连接速率下后者会累积大量睡眠任务）。扫描周期 1s，超时取
+        // WORK_CONN_TIMEOUT_RFRPS，实际清理时间落在 [timeout, timeout+1s]。
+        {
+            let state = self.state.clone();
+            let sd = shutdown.clone();
+            tasks.spawn(async move {
+                let timeout = Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS);
+                let mut iv = tokio::time::interval(Duration::from_secs(1));
+                iv.tick().await; // 消耗首次立即 tick
+                loop {
+                    tokio::select! {
+                        _ = iv.tick() => {
+                            let n = crate::listener::sweep_expired_pending(&state, timeout).await;
+                            if n > 0 {
+                                tracing::debug!(count = n, "closed timed-out pending user connections");
+                            }
+                        }
+                        _ = sd.cancelled() => break,
+                    }
+                }
+            });
+        }
         // 与代理/vhost/Dashboard 共用同一套退避策略；区别是主监听连续失败达到阈值后
         // 判定不可恢复，进程以非零码退出交服务管理器重启（见 util::accept 说明）。
         let mut accept_retry = AcceptRetry::new();
@@ -251,9 +280,26 @@ impl Server {
 /// 绑定可选监听端口（`None` = 该监听未启用）。
 async fn bind_optional(bind_addr: &str, port: Option<u16>) -> Result<Option<TcpListener>> {
     match port {
-        Some(port) => Ok(Some(TcpListener::bind((bind_addr, port)).await?)),
+        Some(port) => {
+            let addr = format!("{bind_addr}:{port}");
+            let listener = TcpListener::bind((bind_addr, port))
+                .await
+                .map_err(|e| bind_error("http vhost listener", &addr, e))?;
+            Ok(Some(listener))
+        }
         None => Ok(None),
     }
+}
+
+/// 绑定失败时带上"绑到哪个地址"的上下文。
+///
+/// 否则日志只剩 `address already in use`，多监听场景下无法定位是控制口、vhost 还是
+/// Dashboard 端口冲突。
+fn bind_error(what: &str, addr: &str, e: std::io::Error) -> Error {
+    Error::Other(format!(
+        "failed to bind {what} {addr}: {}",
+        rfrp_common::error::describe_io_error(&e)
+    ))
 }
 
 /// Dashboard 监听（可选）。地址格式已在配置校验阶段检查过。
@@ -265,7 +311,10 @@ async fn bind_dashboard(config: &ServerConfig) -> Result<Option<TcpListener>> {
         .addr
         .parse()
         .map_err(|e| Error::Config(format!("invalid dashboard addr: {e}")))?;
-    Ok(Some(TcpListener::bind(addr).await?))
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| bind_error("dashboard listener", &d.addr, e))?;
+    Ok(Some(listener))
 }
 
 /// HTTPS vhost 监听 + 证书（可选；启用时必须同时提供证书与私钥）。
@@ -277,7 +326,10 @@ async fn bind_vhost_https(config: &ServerConfig) -> Result<Option<(TcpListener, 
         || Error::Config("vhost_https_port requires vhost_tls_cert and vhost_tls_key".into());
     let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(missing)?;
     let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(missing)?;
-    let listener = TcpListener::bind((config.server.bind_addr.as_str(), port)).await?;
+    let addr = format!("{}:{port}", config.server.bind_addr);
+    let listener = TcpListener::bind((config.server.bind_addr.as_str(), port))
+        .await
+        .map_err(|e| bind_error("https vhost listener", &addr, e))?;
     let tls = ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))?;
     Ok(Some((listener, tls)))
 }

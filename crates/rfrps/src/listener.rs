@@ -1,7 +1,9 @@
-//! 代理公网监听（服务端侧，当前仅 TCP；UDP/HTTP/HTTPS 在 M4 扩展）。
+//! 代理注册与公网监听（服务端侧）。
 //!
-//! 注册成功后为每个 `remote_port` 起一个 accept 循环：每来一个用户连接，
-//! 分配 work_id、登记待处理项、向客户端发 `ReqWorkConn`（见 DESIGN §8.2）。
+//! 注册成功后按类型分发：TCP 起独立 accept 循环；UDP 起 UDP 监听 + 会话表
+//! （见 [`crate::udp`]）；HTTP/HTTPS 不占独立端口，只登记域名走共享 vhost 监听
+//! （见 [`crate::vhost`]）。TCP 每来一个用户连接即分配 work_id、登记待处理项、
+//! 向客户端发 `ReqWorkConn`（见 DESIGN §8.2）。
 
 use std::sync::Arc;
 
@@ -15,7 +17,7 @@ use rfrp_common::util::stream::{AsyncStream, BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::control::{ProxyEntry, Session};
 use crate::state::{PendingWork, ServerState};
@@ -42,12 +44,12 @@ pub async fn register_proxy(
     config: &ServerConfig,
 ) -> std::result::Result<(), ProxyError> {
     // 会话内代理数上限：认证客户端也不得无限占用端口/内存。
-    if session.proxies.lock().unwrap().len() >= MAX_PROXIES_PER_SESSION {
+    if session.proxies.lock().len() >= MAX_PROXIES_PER_SESSION {
         tracing::warn!(proxy = %np.proxy_name, "proxy limit per session reached");
         return Err(ProxyError::TooManyProxies);
     }
     // 同名代理一律拒绝，避免静默覆盖旧条目。
-    if session.proxies.lock().unwrap().contains_key(&np.proxy_name) {
+    if session.proxies.lock().contains_key(&np.proxy_name) {
         return Err(ProxyError::NameExists);
     }
 
@@ -84,6 +86,11 @@ pub async fn register_proxy(
         ProxyType::Udp => {
             let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
             if !port_allowed(config, remote_port) {
+                tracing::warn!(
+                    proxy = %np.proxy_name, remote_port,
+                    allow_ports = %config.proxy.allow_ports,
+                    "udp remote_port not allowed by [proxy].allow_ports"
+                );
                 return Err(ProxyError::PortNotAllowed);
             }
             crate::udp::register_udp_proxy(
@@ -99,6 +106,11 @@ pub async fn register_proxy(
         ProxyType::Tcp => {
             let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
             if !port_allowed(config, remote_port) {
+                tracing::warn!(
+                    proxy = %np.proxy_name, remote_port,
+                    allow_ports = %config.proxy.allow_ports,
+                    "tcp remote_port not allowed by [proxy].allow_ports"
+                );
                 return Err(ProxyError::PortNotAllowed);
             }
             let listener =
@@ -129,17 +141,21 @@ pub async fn register_proxy(
 
     // 登记：vhost 域名映射 + 会话内条目 + 全局归属索引。
     if !domains.is_empty() {
-        let mut map = session.proxy_domains.lock().unwrap();
+        let mut map = session.proxy_domains.lock();
         for d in &domains {
             map.insert(d.clone(), np.proxy_name.clone());
             state.index_domain(d, &session.run_id, &np.proxy_name);
         }
     }
-    session
-        .proxies
-        .lock()
-        .unwrap()
-        .insert(np.proxy_name.clone(), ProxyEntry { handle, kind });
+    session.proxies.lock().insert(
+        np.proxy_name.clone(),
+        ProxyEntry {
+            handle,
+            kind,
+            remote_port: np.remote_port,
+            custom_domains: domains,
+        },
+    );
     state.index_proxy(&np.proxy_name, &session.run_id);
     match kind {
         ProxyType::Udp => {
@@ -203,7 +219,7 @@ async fn proxy_accept_loop(
 fn pop_live_pooled(session: &Session, proxy_name: &str) -> Option<BoxedStream> {
     loop {
         let work = {
-            let mut pools = session.pools.lock().unwrap();
+            let mut pools = session.pools.lock();
             pools.get_mut(proxy_name).and_then(|v| v.pop())
         }?;
         match probe_alive(work) {
@@ -271,7 +287,7 @@ pub(crate) fn dispatch_user_connection<S>(
         return;
     }
 
-    // 统计连接与流量（M5）。active 已在上面原子递增；CountingStream drop 时递减。
+    // 统计连接与流量。active 已在上面原子递增；CountingStream drop 时递减。
     let metrics = state.metrics.clone();
     metrics
         .total_connections
@@ -318,18 +334,20 @@ pub(crate) fn dispatch_user_connection<S>(
 
     let work_id = state.next_work_id();
     tracing::debug!(%proxy_name, work_id, "user connected (on-demand)");
-    state.pending.lock().unwrap().insert(
+    state.pending.lock().insert(
         work_id,
         PendingWork {
             proxy_name: proxy_name.clone(),
             session_id: session.session_id.clone(),
             user: Some(user),
+            created: std::time::Instant::now(),
         },
     );
 
     let tx = session.tx.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
+        // 超时兜底由 Server::run 里的单周期扫描任务负责（见 sweep_expired_pending）。
         if !send_with_timeout(
             &tx,
             Message::ReqWorkConn(ReqWorkConn {
@@ -340,26 +358,34 @@ pub(crate) fn dispatch_user_connection<S>(
         .await
         {
             // 控制连接已断或通道拥堵，清理待处理项（避免任务堆积）。
-            state2.pending.lock().unwrap().remove(&work_id);
-            return;
+            state2.pending.lock().remove(&work_id);
         }
-        // 超时兜底：用户连接长时间等不到工作连接则关闭（见 DESIGN §8.5）。
-        spawn_pending_timeout(work_id, state2);
     });
 }
 
-/// 超时清理：WORK_CONN_TIMEOUT_RFRPS 后仍未消费则关闭用户连接。
-fn spawn_pending_timeout(work_id: u64, state: Arc<ServerState>) {
-    tokio::spawn(async move {
-        sleep(Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS)).await;
-        let user = {
-            let mut p = state.pending.lock().unwrap();
-            p.remove(&work_id).and_then(|pw| pw.user)
-        };
-        if let Some(mut u) = user {
-            let _ = u.shutdown().await;
-        }
-    });
+/// 单次扫描：移除超过 `timeout` 仍未配对的待处理项，关闭其用户连接，返回清理条数。
+///
+/// 用**一个**周期任务扫描整张表，替代"每个用户连接派生一个 sleep 任务"——后者在
+/// 高连接速率下会同时存在大量睡眠任务，调度与内存开销随连接数增长（见 DESIGN §8.5）。
+pub(crate) async fn sweep_expired_pending(state: &Arc<ServerState>, timeout: Duration) -> usize {
+    let now = std::time::Instant::now();
+    let expired: Vec<BoxedStream> = {
+        let mut pending = state.pending.lock();
+        let ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.created) >= timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| pending.remove(&id))
+            .filter_map(|pw| pw.user)
+            .collect()
+    };
+    let n = expired.len();
+    for mut user in expired {
+        let _ = user.shutdown().await;
+    }
+    n
 }
 
 #[cfg(test)]

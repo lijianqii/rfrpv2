@@ -14,13 +14,17 @@
 //! 先收集结果、**释放锁之后**再获取另一把锁：见 control.rs 中 `cleanup` 的调用方式。
 //! `pending` / `udp` / `proxy_stats` / `login_failures` 彼此独立，不参与上述嵌套。
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rfrp_common::constants::{LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS};
+use rfrp_common::constants::{
+    LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS, MAX_SESSIONS,
+    MAX_SESSIONS_PER_IP,
+};
 use rfrp_common::util::stream::BoxedStream;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +36,8 @@ pub struct PendingWork {
     pub session_id: String,
     /// 用户侧流（类型擦除，兼容明文/TLS/vhost 已读缓冲包装）。
     pub user: Option<BoxedStream>,
+    /// 登记时刻：供单一周期扫描任务判定超时（见 `listener::sweep_expired_pending`）。
+    pub created: Instant,
 }
 
 /// 瞬时 gauge 快照（Dashboard/Prometheus 共用，避免各自重复遍历加锁）。
@@ -77,6 +83,10 @@ pub struct ServerState {
     pub metrics: Arc<Metrics>,
     /// 最大并发用户连接数（防 DoS 兜底，测试可调小）。
     pub max_active: AtomicI64,
+    /// 全局并发控制会话上限（测试可调小）。
+    pub max_sessions: AtomicUsize,
+    /// 单来源 IP 的并发控制会话上限（测试可调小）。
+    pub max_sessions_per_ip: AtomicUsize,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -94,6 +104,8 @@ impl ServerState {
             proxy_stats: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
+            max_sessions: AtomicUsize::new(MAX_SESSIONS),
+            max_sessions_per_ip: AtomicUsize::new(MAX_SESSIONS_PER_IP),
             shutdown: CancellationToken::new(),
         })
     }
@@ -102,7 +114,6 @@ impl ServerState {
     pub fn proxy_stats_for(&self, proxy_name: &str) -> Arc<ProxyStats> {
         self.proxy_stats
             .lock()
-            .unwrap()
             .entry(proxy_name.to_string())
             .or_default()
             .clone()
@@ -110,7 +121,7 @@ impl ServerState {
 
     /// 移除若干代理的统计（会话清理时调用）。
     pub fn remove_proxy_stats(&self, names: &[String]) {
-        let mut m = self.proxy_stats.lock().unwrap();
+        let mut m = self.proxy_stats.lock();
         for n in names {
             m.remove(n);
         }
@@ -118,7 +129,7 @@ impl ServerState {
 
     /// 该 IP 当前是否允许尝试登录（窗口内失败次数未超限）。
     pub fn login_allowed(&self, ip: IpAddr) -> bool {
-        let mut m = self.login_failures.lock().unwrap();
+        let mut m = self.login_failures.lock();
         let window = Duration::from_secs(LOGIN_FAILURE_WINDOW);
         match m.get(&ip) {
             Some((count, start)) if start.elapsed() < window => *count < LOGIN_FAILURE_LIMIT,
@@ -133,7 +144,7 @@ impl ServerState {
     /// 记录一次登录失败；条目过多时清理过期项（防内存增长）。
     pub fn record_login_failure(&self, ip: IpAddr) {
         let window = Duration::from_secs(LOGIN_FAILURE_WINDOW);
-        let mut m = self.login_failures.lock().unwrap();
+        let mut m = self.login_failures.lock();
         match m.get_mut(&ip) {
             Some((count, start)) if start.elapsed() < window => *count += 1,
             Some(e) => *e = (1, Instant::now()),
@@ -148,34 +159,27 @@ impl ServerState {
 
     /// 登录成功后清除该 IP 的失败计数。
     pub fn clear_login_failures(&self, ip: IpAddr) {
-        self.login_failures.lock().unwrap().remove(&ip);
+        self.login_failures.lock().remove(&ip);
     }
 
     /// 采样瞬时 gauge（会短暂持有 sessions/udp 等锁，均为短临界区）。
     pub fn gauges(&self) -> Gauges {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         let mut g = Gauges {
             sessions: sessions.len(),
             ..Default::default()
         };
         for s in sessions.values() {
-            g.proxies += s.proxies.lock().unwrap().len();
-            g.pooled_work_conns += s
-                .pools
-                .lock()
-                .unwrap()
-                .values()
-                .map(|v| v.len())
-                .sum::<usize>();
+            g.proxies += s.proxies.lock().len();
+            g.pooled_work_conns += s.pools.lock().values().map(|v| v.len()).sum::<usize>();
         }
         drop(sessions);
-        g.pending_work = self.pending.lock().unwrap().len();
+        g.pending_work = self.pending.lock().len();
         g.udp_sessions = self
             .udp
             .lock()
-            .unwrap()
             .values()
-            .map(|p| p.sessions.lock().unwrap().len())
+            .map(|p| p.sessions.lock().len())
             .sum();
         g
     }
@@ -189,14 +193,13 @@ impl ServerState {
     pub fn index_proxy(&self, proxy_name: &str, run_id: &str) {
         self.proxy_index
             .lock()
-            .unwrap()
             .insert(proxy_name.to_string(), run_id.to_string());
     }
 
     /// 批量移除 proxy 归属记录（会话清理时调用）。按名移除，与 run_id 无关：
     /// 即使同一 run_id 的新会话已重新登记同名代理，条目内容也一致，移除无副作用。
     pub fn unindex_proxies(&self, names: impl IntoIterator<Item = String>) {
-        let mut idx = self.proxy_index.lock().unwrap();
+        let mut idx = self.proxy_index.lock();
         for n in names {
             idx.remove(&n);
         }
@@ -204,15 +207,15 @@ impl ServerState {
 
     /// 按 proxy_name 定位所属会话（O(1)）。
     pub fn session_for_proxy(&self, proxy_name: &str) -> Option<Arc<crate::control::Session>> {
-        let idx = self.proxy_index.lock().unwrap();
+        let idx = self.proxy_index.lock();
         let run_id = idx.get(proxy_name)?;
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         sessions.get(run_id).cloned()
     }
 
     /// 登记域名归属（vhost 路由用，注册成功后调用）。
     pub fn index_domain(&self, domain: &str, run_id: &str, proxy_name: &str) {
-        self.domain_index.lock().unwrap().insert(
+        self.domain_index.lock().insert(
             domain.to_string(),
             (run_id.to_string(), proxy_name.to_string()),
         );
@@ -222,7 +225,7 @@ impl ServerState {
     /// 同一 run_id 重连后若已重新登记同名域名，条目内容一致，移除无副作用
     /// （清理发生在旧会话注销、新会话注册之前）。
     pub fn unindex_domains(&self, domains: impl IntoIterator<Item = String>) {
-        let mut idx = self.domain_index.lock().unwrap();
+        let mut idx = self.domain_index.lock();
         for d in domains {
             idx.remove(&d);
         }
@@ -231,11 +234,11 @@ impl ServerState {
     /// 按域名定位所属会话与代理名（O(1)，vhost 路由热路径）。
     pub fn session_for_domain(&self, host: &str) -> Option<(Arc<crate::control::Session>, String)> {
         let (run_id, proxy_name) = {
-            let idx = self.domain_index.lock().unwrap();
+            let idx = self.domain_index.lock();
             let (run_id, proxy_name) = idx.get(host)?;
             (run_id.clone(), proxy_name.clone())
         };
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         sessions.get(&run_id).cloned().map(|s| (s, proxy_name))
     }
 }
@@ -243,21 +246,7 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
-
-    fn test_session(run_id: &str) -> Arc<crate::control::Session> {
-        let (tx, _rx) = mpsc::channel(8);
-        Arc::new(crate::control::Session {
-            run_id: run_id.into(),
-            session_id: "sid".into(),
-            work_conn_token: "tok".into(),
-            tx,
-            proxies: Mutex::new(HashMap::new()),
-            proxy_domains: Mutex::new(HashMap::new()),
-            stop: Arc::new(tokio::sync::Notify::new()),
-            pools: Mutex::new(HashMap::new()),
-        })
-    }
+    use crate::control::test_session;
 
     #[test]
     fn login_rate_limit_blocks_after_failures() {
@@ -281,7 +270,7 @@ mod tests {
         // proxy_name → run_id 索引：注册后可 O(1) 定位会话，清理后失效（§8.2）。
         let state = ServerState::new();
         let s = test_session("r1");
-        state.sessions.lock().unwrap().insert("r1".into(), s);
+        state.sessions.lock().insert("r1".into(), s);
 
         // 未注册时查不到。
         assert!(state.session_for_proxy("web").is_none());
@@ -303,11 +292,7 @@ mod tests {
         // vhost 路由按域名 O(1) 定位会话；清理后必须失效，否则会命中已注销的会话。
         let state = ServerState::new();
         let s = test_session("r1");
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert("r1".into(), s.clone());
+        state.sessions.lock().insert("r1".into(), s.clone());
 
         assert!(state.session_for_domain("dev.example.com").is_none());
 
@@ -335,24 +320,21 @@ mod tests {
         let state = ServerState::new();
         let s1 = test_session("r1");
         // 一个代理 + 两条池连接
-        s1.proxies.lock().unwrap().insert(
+        s1.proxies.lock().insert(
             "web".into(),
-            crate::control::ProxyEntry {
-                handle: tokio::spawn(async {}),
-                kind: rfrp_common::protocol::msg::ProxyType::Tcp,
-            },
+            crate::control::test_entry(rfrp_common::protocol::msg::ProxyType::Tcp),
         );
         s1.pools
             .lock()
-            .unwrap()
             .insert("web".into(), vec![Box::new(tokio::io::duplex(8).0)]);
-        state.sessions.lock().unwrap().insert("r1".into(), s1);
-        state.pending.lock().unwrap().insert(
+        state.sessions.lock().insert("r1".into(), s1);
+        state.pending.lock().insert(
             1,
             PendingWork {
                 proxy_name: "web".into(),
                 session_id: "sid".into(),
                 user: None,
+                created: Instant::now(),
             },
         );
 
@@ -369,17 +351,13 @@ mod tests {
         // 同一 run_id 重连替换会话后，索引仍指向新会话（§8.3 去重语义）。
         let state = ServerState::new();
         let old = test_session("r1");
-        state.sessions.lock().unwrap().insert("r1".into(), old);
+        state.sessions.lock().insert("r1".into(), old);
         state.index_proxy("web", "r1");
 
         // 新会话替换旧会话（旧会话代理已清理，索引条目内容相同 → 无副作用）。
         let new = test_session("r1");
         state.unindex_proxies(vec!["web".into()]);
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert("r1".into(), new.clone());
+        state.sessions.lock().insert("r1".into(), new.clone());
         state.index_proxy("web", "r1");
 
         let found = state.session_for_proxy("web").expect("re-indexed");

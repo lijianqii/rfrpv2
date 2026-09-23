@@ -50,6 +50,10 @@ pub struct ServerSection {
     /// RDP-UDP 等交互式会话建议保持较大值，避免空闲期间频繁重建工作连接。
     #[serde(default)]
     pub udp_session_timeout_secs: Option<u64>,
+    /// 优雅退出宽限期（秒）：停止接收新连接后等待在途连接结束的最长时间，缺省 30。
+    /// 也可由 CLI `--grace-secs` 覆盖。
+    #[serde(default)]
+    pub grace_secs: Option<u64>,
 }
 
 impl Default for ServerSection {
@@ -66,18 +70,12 @@ impl Default for ServerSection {
             heartbeat_interval_secs: None,
             heartbeat_timeout_secs: None,
             udp_session_timeout_secs: None,
+            grace_secs: None,
         }
     }
 }
 
 impl ServerSection {
-    /// 控制监听地址（`bind_addr:bind_port`）。
-    pub fn bind_socket_addr(&self) -> Result<SocketAddr> {
-        let s = format!("{}:{}", self.bind_addr, self.bind_port);
-        s.parse()
-            .map_err(|e| config(format!("invalid server bind addr '{s}': {e}")))
-    }
-
     /// 生效的心跳发送间隔（配置缺省时用默认值）。
     pub fn heartbeat_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -101,6 +99,14 @@ impl ServerSection {
                 .unwrap_or(crate::constants::UDP_SESSION_TIMEOUT),
         )
     }
+
+    /// 生效的优雅退出宽限期（配置缺省时用默认值）。
+    pub fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.grace_secs
+                .unwrap_or(crate::constants::GRACEFUL_SHUTDOWN_TIMEOUT),
+        )
+    }
 }
 
 /// `[dashboard]` 监控面板（整段可选，省略则不启用）。
@@ -115,9 +121,12 @@ pub struct DashboardSection {
 impl DashboardSection {
     pub fn validate(&self) -> Result<()> {
         // 地址必须可解析为带端口的 SocketAddr。
-        self.addr
-            .parse::<SocketAddr>()
-            .map_err(|e| config(format!("invalid dashboard addr '{}': {e}", self.addr)))?;
+        self.addr.parse::<SocketAddr>().map_err(|e| {
+            config(format!(
+                "invalid dashboard addr '{}' (expected IP:PORT, e.g. 127.0.0.1:7500): {e}",
+                self.addr
+            ))
+        })?;
         if self.user.is_empty() {
             return Err(config("dashboard.user must not be empty"));
         }
@@ -270,6 +279,14 @@ impl ServerConfig {
                     "udp_session_timeout_secs {secs} out of range {}-{}",
                     crate::constants::UDP_SESSION_TIMEOUT_MIN_SECS,
                     crate::constants::UDP_SESSION_TIMEOUT_MAX_SECS
+                )));
+            }
+        }
+        if let Some(secs) = self.server.grace_secs {
+            if secs > crate::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS {
+                return Err(config(format!(
+                    "grace_secs {secs} out of range 0-{}",
+                    crate::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS
                 )));
             }
         }

@@ -30,14 +30,19 @@ pub use server::{DashboardSection, ProxySection, ServerConfig, ServerSection};
 use crate::constants::{
     HEARTBEAT_INTERVAL, HEARTBEAT_MAX_SECS, HEARTBEAT_MIN_SECS, HEARTBEAT_TIMEOUT,
 };
-use crate::error::{config, Result};
+use crate::error::{config, describe_io_error, Result};
 use serde::Deserialize;
 use std::path::Path;
 
 /// 加载并校验服务端配置。
 pub fn load_server_config(path: &Path) -> Result<ServerConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| config(format!("cannot read {}: {e}", path.display())))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        config(format!(
+            "cannot read {}: {}",
+            path.display(),
+            describe_io_error(&e)
+        ))
+    })?;
     let mut cfg: ServerConfig = toml::from_str(&text)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.server.tls_cert, base);
@@ -51,8 +56,13 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig> {
 
 /// 加载并校验客户端配置。
 pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| config(format!("cannot read {}: {e}", path.display())))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        config(format!(
+            "cannot read {}: {}",
+            path.display(),
+            describe_io_error(&e)
+        ))
+    })?;
     let mut cfg: ClientConfig = toml::from_str(&text)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.client.tls_ca, base);

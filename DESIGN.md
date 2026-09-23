@@ -581,7 +581,7 @@ SUBCOMMANDS:
 
 | 参数 | 对应配置字段 |
 |------|--------------|
-| `--bind <ADDR:PORT>` | `bind_addr` + `bind_port` |
+| `--bind <HOST:PORT>` | `bind_addr` + `bind_port`（`HOST` 可为域名 / IPv4 / `[IPv6]`） |
 | `--token <TOKEN>` | `token` |
 | `--tls-enable <BOOL>` | `tls_enable` |
 | `--work-conn-tls <BOOL>` | `work_conn_tls` |
@@ -590,12 +590,17 @@ SUBCOMMANDS:
 
 | 参数 | 对应配置字段 |
 |------|--------------|
-| `--server <ADDR:PORT>` | `server_addr` + `server_port` |
+| `--server <HOST:PORT>` | `server_addr` + `server_port`（`HOST` 可为域名 / IPv4 / `[IPv6]`） |
 | `--token <TOKEN>` | `token` |
 | `--tls-enable <BOOL>` | `tls_enable` |
 | `--work-conn-tls <BOOL>` | `work_conn_tls` |
 
-> 规则：CLI 参数覆盖配置文件同名字段；`-c` 与字段参数可组合（先加载配置文件，再用 CLI 参数覆盖）。`-c` 与全部字段参数同时缺省时报错退出。
+> 规则：CLI 参数覆盖配置文件同名字段；`-c` 与字段参数可组合（先加载配置文件，再用 CLI 参数覆盖）。
+> 两个子命令均支持 `--check`：只加载、覆盖、校验配置并打印生效摘要（token 不打印明文），
+> 不监听端口 / 不建立连接。`-c` 缺省时打印用法提示并以非零退出码结束。
+>
+> 另有 `rfrp client status [-c <config>] [--addr <host:port>]`（查询本地 `status_addr` 端点）
+> 与 `rfrp completions <shell>`（生成补全脚本）。
 
 ---
 
@@ -825,6 +830,7 @@ tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默
 heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
 udp_session_timeout_secs = 300   # UDP 会话空闲超时（秒，默认 300；RDP-UDP 建议 300-600）
+grace_secs = 30                  # 优雅退出宽限期（秒，默认 30，上限 3600）
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps↔rfrpc 控制连接
@@ -916,8 +922,11 @@ CLI 参数 > 配置文件 > 默认值。
   TCP 与 UDP 是相互独立的端口空间，允许一个 TCP 代理与一个 UDP 代理共用同一端口号
   （RDP 场景必需：mstsc 启用 UDP 传输时把 UDP 发往与 TCP 相同的端口）。服务端另有全局唯一校验，见 6.6。
 - **类型与字段匹配**：`type = http/https` 必须有 `custom_domains`；`type = tcp/udp` 必须有 `remote_port`。
-- **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时必须可解析为合法 IPv4/IPv6 地址（`std::net::IpAddr` 解析）。
+- **local_ip 格式**：`local_ip` 省略时默认 `127.0.0.1`；提供时可为域名、IPv4 或 IPv6 字面量，
+  实际解析发生在建连时（`TcpStream::connect((host, port))`）。同理 `server_addr` / `bind_addr`
+  也允许域名，客户端每次重连都会重新解析 `server_addr`。
 - **tcp_keepalive_secs 范围**：0–3600（0 = 禁用 keepalive）。
+- **grace_secs 范围**：0–3600（秒）；缺省 30，0 表示不等待在途连接直接退出。
 - **udp_session_timeout_secs 范围**：1–86400（秒）；缺省 300。RDP-UDP 建议 300–600。
 - **status_addr 格式**：客户端可选状态端点地址，提供时必须可解析为 `SocketAddr`（如 `127.0.0.1:7400`）。
 - **pool_size 通用**：`pool_size` 对所有代理类型（tcp/udp/http/https）生效，省略默认 1。类型为 u32，≥0；0 表示禁用预热纯按需（见 8.2）；建议上限 16（超过记警告但不拒绝，防止资源耗尽）。

@@ -5,7 +5,6 @@ use futures::StreamExt;
 use rfrp_common::config::ClientProxy;
 use rfrp_common::protocol::msg::ProxyType;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -24,17 +23,8 @@ fn tcp_proxy(local_port: u16) -> ClientProxy {
 #[tokio::test]
 async fn unknown_proxy_returns_ok() {
     // 未知 proxy_name：不应连接、不应 panic，直接 Ok 返回（§8.2 负路径）。
-    let state = Arc::new(ClientState {
-        server_addr: "127.0.0.1:9".parse().unwrap(),
-        run_id: "r".into(),
-        proxies: HashMap::new(),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+    let state =
+        crate::client::test_state("127.0.0.1:9".parse().unwrap(), "r", HashMap::new(), false);
     let req = ReqWorkConn {
         proxy_name: "nope".into(),
         work_id: 1,
@@ -47,10 +37,10 @@ async fn local_service_unreachable_closes_gracefully() {
     // 服务端可达，但本地服务不可达：仍应 Ok 返回（关闭工作连接），不 panic（§8.2/§8.5）。
     let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server.local_addr().unwrap();
-    let state = Arc::new(ClientState {
+    let state = crate::client::test_state(
         server_addr,
-        run_id: "r".into(),
-        proxies: HashMap::from([(
+        "r",
+        HashMap::from([(
             "web".to_string(),
             ClientProxy {
                 name: "web".into(),
@@ -62,13 +52,8 @@ async fn local_service_unreachable_closes_gracefully() {
                 pool_size: 0,
             },
         )]),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+        false,
+    );
     let req = ReqWorkConn {
         proxy_name: "web".into(),
         work_id: 1,
@@ -81,17 +66,12 @@ async fn work_conn_tls_enabled_without_tls_errors() {
     // work_conn_tls=true 但客户端 TLS 未初始化：应返回 Err 且不 panic（§6.5 负路径）。
     let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server.local_addr().unwrap();
-    let state = Arc::new(ClientState {
+    let state = crate::client::test_state(
         server_addr,
-        run_id: "r".into(),
-        proxies: HashMap::from([("web".to_string(), tcp_proxy(1))]),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(true),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+        "r",
+        HashMap::from([("web".to_string(), tcp_proxy(1))]),
+        true,
+    );
     let req = ReqWorkConn {
         proxy_name: "web".into(),
         work_id: 7,
@@ -107,17 +87,12 @@ async fn tcp_work_conn_sends_start_frame_and_bridges() {
     let server_addr = server.local_addr().unwrap();
     let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_port = local.local_addr().unwrap().port();
-    let state = Arc::new(ClientState {
+    let state = crate::client::test_state(
         server_addr,
-        run_id: "r".into(),
-        proxies: HashMap::from([("web".to_string(), tcp_proxy(local_port))]),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+        "r",
+        HashMap::from([("web".to_string(), tcp_proxy(local_port))]),
+        false,
+    );
     let req = ReqWorkConn {
         proxy_name: "web".into(),
         work_id: 42,
@@ -170,10 +145,10 @@ async fn udp_work_conn_sends_start_frame_and_ends_on_eof() {
     // UDP 代理：工作连接发送 StartWorkConn 帧后进入分帧桥接；服务端关闭即退出（§8.6）。
     let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server.local_addr().unwrap();
-    let state = Arc::new(ClientState {
+    let state = crate::client::test_state(
         server_addr,
-        run_id: "r".into(),
-        proxies: HashMap::from([(
+        "r",
+        HashMap::from([(
             "udp-x".to_string(),
             ClientProxy {
                 name: "udp-x".into(),
@@ -185,13 +160,8 @@ async fn udp_work_conn_sends_start_frame_and_ends_on_eof() {
                 pool_size: 0,
             },
         )]),
-        resps: Mutex::new(HashMap::new()),
-        login_tx: Mutex::new(None),
-        tls: None,
-        work_conn_tls: Mutex::new(false),
-        work_conn_token: Mutex::new(None),
-        metrics: Arc::new(crate::metrics::ClientMetrics::new()),
-    });
+        false,
+    );
     let req = ReqWorkConn {
         proxy_name: "udp-x".into(),
         work_id: 9,

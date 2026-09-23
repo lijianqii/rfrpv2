@@ -61,6 +61,8 @@ pub const SERVER_ALIVE_LOG_INTERVAL: u64 = 300;
 
 /// 优雅退出在途连接强制关闭超时。
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: u64 = 30;
+/// `grace_secs` 可配置上限（秒，1 小时）。
+pub const GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS: u64 = 3600;
 
 // ---- 重连退避（秒）----
 
@@ -87,6 +89,16 @@ pub const RECONNECT_BACKOFF_MAX: u64 = 30;
 
 /// 单个会话可注册的代理数上限（防认证客户端耗尽端口/内存）。
 pub const MAX_PROXIES_PER_SESSION: usize = 128;
+/// 全局并发控制会话上限。
+///
+/// 登录限速只统计**失败**次数，因此持有效 token 的客户端可以用随机 `run_id`
+/// 不断建立控制会话（每个都会注册代理、占用 fd 与内存）。这里给会话总数设一个
+/// 上界；同一 `run_id` 的重连替换不计新增。
+pub const MAX_SESSIONS: usize = 1024;
+/// 单个来源 IP 的并发控制会话上限。
+///
+/// 取值高于常见 NAT 后的客户端数量，避免误伤；作用是防止单一来源占满全局额度。
+pub const MAX_SESSIONS_PER_IP: usize = 256;
 /// 登录失败限速：窗口内允许的最大失败次数（超出后拒绝该 IP 的登录尝试）。
 pub const LOGIN_FAILURE_LIMIT: u32 = 10;
 /// 登录失败限速窗口（秒）。

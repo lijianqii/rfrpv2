@@ -377,17 +377,19 @@ fn render_login_page(error: Option<&str>) -> String {
 }
 
 fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
-    let sessions = state.sessions.lock().unwrap();
+    let sessions = state.sessions.lock();
     let session_list: Vec<serde_json::Value> = sessions
         .values()
         .map(|s| {
-            let proxies = s.proxies.lock().unwrap();
+            let proxies = s.proxies.lock();
             let proxy_list: Vec<serde_json::Value> = proxies
                 .iter()
                 .map(|(name, e)| {
                     json!({
                         "name": name,
                         "kind": serde_json::to_value(e.kind).unwrap_or_default(),
+                        "remote_port": e.remote_port,
+                        "domains": e.custom_domains,
                     })
                 })
                 .collect();
@@ -406,7 +408,6 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
     let mut proxy_stats: Vec<(String, Arc<crate::metrics::ProxyStats>)> = state
         .proxy_stats
         .lock()
-        .unwrap()
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -554,12 +555,8 @@ mod authorized_tests {
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
-    use crate::control::Session;
+
     use crate::state::ServerState;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use tokio::sync::{mpsc, Notify};
 
     #[test]
     fn healthz_reflects_accept_state() {
@@ -574,18 +571,8 @@ mod metrics_tests {
     #[test]
     fn render_metrics_includes_session_gauge() {
         let state = ServerState::new();
-        let (tx, _rx) = mpsc::channel::<rfrp_common::protocol::msg::Message>(8);
-        let session = Arc::new(Session {
-            run_id: "r".into(),
-            session_id: "s".into(),
-            work_conn_token: "tok".into(),
-            tx,
-            proxies: Mutex::new(HashMap::new()),
-            proxy_domains: Mutex::new(HashMap::new()),
-            stop: Arc::new(Notify::new()),
-            pools: Mutex::new(HashMap::new()),
-        });
-        state.sessions.lock().unwrap().insert("r".into(), session);
+        let session = crate::control::test_session("r");
+        state.sessions.lock().insert("r".into(), session);
 
         let text = render_metrics(&state);
         assert!(
@@ -613,5 +600,35 @@ mod metrics_tests {
             html.contains("\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"),
             "escaped JSON proxy name expected: {html}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_json_includes_proxy_details() {
+        // 看板需要展示代理的公网端口 / 域名，而不只是名字与类型。
+        let state = ServerState::new();
+        let session = crate::control::test_session("r");
+        session.proxies.lock().insert(
+            "web".into(),
+            crate::control::test_entry_with(
+                rfrp_common::protocol::msg::ProxyType::Http,
+                None,
+                &["dev.example.com"],
+            ),
+        );
+        session.proxies.lock().insert(
+            "ssh".into(),
+            crate::control::test_entry_with(
+                rfrp_common::protocol::msg::ProxyType::Tcp,
+                Some(6000),
+                &[],
+            ),
+        );
+        state.sessions.lock().insert("r".into(), session);
+
+        let json = status_json(&state);
+        let proxies = json["sessions"][0]["proxies"].as_array().unwrap();
+        let by_name = |n: &str| proxies.iter().find(|p| p["name"] == n).unwrap();
+        assert_eq!(by_name("ssh")["remote_port"], 6000);
+        assert_eq!(by_name("web")["domains"][0], "dev.example.com");
     }
 }
