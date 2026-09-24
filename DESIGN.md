@@ -517,9 +517,11 @@ rfrp/
 │   │       └── cli.rs         # CLI 参数覆盖配置
 │   └── rfrp-bin/              # 统一二进制入口
 │       └── src/
-│           ├── main.rs        # 子命令分派 → run_server / run_client
+│           ├── main.rs        # 入口：解析 CLI 并按子命令分派
 │           ├── cli.rs         # 子命令与参数定义
-│           └── logging.rs     # 日志初始化
+│           ├── commands.rs    # server / client / client status 的执行
+│           ├── summary.rs     # 启动摘要、--check 摘要、日志初始化
+│           └── logging.rs     # tracing subscriber 安装
 ```
 
 **测试组织约定**：单元测试与生产代码同目录；测试代码超过约 150 行时拆到

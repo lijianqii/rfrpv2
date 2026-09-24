@@ -141,9 +141,14 @@ pub async fn register_proxy(
 
     // 登记：vhost 域名映射 + 会话内条目 + 全局归属索引。
     if !domains.is_empty() {
-        let mut map = session.proxy_domains.lock();
+        {
+            let mut map = session.proxy_domains.lock();
+            for d in &domains {
+                map.insert(d.clone(), np.proxy_name.clone());
+            }
+        }
+        // 全局索引在会话锁之外写入，避免 `proxy_domains → domain_index` 嵌套。
         for d in &domains {
-            map.insert(d.clone(), np.proxy_name.clone());
             state.index_domain(d, &session.run_id, &np.proxy_name);
         }
     }

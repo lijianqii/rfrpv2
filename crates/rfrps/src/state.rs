@@ -3,15 +3,17 @@
 //! # 锁顺序
 //!
 //! 本结构被所有 accept / 控制 / 数据面任务共享，加锁顺序必须统一，否则会出现
-//! 反向持锁导致的死锁。已确立的顺序（从左到右，不可反向获取）：
+//! 反向持锁导致的死锁。已确立的嵌套顺序（从左到右，不可反向获取）：
 //!
 //! ```text
-//! proxy_index → sessions → session.proxies / session.pools / session.proxy_domains
+//! proxy_index → sessions
 //! ```
 //!
-//! 即：`session_for_proxy` 先 `proxy_index` 再 `sessions`；`gauges` / `status_json`
-//! 先 `sessions` 再逐个会话的内部表。需要跨层操作时（如会话替换后的清理），
-//! 先收集结果、**释放锁之后**再获取另一把锁：见 control.rs 中 `cleanup` 的调用方式。
+//! 即 `session_for_proxy` 先 `proxy_index` 再 `sessions`。`sessions` 与各会话内部的
+//! `proxies` / `pools` / `proxy_domains` **不嵌套**：`gauges` / `status_json` 先克隆
+//! 会话句柄、释放 `sessions` 锁，再逐个读取内部表；注册路径也是先在会话锁内写映射、
+//! 再在锁外写全局索引。需要跨层操作时（如会话替换后的清理），先收集结果、
+//! **释放锁之后**再获取另一把锁：见 control.rs 中 `cleanup`。
 //! `pending` / `udp` / `proxy_stats` / `login_failures` 彼此独立，不参与上述嵌套。
 
 use parking_lot::Mutex;
@@ -162,18 +164,21 @@ impl ServerState {
         self.login_failures.lock().remove(&ip);
     }
 
-    /// 采样瞬时 gauge（会短暂持有 sessions/udp 等锁，均为短临界区）。
+    /// 采样瞬时 gauge。
+    ///
+    /// 先快照会话 Arc 再逐个统计：`sessions` 锁只在克隆句柄时短暂持有，
+    /// 不会因为遍历各会话的内部表而拖住登录/注销路径。
     pub fn gauges(&self) -> Gauges {
-        let sessions = self.sessions.lock();
+        let sessions: Vec<Arc<crate::control::Session>> =
+            self.sessions.lock().values().cloned().collect();
         let mut g = Gauges {
             sessions: sessions.len(),
             ..Default::default()
         };
-        for s in sessions.values() {
+        for s in &sessions {
             g.proxies += s.proxies.lock().len();
             g.pooled_work_conns += s.pools.lock().values().map(|v| v.len()).sum::<usize>();
         }
-        drop(sessions);
         g.pending_work = self.pending.lock().len();
         g.udp_sessions = self
             .udp

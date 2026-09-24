@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use rfrp_common::config::ClientConfig;
 use rfrp_common::util::accept::AcceptRetry;
-use rfrp_common::util::http::{html_escape, read_request_head, write_response};
+use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
 use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
@@ -85,12 +85,7 @@ async fn handle_request(
     if !limiter.allow(peer.ip(), Instant::now()) {
         return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
     }
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut req = httparse::Request::new(&mut headers);
-    let path = match req.parse(&head) {
-        Ok(httparse::Status::Complete(_)) => req.path.unwrap_or("/").to_string(),
-        _ => "/".to_string(),
-    };
+    let path = RequestHead::parse(&head).path;
 
     // /healthz：隧道健康检查（控制连接已登录 → 200；否则 503），供监控/守护进程使用。
     if path == "/healthz" {

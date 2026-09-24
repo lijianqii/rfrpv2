@@ -10,6 +10,56 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// 请求头上限（超过后按已读内容处理，解析失败按 `/` 处理）。
 pub const MAX_REQUEST_HEAD: usize = 8192;
 
+/// 解析后的请求行与常用头部（Dashboard 与客户端状态端点共用）。
+///
+/// 两个只读 HTTP 端点此前各自写了一套 `httparse` 样板；集中到这里后行为一致
+/// （最多 32 个头部、方法/路径默认值、`Accept`/`Cookie`/`Authorization` 提取）。
+#[derive(Default)]
+pub struct RequestHead {
+    pub method: String,
+    pub path: String,
+    /// `Content-Length`（缺失或非法时为 0）。
+    pub content_length: usize,
+    /// `Accept` 是否包含 `text/html`（用于区分浏览器导航与脚本客户端）。
+    pub accept_html: bool,
+    pub authorization: Option<String>,
+    pub cookie: Option<String>,
+}
+
+impl RequestHead {
+    /// 解析请求头；解析失败时退化为 `GET /`，由调用方决定返回 404 还是登录页。
+    pub fn parse(head: &[u8]) -> Self {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        let mut out = Self {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        if let Ok(httparse::Status::Complete(_)) = req.parse(head) {
+            if let Some(m) = req.method {
+                out.method = m.to_string();
+            }
+            if let Some(p) = req.path {
+                out.path = p.to_string();
+            }
+            for h in req.headers.iter() {
+                let value = std::str::from_utf8(h.value).unwrap_or("").trim();
+                if h.name.eq_ignore_ascii_case("content-length") {
+                    out.content_length = value.parse().unwrap_or(0);
+                } else if h.name.eq_ignore_ascii_case("accept") {
+                    out.accept_html = value.to_ascii_lowercase().contains("text/html");
+                } else if h.name.eq_ignore_ascii_case("authorization") {
+                    out.authorization = Some(value.to_string());
+                } else if h.name.eq_ignore_ascii_case("cookie") {
+                    out.cookie = Some(value.to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
 /// HTML 转义（`&`、`<`、`>`、`"`、`'`）。
 ///
 /// Dashboard / 状态页会把运行期数据（代理名、run_id、指标标签等）拼进 HTML。
@@ -203,5 +253,27 @@ mod tests {
         );
         assert_eq!(html_escape("plain-proxy_1"), "plain-proxy_1");
         assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn request_head_parses_method_path_and_headers() {
+        let head = b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\
+                     Accept: text/html,application/xhtml+xml\r\n\
+                     Authorization: Basic abc\r\nCookie: a=1; b=2\r\n\r\n";
+        let req = RequestHead::parse(head);
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/login");
+        assert_eq!(req.content_length, 12);
+        assert!(req.accept_html);
+        assert_eq!(req.authorization.as_deref(), Some("Basic abc"));
+        assert_eq!(req.cookie.as_deref(), Some("a=1; b=2"));
+
+        // 解析失败时退化为 GET /（由调用方决定返回 404 还是登录页）。
+        let req = RequestHead::parse(b"garbage");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/");
+        assert_eq!(req.content_length, 0);
+        assert!(!req.accept_html);
+        assert!(req.authorization.is_none());
     }
 }

@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 /// 运行指标。计数器用 `Arc<Atomic*>`，便于多处共享。
 pub struct Metrics {
     /// 进程启动时刻（用于 uptime 指标）。
@@ -195,54 +198,67 @@ pub fn render_prometheus(state: &crate::state::ServerState) -> String {
              # TYPE rfrp_proxy_bytes_up_total counter\n",
         );
         for (name, st) in &stats {
-            out.push_str(&format!(
-                "rfrp_proxy_bytes_up_total{{proxy=\"{}\"}} {}\n",
+            // `write!` 直接写入目标串，避免每行一个临时 String（代理多时每轮渲染可省数百次分配）。
+            let _ = writeln!(
+                out,
+                "rfrp_proxy_bytes_up_total{{proxy=\"{}\"}} {}",
                 escape_label(name),
                 st.bytes_up.load(Ordering::Relaxed)
-            ));
+            );
         }
         out.push_str(
             "# HELP rfrp_proxy_bytes_down_total Bytes from local service to external users (per proxy).\n\
              # TYPE rfrp_proxy_bytes_down_total counter\n",
         );
         for (name, st) in &stats {
-            out.push_str(&format!(
-                "rfrp_proxy_bytes_down_total{{proxy=\"{}\"}} {}\n",
+            let _ = writeln!(
+                out,
+                "rfrp_proxy_bytes_down_total{{proxy=\"{}\"}} {}",
                 escape_label(name),
                 st.bytes_down.load(Ordering::Relaxed)
-            ));
+            );
         }
         out.push_str(
             "# HELP rfrp_proxy_connections_total User connections accepted (per proxy).\n\
              # TYPE rfrp_proxy_connections_total counter\n",
         );
         for (name, st) in &stats {
-            out.push_str(&format!(
-                "rfrp_proxy_connections_total{{proxy=\"{}\"}} {}\n",
+            let _ = writeln!(
+                out,
+                "rfrp_proxy_connections_total{{proxy=\"{}\"}} {}",
                 escape_label(name),
                 st.connections_total.load(Ordering::Relaxed)
-            ));
+            );
         }
         out.push_str(
             "# HELP rfrp_proxy_active_connections Active user connections (per proxy).\n\
              # TYPE rfrp_proxy_active_connections gauge\n",
         );
         for (name, st) in &stats {
-            out.push_str(&format!(
-                "rfrp_proxy_active_connections{{proxy=\"{}\"}} {}\n",
+            let _ = writeln!(
+                out,
+                "rfrp_proxy_active_connections{{proxy=\"{}\"}} {}",
                 escape_label(name),
                 st.active_connections.load(Ordering::Relaxed)
-            ));
+            );
         }
     }
     out
 }
 
 /// Prometheus 标签值转义（反斜杠、双引号、换行）。
-fn escape_label(v: &str) -> String {
-    v.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+///
+/// 绝大多数代理名无需转义，此时直接借用原串，避免每次渲染为每个标签分配一份 String。
+fn escape_label(v: &str) -> Cow<'_, str> {
+    if v.contains(['\\', '"', '\n']) {
+        Cow::Owned(
+            v.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n"),
+        )
+    } else {
+        Cow::Borrowed(v)
+    }
 }
 
 #[cfg(test)]

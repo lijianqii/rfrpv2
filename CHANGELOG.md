@@ -24,6 +24,18 @@
 
 ### Changed
 
+- **数据面 / 渲染路径的分配与锁优化**：
+  - `PrependStream` 改用 `Bytes::from(Vec)` 零拷贝接管已读缓冲（vhost 请求头最长 64 KiB，
+    此前会再复制一份）。
+  - Prometheus 渲染改为 `write!` 直写目标串、标签转义返回 `Cow`，代理多时每轮渲染
+    少掉数百次临时 String 分配。
+  - 工作连接不再为日志拼接 `host:port` 字符串（改为结构化字段）。
+  - `gauges` / `status_json` / 代理注册不再在持 `sessions`（或 `proxy_domains`）锁时
+    嵌套获取会话内部表与全局索引，缩短登录/注销路径的等待；`cleanup` 合并为一次加锁收集。
+- **HTTP 请求头解析去重**：新增 `rfrp-common::util::http::RequestHead`，Dashboard 与
+  客户端状态端点共用（状态端点顺带获得一致的方法/头部处理）；`rfrpc` 不再依赖 `httparse`。
+- **`rfrp-bin` 结构整理**：入口只负责解析与分派，子命令执行拆到 `commands`，
+  启动摘要 / `--check` 摘要与日志初始化拆到 `summary`。
 - **并发控制会话上限**：新增全局 `MAX_SESSIONS`(1024) 与单来源 IP `MAX_SESSIONS_PER_IP`(256)。
   登录限速只统计失败次数，此前持有效 token 的客户端可用随机 `run_id` 无限建立控制会话
   （每个都会注册代理、占用 fd 与内存）；同一 `run_id` 的重连替换不计新增。

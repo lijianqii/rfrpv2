@@ -69,8 +69,6 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     };
     let mut framed = Framed::new(work, FrameCodec);
 
-    let local_addr = format!("{}:{}", proxy.local_ip, proxy.local_port);
-
     if proxy.r#type == ProxyType::Udp {
         // UDP：本地用 UDP socket，工作连接上按长度前缀分帧（DESIGN §8.6）。
         let local = UdpSocket::bind("0.0.0.0:0").await?;
@@ -81,7 +79,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         {
             state.metrics.inc_work_conn_failure();
             tracing::warn!(
-                proxy = %req.proxy_name, local = %local_addr, error = %e,
+                proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port, error = %e,
                 "local udp connect failed; closing work connection"
             );
             return Ok(());
@@ -125,7 +123,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             // 本地连不上：直接关闭工作连接（TCP FIN），服务端不会入池。
             state.metrics.inc_work_conn_failure();
             tracing::warn!(
-                proxy = %req.proxy_name, local = %local_addr, error = %e,
+                proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port, error = %e,
                 "local connect failed; closing work connection"
             );
             return Ok(());
@@ -133,7 +131,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         Err(_) => {
             state.metrics.inc_work_conn_failure();
             tracing::warn!(
-                proxy = %req.proxy_name, local = %local_addr,
+                proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port,
                 "local connect timeout; closing work connection"
             );
             return Ok(());

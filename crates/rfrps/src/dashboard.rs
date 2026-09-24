@@ -8,7 +8,7 @@ use base64::Engine;
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::DashboardSection;
 use rfrp_common::util::accept::AcceptRetry;
-use rfrp_common::util::http::{html_escape, read_request_head, write_response};
+use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
 use rfrp_common::util::ratelimit::RateLimiter;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -88,7 +88,7 @@ async fn handle_request(
         return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
     }
 
-    let req = ParsedHead::parse(&head);
+    let req = RequestHead::parse(&head);
 
     // /healthz 免鉴权（仅暴露 up/down，供监控/负载均衡探活）。
     if req.path == "/healthz" {
@@ -160,50 +160,6 @@ async fn handle_request(
     }
 }
 
-/// 解析后的请求头关键字段（一次解析，多处复用）。
-#[derive(Default)]
-struct ParsedHead {
-    method: String,
-    path: String,
-    content_length: usize,
-    accept_html: bool,
-    authorization: Option<String>,
-    cookie: Option<String>,
-}
-
-impl ParsedHead {
-    fn parse(head: &[u8]) -> Self {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut req = httparse::Request::new(&mut headers);
-        let mut out = Self {
-            method: "GET".into(),
-            path: "/".into(),
-            ..Default::default()
-        };
-        if let Ok(httparse::Status::Complete(_)) = req.parse(head) {
-            if let Some(m) = req.method {
-                out.method = m.to_string();
-            }
-            if let Some(p) = req.path {
-                out.path = p.to_string();
-            }
-            for h in req.headers.iter() {
-                let value = std::str::from_utf8(h.value).unwrap_or("").trim();
-                if h.name.eq_ignore_ascii_case("content-length") {
-                    out.content_length = value.parse().unwrap_or(0);
-                } else if h.name.eq_ignore_ascii_case("accept") {
-                    out.accept_html = value.to_ascii_lowercase().contains("text/html");
-                } else if h.name.eq_ignore_ascii_case("authorization") {
-                    out.authorization = Some(value.to_string());
-                } else if h.name.eq_ignore_ascii_case("cookie") {
-                    out.cookie = Some(value.to_string());
-                }
-            }
-        }
-        out
-    }
-}
-
 /// 健康检查响应：accept 循环正常返回 200，否则 503（供探活与告警）。
 fn health_response(state: &Arc<ServerState>) -> (u16, &'static str) {
     if state.metrics.is_accepting() {
@@ -214,7 +170,7 @@ fn health_response(state: &Arc<ServerState>) -> (u16, &'static str) {
 }
 
 /// 鉴权：接受 `Authorization: Basic` 头（脚本/兼容）或登录后的会话 Cookie。
-fn authorized(req: &ParsedHead, cfg: &DashboardSection) -> bool {
+fn authorized(req: &RequestHead, cfg: &DashboardSection) -> bool {
     if let Some(auth) = req.authorization.as_deref() {
         if let Some(encoded) = auth.strip_prefix("Basic ") {
             if let Some((user, pass)) = decode_basic(encoded.trim()) {
@@ -377,9 +333,12 @@ fn render_login_page(error: Option<&str>) -> String {
 }
 
 fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
-    let sessions = state.sessions.lock();
+    // 先快照会话 Arc，再逐个读取内部表：`sessions` 锁不跨越各会话的锁，
+    // 避免 Dashboard 轮询期间阻塞登录/注销。
+    let sessions: Vec<Arc<crate::control::Session>> =
+        state.sessions.lock().values().cloned().collect();
     let session_list: Vec<serde_json::Value> = sessions
-        .values()
+        .iter()
         .map(|s| {
             let proxies = s.proxies.lock();
             let proxy_list: Vec<serde_json::Value> = proxies
@@ -401,7 +360,6 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         })
         .collect();
 
-    drop(sessions);
     let g = state.gauges();
 
     // 每代理累计统计（按名字排序，便于阅读与测试）。
@@ -479,8 +437,8 @@ mod authorized_tests {
         }
     }
 
-    fn parsed(head: &str) -> ParsedHead {
-        ParsedHead::parse(head.as_bytes())
+    fn parsed(head: &str) -> RequestHead {
+        RequestHead::parse(head.as_bytes())
     }
 
     #[test]

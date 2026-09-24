@@ -447,18 +447,18 @@ fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
     session.stop.notify_waiters();
-    // 先收集代理名，用于清理全局归属索引（proxy_name → run_id）。
-    let proxy_names: Vec<String> = session.proxies.lock().keys().cloned().collect();
-    // 先收集 UDP 代理名，用于清理全局注册表。
-    let udp_names: Vec<String> = session
-        .proxies
-        .lock()
-        .iter()
-        .filter(|(_, e)| e.kind == ProxyType::Udp)
-        .map(|(n, _)| n.clone())
-        .collect();
-    // 收集 vhost 域名，用于清理全局域名索引（domain → 归属）。
-    let domain_names: Vec<String> = session.proxy_domains.lock().keys().cloned().collect();
+    // 一次加锁收集需要清理的代理名（全部 + UDP）与域名，随后在锁外操作全局索引。
+    let (proxy_names, udp_names, domain_names) = {
+        let proxies = session.proxies.lock();
+        let proxy_names: Vec<String> = proxies.keys().cloned().collect();
+        let udp_names: Vec<String> = proxies
+            .iter()
+            .filter(|(_, e)| e.kind == ProxyType::Udp)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let domain_names: Vec<String> = session.proxy_domains.lock().keys().cloned().collect();
+        (proxy_names, udp_names, domain_names)
+    };
     state.remove_proxy_stats(&proxy_names);
     state.unindex_proxies(proxy_names);
     state.unindex_domains(domain_names);

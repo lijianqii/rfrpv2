@@ -1,6 +1,6 @@
 //! 类型擦除的异步字节流，用于同时持有明文 TCP 与 TLS 流。
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -15,14 +15,17 @@ pub type BoxedStream = Box<dyn AsyncStream>;
 
 /// 先回放已读缓冲、再透传底层流的包装器（vhost 读取请求头后使用）。
 pub struct PrependStream {
-    buf: BytesMut,
+    /// 已读缓冲。`Bytes::from(Vec)` 零拷贝接管调用方的分配，避免再复制一份
+    /// （vhost 请求头最长可达 64 KiB）。
+    buf: Bytes,
     inner: BoxedStream,
 }
 
 impl PrependStream {
+    /// 先回放 `buf`，再透传 `inner`；`buf` 的所有权被接管，不做拷贝。
     pub fn new(buf: Vec<u8>, inner: BoxedStream) -> Self {
         Self {
-            buf: BytesMut::from(&buf[..]),
+            buf: Bytes::from(buf),
             inner,
         }
     }

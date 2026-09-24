@@ -1,48 +1,21 @@
 //! `rfrp` 二进制入口。
 //!
-//! 解析 CLI、加载配置、应用 CLI 覆盖、初始化日志，按子命令分派到
-//! `rfrps::Server::run` 或 `rfrpc::Client::run`。
+//! 解析 CLI 后按子命令分派：具体执行见 [`commands`]，启动/`--check` 摘要与日志
+//! 初始化见 [`summary`]。
 
 #![forbid(unsafe_code)]
 
 mod cli;
+mod commands;
 mod logging;
+mod summary;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
 use cli::{Cli, ClientAction, Commands};
-use rfrp_common::config::LogSection;
-
-/// 全局日志覆盖（CLI 参数，优先级高于配置文件 `[log]`）。
-struct LogOverrides {
-    level: Option<String>,
-    output: Option<String>,
-    format: Option<String>,
-}
-
-/// 服务端子命令参数。
-struct ServerArgs {
-    config: PathBuf,
-    bind: Option<String>,
-    token: Option<String>,
-    tls_enable: Option<bool>,
-    work_conn_tls: Option<bool>,
-    grace_secs: Option<u64>,
-    check: bool,
-}
-
-/// 客户端子命令参数。
-struct ClientArgs {
-    config: PathBuf,
-    server: Option<String>,
-    token: Option<String>,
-    tls_enable: Option<bool>,
-    work_conn_tls: Option<bool>,
-    check: bool,
-}
+use commands::{run_client, run_server, run_status, ClientArgs, ServerArgs};
+use summary::LogOverrides;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -90,11 +63,6 @@ async fn main() -> ExitCode {
             action: Some(ClientAction::Status { config, addr }),
             ..
         } => run_status(config, addr).await,
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "rfrp", &mut std::io::stdout());
-            ExitCode::SUCCESS
-        }
         Commands::Client {
             config: Some(config),
             server,
@@ -121,290 +89,10 @@ async fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
-    }
-}
-
-/// 按“CLI 参数 > 配置文件 > 默认值”合并日志设置并初始化。
-fn init_logging(log: &LogSection, overrides: &LogOverrides) {
-    logging::init_logging(
-        overrides.level.as_deref().or(log.level.as_deref()),
-        overrides.output.as_deref().or(log.output.as_deref()),
-        overrides.format.as_deref().or(log.format.as_deref()),
-    );
-}
-
-/// 打印服务端启动摘要（版本与关键配置；不打印 token）。
-fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        bind = %format!("{}:{}", cfg.server.bind_addr, cfg.server.bind_port),
-        tls = cfg.server.tls_enable,
-        work_conn_tls = cfg.server.work_conn_tls,
-        tcp_keepalive_secs = cfg.server.tcp_keepalive_secs.unwrap_or(30),
-        udp_session_timeout_secs = cfg.server.udp_session_timeout().as_secs(),
-        grace_secs = cfg.server.grace().as_secs(),
-        allow_ports = if cfg.proxy.allow_ports.trim().is_empty() {
-            "all"
-        } else {
-            cfg.proxy.allow_ports.as_str()
-        },
-        vhost_http = ?cfg.proxy.vhost_http_port,
-        vhost_https = ?cfg.proxy.vhost_https_port,
-        dashboard = cfg.dashboard.is_some(),
-        log_level = cfg.log.level.as_deref().unwrap_or("info"),
-        "rfrps starting"
-    );
-}
-
-/// 打印客户端启动摘要（版本、服务端地址、代理清单；不打印 token）。
-fn log_client_summary(cfg: &rfrp_common::config::ClientConfig) {
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        server = %format!("{}:{}", cfg.client.server_addr, cfg.client.server_port),
-        proxies = cfg.proxies.len(),
-        tls = cfg.client.tls_enable,
-        work_conn_tls = cfg.client.work_conn_tls,
-        tcp_keepalive_secs = cfg.client.tcp_keepalive_secs.unwrap_or(30),
-        run_id_file = ?cfg.client.run_id_file,
-        "rfrpc starting"
-    );
-    for p in &cfg.proxies {
-        tracing::info!(
-            name = %p.name,
-            kind = ?p.r#type,
-            local = %format!("{}:{}", p.local_ip, p.local_port),
-            remote_port = ?p.remote_port,
-            domains = ?p.custom_domains,
-            pool_size = p.pool_size,
-            "proxy configured"
-        );
-    }
-}
-
-/// 密钥类字段的展示形式：只说明"已设置 + 长度"，绝不打印明文。
-fn describe_secret(s: &str) -> String {
-    format!("(set, {} chars)", s.chars().count())
-}
-
-/// `--check` 模式的服务端配置摘要（打印到 stdout，便于脚本/CI 捕获）。
-fn print_server_config_summary(path: &std::path::Path, cfg: &rfrp_common::config::ServerConfig) {
-    println!("server config OK: {}", path.display());
-    println!("  bind: {}:{}", cfg.server.bind_addr, cfg.server.bind_port);
-    println!("  token: {}", describe_secret(&cfg.server.token));
-    println!(
-        "  tls_enable: {}, work_conn_tls: {}",
-        cfg.server.tls_enable, cfg.server.work_conn_tls
-    );
-    println!("  grace_secs: {}", cfg.server.grace().as_secs());
-    println!(
-        "  allow_ports: {}",
-        if cfg.proxy.allow_ports.trim().is_empty() {
-            "all".to_string()
-        } else {
-            cfg.proxy.allow_ports.clone()
-        }
-    );
-    println!(
-        "  vhost: http={:?}, https={:?}",
-        cfg.proxy.vhost_http_port, cfg.proxy.vhost_https_port
-    );
-    println!(
-        "  dashboard: {}",
-        cfg.dashboard
-            .as_ref()
-            .map(|d| format!("{} (user={})", d.addr, d.user))
-            .unwrap_or_else(|| "disabled".to_string())
-    );
-}
-
-/// `--check` 模式的客户端配置摘要（打印到 stdout，便于脚本/CI 捕获）。
-fn print_client_config_summary(path: &std::path::Path, cfg: &rfrp_common::config::ClientConfig) {
-    println!("client config OK: {}", path.display());
-    println!(
-        "  server: {}:{}",
-        cfg.client.server_addr, cfg.client.server_port
-    );
-    println!("  token: {}", describe_secret(&cfg.client.token));
-    println!(
-        "  tls_enable: {}, work_conn_tls: {}",
-        cfg.client.tls_enable, cfg.client.work_conn_tls
-    );
-    println!("  proxies: {}", cfg.proxies.len());
-    for p in &cfg.proxies {
-        let remote = match (p.remote_port, &p.custom_domains) {
-            (Some(rp), _) => format!("remote_port={rp}"),
-            (None, Some(d)) => format!("domains={}", d.join(",")),
-            (None, None) => String::new(),
-        };
-        println!(
-            "    - {} {:?} {}:{} {} pool_size={}",
-            p.name, p.r#type, p.local_ip, p.local_port, remote, p.pool_size
-        );
-    }
-}
-
-/// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
-async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
-    let mut cfg = match rfrp_common::config::load_server_config(&args.config) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "failed to load server config {}: {e}",
-                args.config.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrps。
-    if let Err(e) = rfrps::cli::apply_cli_overrides(
-        &mut cfg,
-        args.bind,
-        args.token,
-        args.tls_enable,
-        args.work_conn_tls,
-    ) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = cfg.validate() {
-        eprintln!("server config invalid after CLI overrides: {e}");
-        return ExitCode::FAILURE;
-    }
-    if args.check {
-        print_server_config_summary(&args.config, &cfg);
-        return ExitCode::SUCCESS;
-    }
-    init_logging(&cfg.log, &log);
-    log_server_summary(&cfg);
-    rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
-        cfg.server.tcp_keepalive_secs,
-    ));
-
-    let server = match rfrps::Server::new(cfg).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to start server");
-            return ExitCode::FAILURE;
-        }
-    };
-    // 优雅退出宽限期可由 CLI 覆盖（运维可调，默认 30s，见 §14.4）。
-    let server = match args.grace_secs {
-        Some(g) => server.with_grace(Duration::from_secs(g)),
-        None => server,
-    };
-    tracing::info!(addr = %server.local_addr(), "rfrps listening");
-    match server.run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            tracing::error!(error = %e, "rfrps exited with error");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// `status` 子命令：查询本地客户端状态端点并打印 `/api/status` 的 JSON。
-async fn run_status(config: PathBuf, addr: Option<String>) -> ExitCode {
-    let cfg = match rfrp_common::config::load_client_config(&config) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load client config {}: {e}", config.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let target = addr.or_else(|| cfg.client.status_addr.clone());
-    let Some(target) = target else {
-        eprintln!(
-            "未启用状态端点：请在配置里设置 [client].status_addr（如 \"127.0.0.1:7400\"），\
-             或用 --addr 指定"
-        );
-        return ExitCode::FAILURE;
-    };
-    match fetch_status(&target).await {
-        Ok(body) => {
-            print!("{body}");
-            if !body.ends_with('\n') {
-                println!();
-            }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "rfrp", &mut std::io::stdout());
             ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to query status endpoint {target}: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// 极简 HTTP GET：连接状态端点、读完整响应、校验 200 后返回 body。
-async fn fetch_status(addr: &str) -> std::io::Result<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = tokio::net::TcpStream::connect(addr).await?;
-    let req = format!("GET /api/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await?;
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
-
-    let text = String::from_utf8_lossy(&resp).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
-    let status = head.lines().next().unwrap_or("");
-    if !status.contains(" 200 ") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unexpected response: {status}"),
-        ));
-    }
-    Ok(body.to_string())
-}
-
-/// 客户端：加载配置 → CLI 覆盖 → 校验 → 日志 → 长驻运行（重连直到退出）。
-async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
-    let mut cfg = match rfrp_common::config::load_client_config(&args.config) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "failed to load client config {}: {e}",
-                args.config.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrpc。
-    if let Err(e) = rfrpc::cli::apply_cli_overrides(
-        &mut cfg,
-        args.server,
-        args.token,
-        args.tls_enable,
-        args.work_conn_tls,
-    ) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = cfg.validate() {
-        eprintln!("client config invalid after CLI overrides: {e}");
-        return ExitCode::FAILURE;
-    }
-    if args.check {
-        print_client_config_summary(&args.config, &cfg);
-        return ExitCode::SUCCESS;
-    }
-    init_logging(&cfg.log, &log);
-    log_client_summary(&cfg);
-    rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
-        cfg.client.tcp_keepalive_secs,
-    ));
-
-    let client = match rfrpc::Client::new(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create client");
-            return ExitCode::FAILURE;
-        }
-    };
-    match client.run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            tracing::error!(error = %e, "rfrpc exited with error");
-            ExitCode::FAILURE
         }
     }
 }

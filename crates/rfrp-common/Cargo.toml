@@ -22,6 +22,7 @@ bytes = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+httparse = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
