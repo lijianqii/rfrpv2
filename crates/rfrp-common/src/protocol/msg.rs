@@ -118,6 +118,15 @@ impl ProxyError {
         matches!(self, Self::PortOccupied | Self::DomainConflict)
     }
 
+    /// 是否值得用**较长退避**在后台继续重试。
+    ///
+    /// 这类失败当前不可自愈，但可能在**不重启客户端**的前提下随服务端配置/状态变化而恢复
+    /// （如服务端放宽 `allow_ports`、临时性资源耗尽缓解），因此值得继续尝试；
+    /// 而 `invalid field` / `invalid type` 属纯客户端配置错误，重试无意义。
+    pub fn is_persistently_retryable(self) -> bool {
+        matches!(self, Self::PortNotAllowed | Self::Internal)
+    }
+
     /// 从错误码字符串解析（未知码返回 `None`）。
     pub fn from_code(code: &str) -> Option<Self> {
         [
@@ -396,6 +405,24 @@ mod proxy_error_tests {
             ProxyError::Internal,
         ] {
             assert!(!e.is_retryable(), "{e} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn persistently_retryable_classification() {
+        // 可能随服务端配置变化恢复：值得长退避继续重试。
+        assert!(ProxyError::PortNotAllowed.is_persistently_retryable());
+        assert!(ProxyError::Internal.is_persistently_retryable());
+        // 纯客户端配置错误 / 立即可重试的运行时冲突：不走长退避列表。
+        for e in [
+            ProxyError::InvalidType,
+            ProxyError::InvalidField,
+            ProxyError::NameExists,
+            ProxyError::TooManyProxies,
+            ProxyError::PortOccupied,
+            ProxyError::DomainConflict,
+        ] {
+            assert!(!e.is_persistently_retryable(), "{e}");
         }
     }
 

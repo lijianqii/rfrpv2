@@ -42,6 +42,13 @@ pub const HEARTBEAT_MIN_SECS: u64 = 1;
 pub const HEARTBEAT_MAX_SECS: u64 = 3600;
 /// rfrps 侧等待 StartWorkConn 的兜底超时。
 pub const WORK_CONN_TIMEOUT_RFRPS: u64 = 10;
+/// rfrps 侧重发 `ReqWorkConn` 的间隔（毫秒）。
+///
+/// 工作连接建立失败（客户端本地服务瞬时不可用、建连抖动）时，只发一次请求会让用户
+/// 连接白等到 `WORK_CONN_TIMEOUT_RFRPS` 被关闭。这里在超时窗口内周期性重发，给客户端
+/// 重试机会。重复请求是安全的：服务端按 `work_id` 取待处理项，取走即消费；后到的工作
+/// 连接因找不到待处理项而被关闭。
+pub const WORK_CONN_REQUEST_INTERVAL_MS: u64 = 3000;
 /// rfrpc 侧建立工作连接的本地截止。
 pub const WORK_CONN_TIMEOUT_RFRPC: u64 = 8;
 /// UDP 会话无活动超时清理（默认值，可通过服务端配置覆盖）。
@@ -79,6 +86,13 @@ pub const PROXY_REGISTER_RETRY_INITIAL: u64 = 2;
 pub const PROXY_REGISTER_RETRY_MAX: u32 = 8;
 /// 注册重试退避上限。
 pub const PROXY_REGISTER_RETRY_MAX_DELAY: u64 = 30;
+/// "配置类"注册失败的后台重试间隔（秒）。
+///
+/// 这类失败（如服务端尚未放行 `allow_ports`）重试不会立刻自愈，但可能随服务端配置或
+/// 状态变化而恢复，且**不需要重启客户端**；因此用固定长间隔继续尝试。
+pub const PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS: u64 = 30;
+/// "配置类"注册失败的后台重试轮数（约 10 分钟）。
+pub const PROXY_REGISTER_RETRY_PERSISTENT_MAX: u32 = 20;
 
 /// 重连退避初值。
 pub const RECONNECT_BACKOFF_INITIAL: u64 = 1;

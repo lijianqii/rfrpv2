@@ -437,6 +437,31 @@ async fn pending_work_conn_cleaned_after_timeout() {
 }
 
 #[tokio::test]
+async fn work_conn_request_is_retried_until_consumed() {
+    // 工作连接迟迟未建立时，服务端应在超时窗口内重发 ReqWorkConn（给客户端重试机会），
+    // 而不是只发一次就等超时把用户连接关掉。
+    let state = ServerState::new();
+    state
+        .pending_request_interval_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    let (session, mut rx) = crate::control::test_session_with_token("r", "tok");
+    let (user, _peer) = tokio::io::duplex(64);
+    dispatch_user_connection("ssh".to_string(), user, session, state);
+
+    let mut work_ids = Vec::new();
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(Message::ReqWorkConn(r))) => work_ids.push(r.work_id),
+            other => panic!("expected ReqWorkConn, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        work_ids[0], work_ids[1],
+        "the same work_id must be re-requested"
+    );
+}
+
+#[tokio::test]
 async fn pooled_work_conn_without_token_rejected() {
     // 未携带 work_conn_token 的工作连接不得进入预热池（防池注入/中间人）。
     let state = ServerState::new();

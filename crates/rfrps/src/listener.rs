@@ -351,19 +351,35 @@ pub(crate) fn dispatch_user_connection<S>(
 
     let tx = session.tx.clone();
     let state2 = state.clone();
+    let interval = state.pending_request_interval();
     tokio::spawn(async move {
         // 超时兜底由 Server::run 里的单周期扫描任务负责（见 sweep_expired_pending）。
-        if !send_with_timeout(
-            &tx,
-            Message::ReqWorkConn(ReqWorkConn {
-                proxy_name,
-                work_id,
-            }),
-        )
-        .await
-        {
-            // 控制连接已断或通道拥堵，清理待处理项（避免任务堆积）。
-            state2.pending.lock().remove(&work_id);
+        // 这里在超时窗口内**周期性重发** ReqWorkConn：工作连接建立失败（客户端本地服务
+        // 瞬时不可用、建连抖动）时，单次请求会让用户连接白等超时被关闭。
+        let deadline = std::time::Instant::now() + Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS);
+        loop {
+            if !send_with_timeout(
+                &tx,
+                Message::ReqWorkConn(ReqWorkConn {
+                    proxy_name: proxy_name.clone(),
+                    work_id,
+                }),
+            )
+            .await
+            {
+                // 控制连接已断或通道拥堵，清理待处理项（避免任务堆积）。
+                state2.pending.lock().remove(&work_id);
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return; // 交给扫描任务关闭用户连接
+            }
+            tokio::time::sleep(interval.min(deadline - now)).await;
+            // 已被工作连接消费（或已被清理）→ 结束。
+            if !state2.pending.lock().contains_key(&work_id) {
+                return;
+            }
         }
     });
 }

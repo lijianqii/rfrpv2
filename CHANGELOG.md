@@ -24,6 +24,8 @@
 
 ### Changed
 
+- **服务端连接错误日志分级**：对端行为（RST/EOF/协议不符、非 rfrp 客户端首帧）降为
+  `debug`，不再按 `warn` 刷屏；其余异常仍为 `warn`。
 - **数据面 / 渲染路径的分配与锁优化**：
   - `PrependStream` 改用 `Bytes::from(Vec)` 零拷贝接管已读缓冲（vhost 请求头最长 64 KiB，
     此前会再复制一份）。
@@ -70,6 +72,23 @@
 
 ### Fixed
 
+- **UDP 监听遇一次 `recv_from` 瞬时错误就永久停止**：Windows 上若此前的 `send_to` 引来
+  ICMP port unreachable（例如客户端 UDP 端口已关闭），`recv_from` 会返回一次
+  `WSAECONNRESET`，而 socket 之后仍可用；旧实现直接 `break`，导致该 UDP 代理静默失效
+  （不再收包、端口却仍绑定，会话清理扫描也一起停）。现改为退避后继续收包（复用
+  `AcceptRetry`，含日志抑制）。
+- **客户端 TLS 证书/协商失败被当作瞬时错误**：`tls_ca` / `tls_server_name` 配错时客户端
+  会无限退避重连且没有明确信号。现按致命处理（与鉴权失败、版本不符一致）并退出，日志
+  带上 rustls 的具体原因（如 `invalid peer certificate: UnknownIssuer`）；连接类错误
+  （重置/超时）仍按瞬时问题重连。
+- **工作连接建立失败后服务端不再重发请求**：客户端因本地服务瞬时不可用而建连失败时，
+  服务端只发过一次 `ReqWorkConn`，用户连接只能白等到超时被关闭。现改为在
+  `WORK_CONN_TIMEOUT_RFRPS` 窗口内按 `WORK_CONN_REQUEST_INTERVAL_MS`(3s) 周期重发；
+  重复请求安全（待处理项按 `work_id` 取走即消费，后到的工作连接会被关闭）。
+- **不可自愈的注册失败只在下次重连才重试**：`port not allowed`、`internal error` 这类失败
+  现在也纳入后台重试，使用固定 30s、最多 20 轮（约 10 分钟）的长退避——服务端改完
+  `allow_ports` 等配置即可自动恢复，不必等客户端重连；`invalid field` / `invalid type`
+  等纯客户端配置错误仍不重试。
 - **心跳看门狗在写侧失效时不再"装死"（客户端不重连 / 服务端不清理会话）**：心跳任务发送
   `Heartbeat` 失败时（出站通道已关闭，或写任务阻塞超过 `CONTROL_SEND_TIMEOUT` 导致通道满）
   旧实现直接 `continue` 跳过本轮——既不判定超时也不再尝试发送。半开连接（链路静默中断、

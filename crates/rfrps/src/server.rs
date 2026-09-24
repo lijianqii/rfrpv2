@@ -221,7 +221,13 @@ impl Server {
                                 )
                                 .await
                                 {
-                                    tracing::warn!(%peer, error = %e, "connection error");
+                                    // 对端行为（RST/EOF/协议不符）属预期噪声，降为 debug；
+                                    // 其余才是需要关注的异常。
+                                    if is_expected_peer_error(&e) {
+                                        tracing::debug!(%peer, error = %e, "connection closed by peer");
+                                    } else {
+                                        tracing::warn!(%peer, error = %e, "connection error");
+                                    }
                                 }
                             });
                         }
@@ -274,6 +280,26 @@ impl Server {
         }
         sig.abort();
         Ok(())
+    }
+}
+
+/// 连接处理失败是否属于"对端行为"（RST/EOF/协议不符等预期噪声）。
+///
+/// 这类失败降为 `debug`：端口扫描、健康检查、客户端本地服务不可用时
+/// "连上即关"都会产生它们，按 `warn` 记录会把真正的异常淹没。
+fn is_expected_peer_error(e: &Error) -> bool {
+    match e {
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+        ),
+        // 帧格式/版本/JSON 不符：对方不是 rfrp 客户端（扫描器、误连）。
+        Error::Protocol(_) => true,
+        _ => false,
     }
 }
 
@@ -459,7 +485,8 @@ async fn handle_connection(
             work::handle_work_connection(frame, stream, state).await
         }
         other => {
-            tracing::warn!("unexpected first frame msg_type={other:#x}, closing");
+            // 非 rfrp 客户端（扫描器/误连）会产生这种首帧，降为 debug。
+            tracing::debug!("unexpected first frame msg_type={other:#x}, closing");
             Ok(())
         }
     }

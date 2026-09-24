@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rfrp_common::constants::{
     LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS, MAX_SESSIONS,
-    MAX_SESSIONS_PER_IP,
+    MAX_SESSIONS_PER_IP, WORK_CONN_REQUEST_INTERVAL_MS,
 };
 use rfrp_common::util::stream::BoxedStream;
 use tokio_util::sync::CancellationToken;
@@ -89,6 +89,8 @@ pub struct ServerState {
     pub max_sessions: AtomicUsize,
     /// 单来源 IP 的并发控制会话上限（测试可调小）。
     pub max_sessions_per_ip: AtomicUsize,
+    /// 重发 `ReqWorkConn` 的间隔（毫秒，测试可调小）。
+    pub pending_request_interval_ms: AtomicU64,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -108,6 +110,7 @@ impl ServerState {
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
             max_sessions: AtomicUsize::new(MAX_SESSIONS),
             max_sessions_per_ip: AtomicUsize::new(MAX_SESSIONS_PER_IP),
+            pending_request_interval_ms: AtomicU64::new(WORK_CONN_REQUEST_INTERVAL_MS),
             shutdown: CancellationToken::new(),
         })
     }
@@ -192,6 +195,15 @@ impl ServerState {
     /// 分配下一个 work_id（≥1）。原子 RMW 已保证唯一性，Relaxed 足够。
     pub fn next_work_id(&self) -> u64 {
         self.work_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 重发 `ReqWorkConn` 的间隔（下限 1ms，避免被误配成 0 造成热循环）。
+    pub fn pending_request_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.pending_request_interval_ms
+                .load(Ordering::Relaxed)
+                .max(1),
+        )
     }
 
     /// 记录 proxy_name 归属的会话（run_id），注册成功后调用。

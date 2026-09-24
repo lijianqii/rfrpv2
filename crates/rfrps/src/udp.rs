@@ -14,6 +14,7 @@ use rfrp_common::constants::{
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
+use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::control::send_with_timeout;
 use rfrp_common::util::udp::{enlarge_recv_buffer, write_udp_frames_buffered, UdpFrameBuf};
 use tokio::net::UdpSocket;
@@ -171,17 +172,31 @@ async fn run_udp_listener(
     let mut sweep_iv = tokio::time::interval(sweep_period);
     sweep_iv.tick().await; // 消耗首次立即 tick
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
+    // recv 出错同样用退避策略：一次瞬时错误不得结束监听循环（见下方说明）。
+    let mut recv_retry = AcceptRetry::new();
     loop {
         tokio::select! {
             r = proxy.socket.recv_from(&mut buf) => {
                 match r {
                     Ok((n, peer)) => {
+                        recv_retry.record_ok();
                         handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n]).await;
                         drain_socket_batch(&proxy, &proxy_name, &session, &state, &mut buf).await;
                     }
                     Err(e) => {
-                        tracing::warn!(proxy = %proxy_name, error = %e, "udp recv error");
-                        break;
+                        // 瞬时错误（Windows 上此前的 send_to 若引来 ICMP port unreachable，
+                        // 后续 recv_from 会返回 WSAECONNRESET，但 socket 之后仍可用）不得
+                        // 结束监听循环：否则 UDP 代理会静默失效（不再收包，端口却仍绑定）。
+                        let backoff = recv_retry.record_err();
+                        if recv_retry.should_log() {
+                            tracing::warn!(
+                                proxy = %proxy_name,
+                                consecutive = recv_retry.consecutive(),
+                                error = %e,
+                                "udp recv error; retrying"
+                            );
+                        }
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

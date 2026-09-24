@@ -11,6 +11,7 @@ use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
     CONNECT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN, MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT,
     PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY,
+    PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS, PROXY_REGISTER_RETRY_PERSISTENT_MAX,
     RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
@@ -234,7 +235,20 @@ impl Client {
         // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
         let stream: BoxedStream = if self.config.client.tls_enable {
             let tls = tls.as_ref().expect("tls built above");
-            Box::new(tls.connect(stream).await?)
+            match tls.connect(stream).await {
+                Ok(s) => Box::new(s),
+                // 证书校验/协议协商失败是配置问题，重试不会自愈：按致命处理并退出，
+                // 避免无限退避重连且不给用户明确信号（连接类错误仍是瞬时问题）。
+                Err(rfrp_common::Error::Auth(msg)) => {
+                    tracing::error!(
+                        error = %msg,
+                        "control TLS handshake failed; not reconnecting \
+                         (check tls_ca / tls_server_name / server certificate)"
+                    );
+                    return Ok(ConnectOutcome::Fatal(msg));
+                }
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
         } else {
             Box::new(stream)
         };
@@ -318,10 +332,12 @@ impl Client {
         tracing::info!(count = state.proxies.len(), "registering proxies");
         // 可重试失败的代理（如端口被旧会话占用），交给后台任务退避重试（§6.6）。
         let mut retryable: Vec<ClientProxy> = Vec::new();
+        let mut persistent: Vec<ClientProxy> = Vec::new();
         for p in state.proxies.values() {
             match register_one_proxy(&tx, &state, p).await {
                 RegisterOutcome::Ok => {}
                 RegisterOutcome::Retryable => retryable.push(p.clone()),
+                RegisterOutcome::Persistent => persistent.push(p.clone()),
                 RegisterOutcome::Failed => {}
                 RegisterOutcome::ConnLost => {
                     anyhow::bail!(
@@ -331,14 +347,15 @@ impl Client {
             }
         }
 
-        // 运行时冲突（port occupied / domain conflict）后台重试：端口最长约 40s
-        // 会被旧会话心跳超时释放，重试可自愈，避免"连上但代理不可用"。
-        if !retryable.is_empty() {
+        // 后台重试：运行时冲突用短退避（端口最长约 40s 会被旧会话心跳超时释放），
+        // 配置类失败用长退避（服务端改完配置即可恢复，无需重启客户端）。
+        if !retryable.is_empty() || !persistent.is_empty() {
             let tx_retry = tx.clone();
             let state_retry = state.clone();
             let shutdown_retry = shutdown.clone();
             tokio::spawn(async move {
-                retry_registration(tx_retry, state_retry, retryable, shutdown_retry).await;
+                retry_registration(tx_retry, state_retry, retryable, persistent, shutdown_retry)
+                    .await;
             });
         }
 
@@ -414,7 +431,9 @@ enum RegisterOutcome {
     Ok,
     /// 失败且可重试（运行时冲突，DESIGN §6.6）。
     Retryable,
-    /// 失败且不可重试（配置错误等），已记录日志。
+    /// 失败且不可立即重试，但可能随服务端配置/状态变化恢复：长退避后台重试。
+    Persistent,
+    /// 失败且重试无意义（纯客户端配置错误），已记录日志。
     Failed,
     /// 控制连接已断，无法继续注册。
     ConnLost,
@@ -441,14 +460,22 @@ async fn register_one_proxy(
         }
         Ok(Ok(resp)) => {
             let code = resp.error.as_deref().and_then(ProxyError::from_code);
-            let retryable = code.is_some_and(ProxyError::is_retryable);
             state.metrics.inc_proxy_register_failure();
-            if retryable {
+            if code.is_some_and(ProxyError::is_retryable) {
                 tracing::warn!(
                     proxy = %p.name, code = ?resp.error,
                     "proxy registration rejected (retryable, will retry in background)"
                 );
                 RegisterOutcome::Retryable
+            } else if code.is_some_and(ProxyError::is_persistently_retryable) {
+                // 如服务端尚未放行 allow_ports：重试不会立刻自愈，但服务端改完配置即可恢复，
+                // 且不需要重启客户端，因此用长退避继续尝试。
+                tracing::warn!(
+                    proxy = %p.name, code = ?resp.error,
+                    hint = registration_hint(code),
+                    "proxy registration rejected (will retry in background with long backoff)"
+                );
+                RegisterOutcome::Persistent
             } else {
                 tracing::error!(
                     proxy = %p.name, code = ?resp.error,
@@ -503,34 +530,77 @@ fn spawn_preheat(state: &Arc<ClientState>, p: &ClientProxy) {
     }
 }
 
-/// 对运行时冲突（port occupied / domain conflict）的代理做后台退避重试。
+/// 后台注册重试。
 ///
-/// 退避 2s→4s→…→30s，最多 [`PROXY_REGISTER_RETRY_MAX`] 轮（约 2 分钟，
-/// 覆盖旧会话心跳超时释放端口的窗口）。控制连接断开时发送失败即退出；
-/// 重连后由新一轮注册接管。
+/// - `retryable`（端口占用 / 域名冲突）：退避 2s→30s，最多 [`PROXY_REGISTER_RETRY_MAX`] 轮
+///   （约 2.5 分钟），覆盖旧会话心跳超时释放端口的窗口；
+/// - `persistent`（配置类失败，如 `port not allowed`）：固定
+///   [`PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS`] 秒、最多
+///   [`PROXY_REGISTER_RETRY_PERSISTENT_MAX`] 轮（约 10 分钟），便于服务端改完配置后
+///   自动恢复，而不必等客户端重连。
+///
+/// 两段都感知退出信号；控制连接断开（发送失败）即结束，重连后由新一轮注册接管。
 async fn retry_registration(
     tx: mpsc::Sender<Message>,
     state: Arc<ClientState>,
-    mut pending: Vec<ClientProxy>,
+    retryable: Vec<ClientProxy>,
+    persistent: Vec<ClientProxy>,
     shutdown: CancellationToken,
 ) {
-    let mut delay = Duration::from_secs(PROXY_REGISTER_RETRY_INITIAL);
-    for round in 1..=PROXY_REGISTER_RETRY_MAX {
+    retry_loop(
+        &tx,
+        &state,
+        retryable,
+        &shutdown,
+        Duration::from_secs(PROXY_REGISTER_RETRY_INITIAL),
+        Duration::from_secs(PROXY_REGISTER_RETRY_MAX_DELAY),
+        PROXY_REGISTER_RETRY_MAX,
+    )
+    .await;
+    retry_loop(
+        &tx,
+        &state,
+        persistent,
+        &shutdown,
+        Duration::from_secs(PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS),
+        Duration::from_secs(PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS),
+        PROXY_REGISTER_RETRY_PERSISTENT_MAX,
+    )
+    .await;
+}
+
+/// 单个退避重试循环：`delay` 从 `initial` 起翻倍增长、封顶 `max_delay`，最多 `rounds` 轮。
+async fn retry_loop(
+    tx: &mpsc::Sender<Message>,
+    state: &Arc<ClientState>,
+    mut pending: Vec<ClientProxy>,
+    shutdown: &CancellationToken,
+    initial: Duration,
+    max_delay: Duration,
+    rounds: u32,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut delay = initial;
+    for round in 1..=rounds {
         // 退避期间响应退出信号，避免进程退出时还要等满一个退避周期。
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown.cancelled() => return,
         }
-        delay = (delay * 2).min(Duration::from_secs(PROXY_REGISTER_RETRY_MAX_DELAY));
+        delay = (delay * 2).min(max_delay);
         let mut still = Vec::new();
         for p in pending {
-            match register_one_proxy(&tx, &state, &p).await {
+            match register_one_proxy(tx, state, &p).await {
                 RegisterOutcome::Ok => {
                     state.metrics.inc_proxy_register_retry_success();
                     tracing::info!(proxy = %p.name, round, "proxy registered after retry");
                 }
-                RegisterOutcome::Retryable => still.push(p),
-                RegisterOutcome::Failed => {}
+                // 本列表里的代理已被判定为"值得重试"：任何失败都留到下一轮。
+                RegisterOutcome::Retryable
+                | RegisterOutcome::Persistent
+                | RegisterOutcome::Failed => still.push(p),
                 RegisterOutcome::ConnLost => return,
             }
         }
@@ -540,7 +610,7 @@ async fn retry_registration(
         }
     }
     for p in pending {
-        tracing::error!(
+        tracing::warn!(
             proxy = %p.name,
             "proxy still unavailable after retries; will retry on next reconnect"
         );

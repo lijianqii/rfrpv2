@@ -241,6 +241,10 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
   `domain conflict` 为运行时冲突，客户端会自动退避重试（2s→30s，约 2 分钟）；其余为配置问题，需修正配置。
   客户端日志同时带 `hint=` 给出对应的修正方向；服务端日志记录详细原因（端口、占用者、
   不在 `allow_ports` 内的具体端口与允许范围等）。
+  `port not allowed` / `internal error` 这类可能随**服务端**配置变化恢复的失败，客户端也会用
+  长退避后台重试（固定 30s、最多 20 轮，约 10 分钟）——服务端改完 `allow_ports` 后无需重启
+  客户端即可自动注册成功；`invalid field` / `invalid type` 等纯客户端配置错误不重试，修正
+  配置并重启客户端即可。
 - **`remote_port` 无法绑定**：检查 `allow_ports` 是否放行、端口是否被其他进程占用、是否使用了特权端口（<1024）。
 
 ### 服务端连不上（客户端反复 `connect timeout`）
@@ -285,6 +289,8 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
   两个参数均可配置（`heartbeat_interval_secs` / `heartbeat_timeout_secs`，见"注意事项"）；
   心跳看门狗同时覆盖**写侧失效**：出站发送失败（写任务退出或阻塞超时）即判定控制连接
   失效并触发重连 / 会话清理，不会出现"链路半开却一直不重连、服务端不清理"的僵死状态。
+- **证书类错误按致命处理**：`tls_ca` / `tls_server_name` 配错（证书校验、协议协商失败）时
+  客户端直接退出并打印具体原因，而不是无限退避重连；连接重置/超时等瞬时错误仍会重连。
 - **TCP 与 UDP 数据连接的语义差异**：已建立的 **TCP** 数据连接（SSH/RDP 会话）在控制面
   重连期间**不受影响**（有集成测试覆盖）；而 **UDP** 代理会话绑定在控制会话上——控制会话
   被清理时服务端会结束其 UDP 工作连接并释放端口，客户端重连后重新注册、重建会话

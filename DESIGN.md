@@ -428,7 +428,13 @@ rfrps 收到 `NewProxy` 后按顺序校验，任一失败返回 `NewProxyResp{ok
 
 > error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。
 >
-> **实现**（`rfrp_common::ProxyError` 为唯一来源）：rfrpc 收到 `ok=false` 时按上表分类——`"port occupied"` / `"domain conflict"` 交由后台任务退避重试（`PROXY_REGISTER_RETRY_*`，不阻塞控制循环、不影响其他 Proxy）；其余视为配置错误记 error 日志并跳过。服务端在 `register_proxy` 失败时记录 `code` 与详细原因，便于两端日志关联。
+> **实现**（`rfrp_common::ProxyError` 为唯一来源）：rfrpc 收到 `ok=false` 时按上表分类——
+> `"port occupied"` / `"domain conflict"`（运行时冲突）交由后台任务短退避重试
+> （`PROXY_REGISTER_RETRY_*`，2s→30s，8 轮）；`"port not allowed"` / `"internal error"`
+> 这类可能随**服务端**配置/状态变化恢复的失败，用长退避继续重试
+> （`PROXY_REGISTER_RETRY_PERSISTENT_*`，固定 30s，20 轮）；`invalid field` / `invalid type` /
+> `proxy_name exists` / `too many proxies` 属配置问题，记 error 日志并跳过。重试均不阻塞
+> 控制循环、不影响其他 Proxy。服务端在 `register_proxy` 失败时记录 `code` 与详细原因，便于两端日志关联。
 
 #### 重连恢复冲突
 
@@ -535,6 +541,8 @@ rfrp/
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
 > - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP）
 > - 代理注册重试（秒）：`PROXY_REGISTER_RETRY_INITIAL = 2`、`PROXY_REGISTER_RETRY_MAX = 8`（轮）、`PROXY_REGISTER_RETRY_MAX_DELAY = 30`
+> - 配置类注册重试（秒）：`PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS = 30`、`PROXY_REGISTER_RETRY_PERSISTENT_MAX = 20`（轮，约 10 分钟）
+> - 工作连接请求重发间隔：`WORK_CONN_REQUEST_INTERVAL_MS = 3000`（在 `WORK_CONN_TIMEOUT_RFRPS` 窗口内周期重发 `ReqWorkConn`）
 > - 上限：`MAX_PENDING_UDP_SESSIONS = 256`、`MAX_PROXIES_PER_SESSION = 128`、`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
 > - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`、`MAX_ERROR_LEN = 512`
 
@@ -641,6 +649,8 @@ rfrpc 启动
 ```
 User → rfrps:remote_port  (Listener 接收)
   → rfrps 生成 work_id，在控制连接发送 ReqWorkConn(proxy_name, work_id)
+      → 若超时窗口内工作连接仍未建立，按 WORK_CONN_REQUEST_INTERVAL_MS 周期重发
+        （覆盖客户端本地服务瞬时不可用/建连抖动；重复请求安全：待处理项取走即消费）
   → rfrpc 收到，新建 work TCP 到 rfrps
       →（若 work_conn_tls=true）TLS 握手
       → 首帧 StartWorkConn(proxy_name, work_id)  # 回传 work_id 供 rfrps 关联

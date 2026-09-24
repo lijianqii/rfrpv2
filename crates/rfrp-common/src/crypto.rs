@@ -190,7 +190,34 @@ impl ClientTls {
         self.connector
             .connect(self.server_name.clone(), stream)
             .await
-            .map_err(|e| Error::Other(format!("TLS connect failed: {}", describe_io_error(&e))))
+            .map_err(map_tls_connect_error)
+    }
+}
+
+/// 把 tokio-rustls 的握手错误转成 rfrp 错误。
+///
+/// tokio-rustls 把证书校验/协议协商失败包装成 `InvalidData`；这类问题重试不会自愈
+/// （`tls_ca` / `tls_server_name` 配置错误），用 [`Error::Auth`] 区分出来，让上层判定为
+/// 致命而不是无限退避重连。连接类错误（重置/超时等）仍是瞬时问题，用 [`Error::Other`]。
+fn map_tls_connect_error(e: std::io::Error) -> Error {
+    let detail = format!("TLS connect failed: {}", tls_error_detail(&e));
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        Error::Auth(detail)
+    } else {
+        Error::Other(detail)
+    }
+}
+
+/// 渲染 TLS 握手错误。
+///
+/// tokio-rustls 把 rustls 错误包成自定义 `io::Error`，其 `Display` 就是具体原因
+/// （如 "invalid peer certificate: UnknownIssuer"）——比 `ErrorKind` 描述（"invalid data"）
+/// 有用得多，且不是 OS 本地化文案。纯 I/O 错误则用稳定的 rfrp 描述，避免透出系统语言。
+fn tls_error_detail(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        e.to_string()
+    } else {
+        describe_io_error(e)
     }
 }
 
@@ -232,6 +259,42 @@ mod tests {
             ..Default::default()
         };
         assert!(ClientTls::new(&cfg).is_ok());
+    }
+
+    #[test]
+    fn tls_connect_error_classification() {
+        // 模拟 tokio-rustls 的真实包装：io::Error 的 source 是 rustls 错误。
+        #[derive(Debug)]
+        struct FakeRustlsError;
+        impl std::fmt::Display for FakeRustlsError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("invalid peer certificate: UnknownIssuer")
+            }
+        }
+        impl std::error::Error for FakeRustlsError {}
+
+        // 证书校验/协议协商失败（tokio-rustls 用 InvalidData 包装）→ Auth（上层判定致命）。
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidData, FakeRustlsError);
+        match map_tls_connect_error(e) {
+            Error::Auth(msg) => assert!(
+                msg.contains("UnknownIssuer"),
+                "detail must keep the underlying cause: {msg}"
+            ),
+            other => panic!("cert error must map to Auth, got {other:?}"),
+        }
+
+        // 连接类错误 → Other（上层按可重试的瞬时问题处理）。
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let e = std::io::Error::new(kind, "transient");
+            assert!(
+                matches!(map_tls_connect_error(e), Error::Other(_)),
+                "{kind:?} must stay transient"
+            );
+        }
     }
 
     #[test]
