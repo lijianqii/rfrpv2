@@ -169,6 +169,10 @@
 
 ### Changed
 
+- **不再提供 musl 静态产物**：发布产物收敛为两个 —— `x86_64-linux-gnu`（`.tar.gz`）
+  与 `x86_64-pc-windows-gnu`（`.zip`）。相应地移除了 `.cargo/config.toml` 的 musl 目标配置、
+  `scripts/release.sh` 的 musl 构建与打包、`scripts/toolchain-setup.sh` 的 musl 工具链步骤，
+  以及 README / DESIGN 中所有 musl 相关内容。
 - **全工程整理（配置样板 / 测试辅助 / 依赖 / 工具）**：
   - 测试与单测里的 `ServerSection` / `ClientSection` 字面量（32 处）改用
     `..Default::default()` 收敛默认字段——上次新增心跳配置时被迫改动 24 处字面量，
@@ -343,7 +347,7 @@
   （`pool_size`，池命中/补充语义 `work_id=0`）、优雅退出（30s 宽限期）。
 - 运维：Dashboard（Basic Auth + `/api/status` + `/metrics`）、Prometheus 指标、
   结构化日志（text/json，stderr/file）、systemd unit 示例、交叉编译发布脚本。
-- 平台：Linux（gnu/musl）、Windows（MinGW-w64）构建产物；`TCP_NODELAY` 全链路启用。
+- 平台：Linux（gnu）、Windows（MinGW-w64）构建产物；`TCP_NODELAY` 全链路启用。
 
 [Unreleased]: https://github.com/lijianqii/rfrpv2/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/lijianqii/rfrpv2/releases/tag/v0.1.0

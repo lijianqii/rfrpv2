@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在 Debian 开发机上交叉编译并打包 rfrp 三产物。
+# 在 Debian 开发机上交叉编译并打包 rfrp 两产物（linux-gnu / windows-gnu）。
 # 产物输出到 dist/，并生成 SHA256SUMS。
 set -euo pipefail
 
@@ -10,9 +10,6 @@ mkdir -p "$DIST"
 
 echo "==> Building linux-gnu"
 cargo build --release --target x86_64-unknown-linux-gnu
-
-echo "==> Building linux-musl"
-cargo build --release --target x86_64-unknown-linux-musl
 
 echo "==> Building windows-gnu"
 cargo build --release --target x86_64-pc-windows-gnu
@@ -33,13 +30,6 @@ prepare_common "$DIST/linux-gnu" "x86_64-linux-gnu"
 cp deploy/systemd/rfrp-server.service deploy/systemd/rfrp-client.service "$DIST/linux-gnu/"
 tar -C "$DIST/linux-gnu" -czf "$DIST/rfrp-${VERSION}-x86_64-linux-gnu.tar.gz" .
 
-# Linux musl
-mkdir -p "$DIST/linux-musl"
-cp target/x86_64-unknown-linux-musl/release/rfrp "$DIST/linux-musl/rfrp"
-prepare_common "$DIST/linux-musl" "x86_64-linux-musl"
-cp deploy/systemd/rfrp-server.service deploy/systemd/rfrp-client.service "$DIST/linux-musl/"
-tar -C "$DIST/linux-musl" -czf "$DIST/rfrp-${VERSION}-x86_64-linux-musl.tar.gz" .
-
 # Windows gnu（zip 内含 exe + 配置模板 + 许可证 + 说明）
 mkdir -p "$DIST/windows-gnu"
 cp target/x86_64-pc-windows-gnu/release/rfrp.exe "$DIST/windows-gnu/rfrp.exe"
@@ -54,7 +44,7 @@ else
 fi
 
 # 清理临时目录
-rm -rf "$DIST/linux-gnu" "$DIST/linux-musl" "$DIST/windows-gnu"
+rm -rf "$DIST/linux-gnu" "$DIST/windows-gnu"
 
 # 校验和
 (cd "$DIST" && sha256sum *.tar.gz *.zip > SHA256SUMS)

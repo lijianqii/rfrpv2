@@ -272,6 +272,9 @@ pub(crate) fn dispatch_user_connection<S>(
 {
     // 并发连接数兜底（防 DoS）：原子地检查并递增，避免并发尖峰突破上限。
     let max = state.max_active.load(std::sync::atomic::Ordering::Relaxed);
+    // 注意：`fetch_update` 在新工具链里被重命名为 `try_update`，但后者晚于本项目的
+    // MSRV(1.75)，因此继续使用旧名并显式豁免 deprecation 警告（bump MSRV 后再改）。
+    #[allow(deprecated)]
     let accepted = state
         .metrics
         .active_connections

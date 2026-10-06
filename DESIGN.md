@@ -85,7 +85,6 @@ rfrp 同时支持 **Linux** 与 **Windows** 运行，但**所有编译均在 Lin
 | 平台 | Target Triple | 产物 | 构建方式 | 备注 |
 |------|---------------|------|----------|------|
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | `rfrp` | 原生编译 | 默认开发与运行平台，动态链接 glibc |
-| Linux x86_64 (静态) | `x86_64-unknown-linux-musl` | `rfrp` | 原生编译（musl） | 静态二进制，便于部署到任意 Linux |
 | Windows x86_64 | `x86_64-pc-windows-gnu` | `rfrp.exe` | **交叉编译**（mingw-w64） | 产出 `.exe`，静态链接 winpthread |
 
 > 明确不支持 `x86_64-pc-windows-msvc`，避免引入 MSVC 构建工具与 Windows SDK 依赖。Windows 版本统一用 MinGW-w64 交叉编译，开发机无需安装 Windows 工具。
@@ -100,27 +99,22 @@ rfrp 同时支持 **Linux** 与 **Windows** 运行，但**所有编译均在 Lin
 sudo apt update
 sudo apt install -y build-essential pkg-config curl git
 
-# musl 静态编译所需
-sudo apt install -y musl-tools
-
 # MinGW-w64 交叉编译器（用于 Windows 产物）
 sudo apt install -y mingw-w64
 ```
 
 安装后可获得：
 - `gcc` / `g++` — Linux 原生编译
-- `musl-gcc` — Linux 静态编译链接器
 - `x86_64-w64-mingw32-gcc` — Windows 交叉编译链接器
 - `x86_64-w64-mingw32-g++`、`x86_64-w64-mingw32-windres` 等
 
 **2) Rust 工具链（rustup）**
 
-假设开发机已通过 rustup 安装好 stable 工具链。仅需添加三个目标 target：
+假设开发机已通过 rustup 安装好 stable 工具链。仅需添加两个目标 target：
 
 ```bash
 # x86_64-unknown-linux-gnu 通常是默认 host，无需额外添加，可跳过本行
 rustup target add x86_64-unknown-linux-gnu
-rustup target add x86_64-unknown-linux-musl
 rustup target add x86_64-pc-windows-gnu
 ```
 
@@ -129,10 +123,6 @@ rustup target add x86_64-pc-windows-gnu
 放在仓库根目录，提交到 git，确保所有人 clone 后即可交叉编译：
 
 ```toml
-[target.x86_64-unknown-linux-musl]
-linker = "musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 # 静态链接 winpthread，产物在 Windows 上无需额外 DLL
@@ -145,22 +135,18 @@ rustflags = ["-C", "link-args=-static", "-C", "link-args=-lpthread"]
 # Linux 原生
 cargo build --release --target x86_64-unknown-linux-gnu
 
-# Linux 静态
-cargo build --release --target x86_64-unknown-linux-musl
-
 # Windows 交叉
 cargo build --release --target x86_64-pc-windows-gnu
 ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 ```
 
-> 三条命令均能在 Debian 上成功，即工具链就绪。
+> 两条命令均能在 Debian 上成功，即工具链就绪。
 
 #### 3.3.3 构建命令速查
 
 | 目标 | 命令 | 产物路径 |
 |------|------|----------|
 | Linux 动态 | `cargo build --release` | `target/release/rfrp` |
-| Linux 静态 | `cargo build --release --target x86_64-unknown-linux-musl` | `target/x86_64-unknown-linux-musl/release/rfrp` |
 | Windows | `cargo build --release --target x86_64-pc-windows-gnu` | `target/x86_64-pc-windows-gnu/release/rfrp.exe` |
 | 单测（Linux） | `cargo test` | — |
 | Clippy | `cargo clippy --all-targets -- -D warnings` | — |
@@ -172,12 +158,11 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 | 产物 | Target | 文件 |
 |------|--------|------|
 | Linux 动态 | `x86_64-unknown-linux-gnu` | `rfrp-0.1.0-x86_64-linux-gnu.tar.gz` |
-| Linux 静态 | `x86_64-unknown-linux-musl` | `rfrp-0.1.0-x86_64-linux-musl.tar.gz` |
 | Windows | `x86_64-pc-windows-gnu` | `rfrp-0.1.0-x86_64-windows-gnu.zip`（含 `rfrp.exe`） |
 
 - 全部产物在 Debian 开发机上一次构建产出，无需 Windows 环境。
 - Windows 产物通过 `file` 命令确认格式：`PE32+ executable for MS Windows (console) x86-64`。
-- 可用 `scripts/release.sh` 一键编译并打包三产物。
+- 可用 `scripts/release.sh` 一键编译并打包两产物。
 
 #### 3.3.5 平台差异注意点
 
@@ -1003,7 +988,7 @@ CLI 参数 > 配置文件 > 默认值。
 - [x] 结构化日志（tracing），按级别过滤，支持 stderr 与 file 输出（`output = "file:/path/to.log"`）
 - [x] 配置文件 + CLI 参数双入口：CLI 参数覆盖配置同名字段，`-c` 与字段参数可组合（见 7.3、9.3）
 - [x] 单二进制 CLI：`rfrp server` / `rfrp client`
-- [x] Linux (gnu/musl) + Windows (MinGW-w64) 双平台构建与产物
+- [x] Linux (gnu) + Windows (MinGW-w64) 双平台构建与产物
 
 ---
 
@@ -1064,7 +1049,7 @@ CLI 参数 > 配置文件 > 默认值。
 
 ### 阶段 6：打磨与发布（M6）
 - 集成测试、性能基准（Criterion）
-- Debian 上交叉编译三产物：linux-gnu / linux-musl / windows-gnu
+- Debian 上交叉编译两产物：linux-gnu / windows-gnu
 - Release 产物打包（tar.gz / zip）、SHA256 校验和
 - 自签证书一键脚本（`scripts/gen-self-signed-cert.sh`）
 - README 与部署文档
@@ -1105,7 +1090,7 @@ rfrp/
 │   │   ├── example_smoke.rs               #   示例配置真实链路冒烟
 │   │   └── certs/                         #   测试用证书
 │   └── rfrp-bin/tests/chaos.rs            # 进程级信号与退出码
-├── .cargo/config.toml        # 交叉编译配置（musl-gcc、mingw-w64 链接器）
+├── .cargo/config.toml        # 交叉编译配置（mingw-w64 链接器）
 ├── deploy/systemd/           # systemd unit 文件
 │   ├── rfrp-server.service
 │   └── rfrp-client.service
@@ -1234,7 +1219,6 @@ C:\rfrp\
 | Windows (mingw64) 交叉编译兼容 | 链接失败/运行时缺 DLL | Debian 统一安装 mingw-w64；`.cargo/config.toml` 静态链接 winpthread；依赖尽量纯 Rust 避免 C 库 |
 | 平台行为差异（信号/UDP/路径） | 跨平台 bug | 平台分支集中在 `util::platform`；Windows 产物在测试机手动验证 |
 | Windows 运行时未自动化测试 | 回归风险 | 开发机只编译不跑 Windows；用 Windows 虚拟机/物理机做发布前冒烟 |
-| musl 静态二进制 DNS 解析异常 | musl 产物域名解析失败 | musl resolver 不读 nsswitch.conf；测试覆盖域名解析场景；必要时文档建议 glibc 产物用于生产 |
 | M1 阶段无鉴权无 TLS | 误部署到公网 | M1 仅供内网测试，文档与启动日志明确警告；M3 完成后才可公网部署 |
 | Dashboard 明文 Basic Auth | 误暴露公网导致密码泄露 | Dashboard 不走 HTTPS，仅限内网/本地访问；启动日志提示绑定地址，若绑 0.0.0.0 则警告 |
 | 心跳超时误判（网络抖动） | 短暂网络抖动导致 10s 超时，触发误断连与重连，影响在途连接 | 心跳间隔 30s + 超时 10s 已留余量；重连复用 run_id 恢复 Proxy，在途用户连接受 8.5 超时保护；弱网场景可考虑调大超时（首版固定不可配，后续版本可配） |
@@ -1298,7 +1282,7 @@ $ cargo run -q -- --help      # 子命令 server/client + 全局日志参数正�
 ```
 rfrpv2/
 ├── Cargo.toml                      # workspace 根
-├── .cargo/config.toml              # musl / windows-gnu 交叉编译
+├── .cargo/config.toml              # windows-gnu 交叉编译
 ├── examples/
 │   ├── rfrp-server.toml
 │   └── rfrp-client.toml
@@ -1428,7 +1412,7 @@ $ cargo fmt --check           # FMT CLEAN
 - **清理**：删除未使用的 `frame::framed_split` 及其导入；`bridge` 泛型化为 `AsyncRead + AsyncWrite + Unpin`，可复用/可测（见 §13）。
 - **新增单测**：rfrps 6 项（注册拒绝 + work_id）、rfrpc 1 项（配置映射）、bridge 1 项（双向转发）、集成 2 项（并发用户、多代理）。
 - **工具链**：`.gitignore`、`rustfmt.toml`(max_width=100)、`Makefile`(`fmt`/`fmt-check`/`clippy`/`build`/`test`/`ci`)。
-- **本地质量门（make ci）**：`fmt --check` + `clippy --all-targets -- -D warnings` + `build` + `test`；目标产物需满足 musl / windows-gnu 交叉编译验证（三产物，§3.3.2）。
+- **本地质量门（make ci）**：`fmt --check` + `clippy --all-targets -- -D warnings` + `build` + `test`；目标产物需满足 windows-gnu 交叉编译验证（两产物，§3.3.2）。
 - **质量门**：`clippy` 零容忍警告；本地 `make ci` 覆盖格式检查 + Clippy 严格 + 构建 + 测试（不依赖 GitHub Workflow）。
 
 新增/调整文件：`rustfmt.toml`、`Makefile`、`.gitignore`、`.github/workflows/ci.yml`、`crates/rfrps/src/bridge.rs`（泛型 + 测试）、`crates/rfrpc/src/bridge.rs`（泛型）、`crates/rfrps/src/listener.rs`（单测）、`crates/rfrpc/src/client.rs`（单测）、`crates/rfrpc/tests/tcp_proxy.rs`（重构 + 2 集成测试）、`crates/rfrpc/tests/example_smoke.rs`（真实示例配置回归）、`crates/rfrp-common/tests/config_files.rs`（示例文件契约测试）、`crates/rfrp-common/src/config/{client,server}.rs`（deny_unknown_fields + 配置正/负例单测）、`crates/rfrp-common/src/protocol/frame.rs`（删 `framed_split`）。
@@ -1603,9 +1587,8 @@ M3 主功能已完成，交付内容如下：
 
 M6 发布与打包已完成：
 
-- **发布脚本**：`scripts/release.sh` 一键构建并打包三平台产物：
+- **发布脚本**：`scripts/release.sh` 一键构建并打包两平台产物：
   - `x86_64-unknown-linux-gnu` → `tar.gz`
-  - `x86_64-unknown-linux-musl` → `tar.gz`
   - `x86_64-pc-windows-gnu` → `zip`
 - **校验和**：产物目录生成 `SHA256SUMS`。
 - **自签证书脚本**：`scripts/gen-self-signed-cert.sh` 生成控制链路/工作连接与 vhost 证书。
