@@ -76,8 +76,7 @@ scripts/bench-udp.py latency   # 200B 小包往返：直连 vs 代理（P50/P95/
   同一次实验的后续轮次因**测试端 TIME_WAIT 端口耗尽**而失真（两种二进制同样塌到几十 conn/s），
   因此这台机器上的 A/B 只能作为参考，结论不足以支持默认启用。
 
-**建议**：不要默认启用；若要进一步压 churn 成本，优先级更高的是**复用桥接缓冲**（去掉每连接
-128 KiB 的分配 + 清零），它在任何分配器下都有效，也顺带降低内存带宽占用。
+**建议**：不要默认启用。若要继续压 churn 成本，"复用桥接缓冲"这条已经实验过，见下一节。
 
 如要在自己的 Debian 上复测：
 
@@ -85,6 +84,31 @@ scripts/bench-udp.py latency   # 200B 小包往返：直连 vs 代理（P50/P95/
 cargo build --release -p rfrp-bin                        # 系统分配器
 cargo build --release -p rfrp-bin --features mimalloc    # mimalloc（可选 feature，默认关闭）
 ```
+
+## 桥接缓冲复用（已实验，**未采纳**）
+
+动机：tokio 的 `copy_bidirectional` 每次调用都 `vec![0; 32 KiB]`（零初始化），而一条用户
+连接要过两次桥接（服务端 + 客户端），等于**每连接多写 128 KiB 的零**。
+
+实测（macOS，release）：
+
+| 项 | 结果 |
+|---|---|
+| `vec![0; 32 KiB]` 分配 + 清零 | 0.534 µs |
+| `Vec::with_capacity(32 KiB)`（不初始化） | 0.012 µs |
+| 分配 + 真正写入 32 KiB（零初始化 / capacity） | 0.279 / 0.284 µs（**几乎无差别**） |
+| 每连接成本基准（in-memory duplex，单桥接） | 新实现 22.50 µs vs tokio 22.90 µs |
+| **端到端全双工单流吞吐**（交错 3 轮） | tokio 1755 / 1719 / 1790 MiB/s vs 新实现 1576 / 1563 / 1541 MiB/s |
+
+结论：缓冲真正被数据填满时，零初始化的开销会被吸收（0.279 vs 0.284 µs），可省下的只有
+"分配了但没填满"的部分，约 0.4 µs/桥接、~2 µs/连接；而为了让两个方向并发读写同一对
+socket，必须先用 `tokio::io::split`，**它让同一 socket 的读半端与写半端共享一把锁**——
+真实用户连接是全双工（RDP/SSH/echo），实测吞吐 **−11%**。收益与代价不成比例，因此已回退，
+生产路径继续使用 tokio 的实现；只有手写 poll 状态机（需要 `unsafe` 操作未初始化缓冲，
+与 `#![forbid(unsafe_code)]` 冲突）才能同时拿到两者，当前不做。
+
+保留的两个语义测试（`bridge_propagates_half_close_and_keeps_reverse_direction`、
+`bridge_reuses_buffer_for_many_small_bursts`）对任何实现都适用，用于守住半关闭与交互小包行为。
 
 ## 历史基线（2026-09-10，Debian x86_64，方法论不同）
 
