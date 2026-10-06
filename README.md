@@ -20,6 +20,21 @@ Rust Fast Reverse Proxy —— 用 Rust + tokio 实现的轻量级反向代理�
 cargo build --release
 ```
 
+### 发布产物交叉编译（Debian 开发机）
+
+发布产物固定为 x86_64 两个平台（`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`），
+`make release` 会交叉编译并打包。开发机可以是 amd64，也可以是 arm64（如 Debian 13 on ARM）：
+
+- 各目标的链接器已在 `.cargo/config.toml` 显式指定——arm64 宿主默认可用的 `cc` 是
+  aarch64 编译器，若不指定会直接链接失败；
+- arm64 宿主需额外安装 x86_64 交叉工具链（提供 `x86_64-linux-gnu-gcc`）：
+
+```bash
+sudo apt install -y crossbuild-essential-amd64   # 或 scripts/toolchain-setup.sh 一键装齐
+rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+make release
+```
+
 ### Windows（原生）
 
 Windows 发布产物使用 GNU ABI：`.cargo/config.toml` 为 `x86_64-pc-windows-gnu`

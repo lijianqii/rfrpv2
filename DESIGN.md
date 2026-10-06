@@ -78,7 +78,11 @@
 
 ### 3.3 平台与构建策略
 
-rfrp 同时支持 **Linux** 与 **Windows** 运行，但**所有编译均在 Linux 开发机上完成**（Debian）。Windows 版本通过交叉编译产出，不在 Windows 上构建。
+rfrp 同时支持 **Linux** 与 **Windows** 运行，但**所有编译均在 Linux 开发机上完成**（Debian）。
+Windows 版本通过交叉编译产出，不在 Windows 上构建。开发机既可能是 **amd64**，也可能是
+**arm64**（Debian 13 on ARM）——两种宿主都产出同一组 x86_64 目标产物，因此各目标的链接器
+必须在 `.cargo/config.toml` 中显式指定（arm64 宿主上宿主默认 `cc` 是 aarch64 编译器，
+不加配置会直接链接失败）。
 
 #### 3.3.1 目标平台与工具链
 
@@ -91,7 +95,8 @@ rfrp 同时支持 **Linux** 与 **Windows** 运行，但**所有编译均在 Lin
 
 #### 3.3.2 Debian 开发机工具链安装
 
-开发机为 Debian 13（trixie），一次性安装所有构建所需工具。以下命令也兼容 Debian 11/12 及 Ubuntu 20.04+。
+开发机为 Debian 13（trixie），一次性安装所有构建所需工具。以下命令也兼容 Debian 11/12 及 Ubuntu 20.04+，
+并覆盖 amd64 / arm64 两种宿主（后者需要额外的 x86_64 交叉工具链）。
 
 **1) 系统基础包**
 
@@ -101,10 +106,15 @@ sudo apt install -y build-essential pkg-config curl git
 
 # MinGW-w64 交叉编译器（用于 Windows 产物）
 sudo apt install -y mingw-w64
+
+# 仅 arm64 宿主需要：x86_64 交叉工具链（提供 x86_64-linux-gnu-gcc）
+sudo apt install -y crossbuild-essential-amd64
 ```
 
 安装后可获得：
 - `gcc` / `g++` — Linux 原生编译
+- `x86_64-linux-gnu-gcc` — x86_64 Linux 产物的链接器（amd64 宿主上即本机 gcc 的三段式名字，
+  arm64 宿主上由 `crossbuild-essential-amd64` 提供）
 - `x86_64-w64-mingw32-gcc` — Windows 交叉编译链接器
 - `x86_64-w64-mingw32-g++`、`x86_64-w64-mingw32-windres` 等
 
@@ -113,7 +123,8 @@ sudo apt install -y mingw-w64
 假设开发机已通过 rustup 安装好 stable 工具链。仅需添加两个目标 target：
 
 ```bash
-# x86_64-unknown-linux-gnu 通常是默认 host，无需额外添加，可跳过本行
+# amd64 宿主上 x86_64-unknown-linux-gnu 通常是默认 host，可跳过本行；
+# arm64 宿主必须显式添加（产物是 x86_64，不是宿主架构）。
 rustup target add x86_64-unknown-linux-gnu
 rustup target add x86_64-pc-windows-gnu
 ```
@@ -123,6 +134,11 @@ rustup target add x86_64-pc-windows-gnu
 放在仓库根目录，提交到 git，确保所有人 clone 后即可交叉编译：
 
 ```toml
+[target.x86_64-unknown-linux-gnu]
+# amd64 宿主上就是本机编译器；arm64 宿主上来自 crossbuild-essential-amd64。
+# 不指定的话，arm64 主机会用 aarch64 的 cc 链接 x86_64 目标而失败。
+linker = "x86_64-linux-gnu-gcc"
+
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 # 静态链接 winpthread，产物在 Windows 上无需额外 DLL
@@ -146,9 +162,9 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 | 目标 | 命令 | 产物路径 |
 |------|------|----------|
-| Linux 动态 | `cargo build --release` | `target/release/rfrp` |
-| Windows | `cargo build --release --target x86_64-pc-windows-gnu` | `target/x86_64-pc-windows-gnu/release/rfrp.exe` |
-| 单测（Linux） | `cargo test` | — |
+| Linux x86_64（发布产物） | `cargo build --release --target x86_64-unknown-linux-gnu` | `target/x86_64-unknown-linux-gnu/release/rfrp` |
+| Windows x86_64（发布产物） | `cargo build --release --target x86_64-pc-windows-gnu` | `target/x86_64-pc-windows-gnu/release/rfrp.exe` |
+| 宿主本机（调试/单测） | `cargo build --release` / `cargo test` | `target/release/rfrp`（宿主架构，amd64 或 arm64） |
 | Clippy | `cargo clippy --all-targets -- -D warnings` | — |
 
 #### 3.3.4 交叉编译矩阵与产物

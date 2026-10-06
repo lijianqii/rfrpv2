@@ -169,6 +169,13 @@
 
 ### Changed
 
+- **支持在 arm64 宿主上构建 x86_64 产物**：开发机可能是 amd64 或 arm64（Debian 13 on ARM），
+  而发布产物固定为 x86_64 两个平台。此前只配置了 Windows 目标的链接器，arm64 宿主构建
+  `x86_64-unknown-linux-gnu` 时会回退到宿主默认 `cc`（aarch64 编译器）而链接失败。
+  现在 `.cargo/config.toml` 显式指定 `[target.x86_64-unknown-linux-gnu] linker =
+  x86_64-linux-gnu-gcc`；`scripts/toolchain-setup.sh` 会按宿主架构自动安装
+  `crossbuild-essential-amd64` 并校验三个链接器；README / DESIGN 补充 arm64 宿主的
+  构建前提与命令（`rustup target add x86_64-unknown-linux-gnu`）。
 - **不再提供 musl 静态产物**：发布产物收敛为两个 —— `x86_64-linux-gnu`（`.tar.gz`）
   与 `x86_64-pc-windows-gnu`（`.zip`）。相应地移除了 `.cargo/config.toml` 的 musl 目标配置、
   `scripts/release.sh` 的 musl 构建与打包、`scripts/toolchain-setup.sh` 的 musl 工具链步骤，
