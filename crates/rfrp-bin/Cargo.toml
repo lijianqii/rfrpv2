@@ -6,11 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 description = "命令行入口：server/client 子命令、配置加载与日志初始化"
 
+[features]
+# 可选的高性能分配器。mimalloc 在多线程 / 大量小对象 / 高连接 churn 场景通常比系统
+# 分配器快，但会引入 C 依赖（构建时需要 cc）与额外内存开销，因此**默认关闭**，
+# 由使用方按实测结果决定是否启用（见 docs/BENCHMARKS.md 的分配器对比）。
+mimalloc = ["dep:mimalloc"]
+
 [[bin]]
 name = "rfrp"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true, default-features = false }
 rfrp-common = { path = "../rfrp-common" }
 tokio = { workspace = true }
 clap = { workspace = true }

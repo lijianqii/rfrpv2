@@ -169,6 +169,13 @@
 
 ### Changed
 
+- **分配器：新增可选的 `mimalloc` feature（默认关闭），并给出实测结论**。用自定义
+  `GlobalAlloc` 统计：短连接 churn **43.2 次分配 / 159.9 KiB 每连接**，而大流量传输只有
+  **0.18 次/MiB**——说明换分配器对吞吐无关，只可能在 churn 场景带来几个百分点的收益
+  （成本主体是 tokio 每次桥接 `vec![0; 32 KiB]`，一条用户连接两次桥接 = 128 KiB 清零，
+  复用缓冲比换分配器更划算）。macOS 上的 A/B 首轮为 1100 vs 1090 conn/s（噪声内），
+  后续轮次因测试端 TIME_WAIT 端口耗尽而失真，故**默认不启用**，仅提供
+  `--features mimalloc` 供按需实测（见 docs/BENCHMARKS.md）。
 - **支持在 arm64 宿主上构建 x86_64 产物**：开发机可能是 amd64 或 arm64（Debian 13 on ARM），
   而发布产物固定为 x86_64 两个平台。此前只配置了 Windows 目标的链接器，arm64 宿主构建
   `x86_64-unknown-linux-gnu` 时会回退到宿主默认 `cc`（aarch64 编译器）而链接失败。

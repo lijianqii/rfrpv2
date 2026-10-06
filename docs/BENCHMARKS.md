@@ -55,6 +55,37 @@ scripts/bench-udp.py latency   # 200B 小包往返：直连 vs 代理（P50/P95/
 > 突发回收率对机器负载很敏感（同一台机器上实测 60%~97% 波动），因此脚本只打印数字、
 > 不做断言；`crates/rfrpc/tests/udp_burst.rs` 里另有一道 release 下的粗粒度闸门。
 
+## 分配与分配器（可选 feature = mimalloc）
+
+判断"换分配器有没有用"，先量**分配发生了多少次**（`cargo test -p rfrpc --test alloc_count -- --nocapture`，
+用自定义 `GlobalAlloc` 统计，server+client 同进程）：
+
+| 场景 | 分配次数 | 分配字节 |
+|---|---|---|
+| 短连接 churn（每条连接：用户连接 + 工作连接 + 本地连接） | **43.2 次/连接** | **159.9 KiB/连接** |
+| 大流量传输（单连接 128 MiB） | **0.18 次/MiB** | 8.6 KiB/MiB |
+
+结论：
+
+- **大流量与分配器无关**：传输路径每 MiB 只有 0.18 次分配（连接建立时的一次性分配），
+  换 mimalloc/jemalloc 不会改变吞吐。
+- **churn 才可能受益**：每连接 43 次分配、160 KiB，其中大头是 tokio
+  `copy_bidirectional_with_sizes` 每次桥接都 `vec![0; 32 KiB]`——一条用户连接两次桥接
+  （服务端 + 客户端）= **128 KiB 清零**，这是分配/内存带宽成本的主体。
+  按 macOS 实测的候选分配器 A/B：**系统分配器 1100 conn/s vs mimalloc 1090 conn/s（噪声内）**。
+  同一次实验的后续轮次因**测试端 TIME_WAIT 端口耗尽**而失真（两种二进制同样塌到几十 conn/s），
+  因此这台机器上的 A/B 只能作为参考，结论不足以支持默认启用。
+
+**建议**：不要默认启用；若要进一步压 churn 成本，优先级更高的是**复用桥接缓冲**（去掉每连接
+128 KiB 的分配 + 清零），它在任何分配器下都有效，也顺带降低内存带宽占用。
+
+如要在自己的 Debian 上复测：
+
+```bash
+cargo build --release -p rfrp-bin                        # 系统分配器
+cargo build --release -p rfrp-bin --features mimalloc    # mimalloc（可选 feature，默认关闭）
+```
+
 ## 历史基线（2026-09-10，Debian x86_64，方法论不同）
 
 | Benchmark | 耗时 / 吞吐（中位数） | 说明 |

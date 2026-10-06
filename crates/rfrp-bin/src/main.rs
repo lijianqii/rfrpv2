@@ -10,6 +10,15 @@ mod commands;
 mod logging;
 mod summary;
 
+/// 可选的高性能分配器（构建时加 `--features mimalloc` 启用）。
+///
+/// 默认用系统分配器：是否值得换要看实测（见 docs/BENCHMARKS.md 的 A/B 对比）。
+/// 本项目数据面在稳态下几乎不分配（每连接几次、每字节零次），所以收益主要出现在
+/// **高连接 churn**（大量短连接）场景，而不是大流量传输。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
