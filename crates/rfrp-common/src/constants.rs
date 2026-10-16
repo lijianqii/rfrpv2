@@ -158,7 +158,7 @@ pub const UDP_SOCKET_RECV_BUF_BYTES: usize = 1 << 20;
 /// tokio `copy_bidirectional` 默认 8 KiB；此处提高到 32 KiB 以减少大流量
 /// （文件传输等）下的 read/write 系统调用次数，小包交互场景不受影响。
 /// 每条约 2×该值 的连接内存开销。
-pub const BRIDGE_BUF_SIZE: usize = 32 * 1024;
+pub const BRIDGE_BUF_SIZE: usize = 64 * 1024;
 
 /// 服务端最大并发用户连接数（防 DoS 兜底）。
 pub const MAX_ACTIVE_CONNECTIONS: i64 = 65536;

@@ -68,6 +68,9 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
     if !cfg.idle.is_zero() {
         set_tcp_keepalive(&sock, &cfg)?;
     }
+    // P1 优化：增大 socket 缓冲区，减少 RDP 大流量突发时的窗口溢出
+    let _ = sock.set_recv_buffer_size(512 * 1024);
+    let _ = sock.set_send_buffer_size(512 * 1024);
     Ok(())
 }
 
