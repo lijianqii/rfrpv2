@@ -13,6 +13,10 @@
 *.out
 /tmp/
 
+# Python
+__pycache__/
+*.pyc
+
 # pi agent session dir
 .pi/
 

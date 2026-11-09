@@ -1,6 +1,6 @@
 # 常用开发任务。用法：make <target>，默认 make ci
 
-.PHONY: all fmt fmt-check clippy build check test ci ci-release clean
+.PHONY: all fmt fmt-check clippy build check test e2e soak soak-long ci ci-release clean
 
 all: fmt-check clippy build test
 
@@ -21,6 +21,24 @@ check:
 
 test:
 	cargo test --all
+
+# 真实进程级 Python E2E：功能、性能冒烟与稳定性（TCP/UDP/Dashboard/TLS/重启）。
+# 只依赖 python3 标准库；显式使用刚构建的 debug 二进制，避免误用旧 release。
+e2e: build
+	RFRP_BIN=target/debug/rfrp python3 scripts/e2e_env.py -v
+
+SOAK_SECS ?= 600
+SOAK_LONG_SECS ?= 3600
+SOAK_BIN ?= target/debug/rfrp
+
+# 长时间稳定性测试：默认 10 分钟冒烟；报告保留在 target/soak-*。
+soak: build
+	E2E_SOAK_SECS=$(SOAK_SECS) RFRP_BIN=$(SOAK_BIN) python3 scripts/soak_env.py
+
+# 1 小时 release 标准档；8 小时：make soak-long SOAK_LONG_SECS=28800
+soak-long:
+	cargo build --release --all
+	E2E_SOAK_SECS=$(SOAK_LONG_SECS) E2E_SOAK_TCP_INTERVAL_MS=100 E2E_SOAK_UDP_INTERVAL_MS=50 RFRP_BIN=target/release/rfrp python3 scripts/soak_env.py
 
 # CI 等价流程：格式化检查 + Clippy 严格 + 构建 + 测试
 ci: fmt-check clippy build test
