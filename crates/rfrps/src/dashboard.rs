@@ -1,6 +1,6 @@
 //! Dashboard：Basic Auth + 状态 API + Prometheus 指标。
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,12 +74,12 @@ impl DashboardSessions {
 /// Dashboard HTTP 服务主循环。
 pub async fn run_dashboard(
     listener: TcpListener,
-    cfg: DashboardSection,
+    cfg: Arc<RwLock<DashboardSection>>,
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
-    let sessions = Arc::new(DashboardSessions::new(cfg.session_ttl()));
+    let sessions = Arc::new(DashboardSessions::new(cfg.read().session_ttl()));
     // accept 出错不得结束循环：Dashboard 是进程级监听，自行退出后只能靠重启恢复。
     let mut retry = AcceptRetry::new();
     loop {
@@ -89,7 +89,7 @@ pub async fn run_dashboard(
                     Ok((stream, peer)) => {
                         retry.record_ok();
                         tracing::debug!(%peer, "dashboard connection");
-                        let cfg = cfg.clone();
+                        let cfg = cfg.read().clone();
                         let state = state.clone();
                         let limiter = limiter.clone();
                         let sessions = sessions.clone();

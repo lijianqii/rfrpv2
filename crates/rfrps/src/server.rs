@@ -1,11 +1,13 @@
 //! 服务端主控：监听 accept 循环，按首帧区分控制/工作连接。
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rfrp_common::config::ServerConfig;
+use parking_lot::RwLock;
+
+use rfrp_common::config::{DashboardSection, ServerConfig};
 use rfrp_common::constants::{
     FIRST_FRAME_TIMEOUT, SERVER_ALIVE_LOG_INTERVAL, TLS_HANDSHAKE_TIMEOUT, WORK_CONN_TIMEOUT_RFRPS,
 };
@@ -18,6 +20,7 @@ use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -29,15 +32,16 @@ use crate::state::ServerState;
 
 /// rfrps 服务端实例。
 pub struct Server {
-    config: Arc<ServerConfig>,
+    config: Arc<RwLock<ServerConfig>>,
     listener: TcpListener,
     state: Arc<ServerState>,
     /// 优雅退出宽限期：停止接收后等待在途连接结束的最长时间（§14.4）。
-    grace: Duration,
-    /// 心跳参数（来自配置，缺省 30s 间隔 / 10s 超时，见 §8.3）。
-    heartbeat_interval: Duration,
-    heartbeat_timeout: Duration,
-    /// 控制/工作连接 TLS acceptor（按配置按需加载）。
+    /// 运行期可由配置热更新；CLI `--grace-secs` 覆盖值优先。
+    grace: Arc<AtomicU64>,
+    grace_override: Option<Duration>,
+    /// Dashboard 运行期配置（凭据可热更新；监听地址变更需重启）。
+    dashboard_cfg: Option<Arc<RwLock<DashboardSection>>>,
+    /// 控制/工作连接 TLS acceptor（阶段 1 不热替换）。
     tls: Option<ServerTls>,
     /// HTTP vhost 监听（可选）。
     vhost_http: Option<TcpListener>,
@@ -62,17 +66,15 @@ impl Server {
         let dashboard = bind_dashboard(&config).await?;
         let vhost_https = bind_vhost_https(&config).await?;
         let tls = load_control_tls(&config)?;
-        // 在 config 移入 Arc 之前取出生效的心跳参数。
-        let heartbeat_interval = config.server.heartbeat_interval();
-        let heartbeat_timeout = config.server.heartbeat_timeout();
         let grace = config.server.grace();
+        let dashboard_cfg = config.dashboard.clone().map(|d| Arc::new(RwLock::new(d)));
         Ok(Self {
-            config: Arc::new(config),
+            config: Arc::new(RwLock::new(config)),
             listener,
             state: ServerState::new(),
-            grace,
-            heartbeat_interval,
-            heartbeat_timeout,
+            grace: Arc::new(AtomicU64::new(grace.as_secs())),
+            grace_override: None,
+            dashboard_cfg,
             tls,
             vhost_http,
             vhost_https,
@@ -91,9 +93,10 @@ impl Server {
         self
     }
 
-    /// 覆盖优雅退出宽限期（主要用于测试）。
+    /// 覆盖优雅退出宽限期（主要用于测试/CLI）。
     pub fn with_grace(mut self, grace: Duration) -> Self {
-        self.grace = grace;
+        self.grace.store(grace.as_secs(), Ordering::Relaxed);
+        self.grace_override = Some(grace);
         self
     }
 
@@ -106,15 +109,29 @@ impl Server {
     /// 收到退出信号（Ctrl+C / SIGTERM / 令牌取消）后停止接收新连接，
     /// 在 grace 宽限期内让在途连接自然结束，超时后由任务取消/进程退出强制关闭（§14.4）。
     pub async fn run(self) -> Result<()> {
+        let initial = self.config.read().clone();
+        let (tx, rx) = watch::channel(initial);
+        let result = self.run_with_reload(rx).await;
+        drop(tx);
+        result
+    }
+
+    /// 带配置热重载的 accept 循环。
+    ///
+    /// 阶段 1 只更新无需重建监听的字段（token、心跳、allow_ports、Dashboard 凭据、
+    /// grace 等）；bind/TLS/vhost/Dashboard 地址变更会在日志中提示需要重启，并继续
+    /// 使用旧监听。监听热替换见后续阶段。
+    pub async fn run_with_reload(self, mut reload_rx: watch::Receiver<ServerConfig>) -> Result<()> {
         let shutdown = self.state.shutdown.clone();
         let tls = self.tls.clone();
         let vhost_http = self.vhost_http;
         let vhost_https = self.vhost_https;
         let dashboard = self.dashboard;
-        let dashboard_cfg = self.config.dashboard.clone();
+        let dashboard_cfg = self.dashboard_cfg.clone();
         let config = self.config.clone();
-        let heartbeat_interval = self.heartbeat_interval;
-        let heartbeat_timeout = self.heartbeat_timeout;
+        let grace = self.grace.clone();
+        let grace_override = self.grace_override;
+        let mut reload_enabled = true;
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
@@ -127,7 +144,7 @@ impl Server {
             });
         }
         // Dashboard 监听循环（可选）。
-        if let (Some(listener), Some(cfg)) = (dashboard, dashboard_cfg) {
+        if let (Some(listener), Some(cfg)) = (dashboard, dashboard_cfg.clone()) {
             let state = self.state.clone();
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
@@ -208,6 +225,9 @@ impl Server {
                             let state = self.state.clone();
                             let config = config.clone();
                             let tls = tls.clone();
+                            let current = config.read().clone();
+                            let heartbeat_interval = current.server.heartbeat_interval();
+                            let heartbeat_timeout = current.server.heartbeat_timeout();
                             tracing::debug!(%peer, "accepted connection");
                             tasks.spawn(async move {
                                 if let Err(e) = handle_connection(
@@ -258,6 +278,18 @@ impl Server {
                 // 回收已完成任务：JoinSet 会保留已完成任务的条目直到被 join，
                 // 长期运行下按连接数累积（实测约 257B/连接）。此处持续回收。
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                changed = reload_rx.changed(), if reload_enabled => {
+                    match changed {
+                        Ok(()) => {
+                            let new = reload_rx.borrow().clone();
+                            apply_reload(&config, &dashboard_cfg, &grace, grace_override, new);
+                        }
+                        Err(_) => {
+                            // 配置监视器已退出：不再轮询该分支，避免忙循环。
+                            reload_enabled = false;
+                        }
+                    }
+                }
                 _ = shutdown.cancelled() => {
                     tracing::info!("shutdown signal received; draining in-flight connections");
                     break;
@@ -265,7 +297,7 @@ impl Server {
             }
         }
         // 优雅期：等待在途连接任务自然结束；无在途任务时立即返回，超时后强制返回。
-        let deadline = Instant::now() + self.grace;
+        let deadline = Instant::now() + Duration::from_secs(grace.load(Ordering::Relaxed));
         while !tasks.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -281,6 +313,103 @@ impl Server {
         sig.abort();
         Ok(())
     }
+}
+
+/// 应用一份新服务端配置。
+///
+/// 阶段 1 的可热更字段直接写入共享配置；监听/TLS/vhost/Dashboard 地址等
+/// 需要重建资源的字段保持旧值并告警，避免配置变更后实际监听与日志描述不一致。
+fn apply_reload(
+    config: &Arc<RwLock<ServerConfig>>,
+    dashboard_cfg: &Option<Arc<RwLock<DashboardSection>>>,
+    grace: &Arc<AtomicU64>,
+    grace_override: Option<Duration>,
+    mut new: ServerConfig,
+) {
+    let old = config.read().clone();
+    let mut restart_fields: Vec<&str> = Vec::new();
+    if old.server.bind_addr != new.server.bind_addr {
+        restart_fields.push("server.bind_addr");
+    }
+    if old.server.bind_port != new.server.bind_port {
+        restart_fields.push("server.bind_port");
+    }
+    if old.server.tls_enable != new.server.tls_enable {
+        restart_fields.push("server.tls_enable");
+    }
+    if old.server.tls_cert != new.server.tls_cert {
+        restart_fields.push("server.tls_cert");
+    }
+    if old.server.tls_key != new.server.tls_key {
+        restart_fields.push("server.tls_key");
+    }
+    if old.server.work_conn_tls != new.server.work_conn_tls {
+        restart_fields.push("server.work_conn_tls");
+    }
+    if old.server.tcp_keepalive_secs != new.server.tcp_keepalive_secs {
+        restart_fields.push("server.tcp_keepalive_secs");
+    }
+    if old.proxy.vhost_http_port != new.proxy.vhost_http_port {
+        restart_fields.push("proxy.vhost_http_port");
+    }
+    if old.proxy.vhost_https_port != new.proxy.vhost_https_port {
+        restart_fields.push("proxy.vhost_https_port");
+    }
+    if old.proxy.vhost_tls_cert != new.proxy.vhost_tls_cert {
+        restart_fields.push("proxy.vhost_tls_cert");
+    }
+    if old.proxy.vhost_tls_key != new.proxy.vhost_tls_key {
+        restart_fields.push("proxy.vhost_tls_key");
+    }
+    let old_dashboard_addr = old.dashboard.as_ref().map(|d| d.addr.as_str());
+    let new_dashboard_addr = new.dashboard.as_ref().map(|d| d.addr.as_str());
+    if old_dashboard_addr != new_dashboard_addr {
+        restart_fields.push("dashboard.addr");
+    }
+    if !restart_fields.is_empty() {
+        tracing::warn!(
+            fields = ?restart_fields,
+            "server config changes require restart; keeping current listeners/TLS"
+        );
+    }
+
+    // 冻结需要重建监听/TLS 的字段：运行时共享配置必须与当前实际资源一致。
+    new.server.bind_addr = old.server.bind_addr.clone();
+    new.server.bind_port = old.server.bind_port;
+    new.server.tls_enable = old.server.tls_enable;
+    new.server.tls_cert = old.server.tls_cert.clone();
+    new.server.tls_key = old.server.tls_key.clone();
+    new.server.work_conn_tls = old.server.work_conn_tls;
+    new.server.tcp_keepalive_secs = old.server.tcp_keepalive_secs;
+    new.proxy.vhost_http_port = old.proxy.vhost_http_port;
+    new.proxy.vhost_https_port = old.proxy.vhost_https_port;
+    new.proxy.vhost_tls_cert = old.proxy.vhost_tls_cert.clone();
+    new.proxy.vhost_tls_key = old.proxy.vhost_tls_key.clone();
+
+    match (&old.dashboard, &new.dashboard) {
+        (Some(old_d), Some(new_d)) => {
+            let mut frozen = new_d.clone();
+            frozen.addr = old_d.addr.clone();
+            new.dashboard = Some(frozen);
+        }
+        (None, Some(_)) => {
+            tracing::warn!("[dashboard] enabling at runtime requires restart");
+            new.dashboard = None;
+        }
+        (Some(_), None) => {
+            tracing::warn!("[dashboard] disabling at runtime requires restart");
+            new.dashboard = old.dashboard.clone();
+        }
+        (None, None) => {}
+    }
+
+    let effective_grace = grace_override.unwrap_or_else(|| new.server.grace());
+    grace.store(effective_grace.as_secs(), Ordering::Relaxed);
+    if let (Some(slot), Some(new_d)) = (dashboard_cfg, new.dashboard.as_ref()) {
+        *slot.write() = new_d.clone();
+    }
+    *config.write() = new;
+    tracing::info!("server configuration reloaded");
 }
 
 /// 连接处理失败是否属于"对端行为"（RST/EOF/协议不符等预期噪声）。
@@ -393,12 +522,13 @@ fn load_control_tls(config: &ServerConfig) -> Result<Option<ServerTls>> {
 async fn handle_connection(
     stream: TcpStream,
     state: Arc<ServerState>,
-    config: Arc<ServerConfig>,
+    config: Arc<RwLock<ServerConfig>>,
     tls: Option<ServerTls>,
     first_frame_timeout: Duration,
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
 ) -> Result<()> {
+    let cfg = config.read().clone();
     let peer_ip = stream
         .peer_addr()
         .map(|a| a.ip())
@@ -470,29 +600,29 @@ async fn handle_connection(
 
     match frame.msg_type {
         MSG_LOGIN => {
-            if config.server.tls_enable && !is_tls {
+            if cfg.server.tls_enable && !is_tls {
                 tracing::warn!("plaintext login rejected: tls_enable=true");
                 // 给明文客户端一个明确的可诊断错误，避免它只看到 EOF 后无限退避重连。
                 control::reject_login(stream, Some("tls required")).await?;
                 return Ok(());
             }
-            if !config.server.tls_enable && is_tls {
+            if !cfg.server.tls_enable && is_tls {
                 tracing::warn!("TLS login rejected: tls_enable=false");
                 return Ok(());
             }
-            control::handle_control_login(
+            control::handle_control_login_shared(
                 frame,
                 stream,
                 peer_ip,
                 state,
-                (*config).clone(),
+                config,
                 heartbeat_interval,
                 heartbeat_timeout,
             )
             .await
         }
         MSG_START_WORK_CONN => {
-            if config.server.work_conn_tls && !is_tls {
+            if cfg.server.work_conn_tls && !is_tls {
                 tracing::warn!("plaintext work connection rejected: work_conn_tls=true");
                 return Ok(());
             }
@@ -525,7 +655,7 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
 
         let state = ServerState::new();
-        let cfg = Arc::new(ServerConfig::default());
+        let cfg = Arc::new(RwLock::new(ServerConfig::default()));
         let started = std::time::Instant::now();
         let res = handle_connection(
             server,

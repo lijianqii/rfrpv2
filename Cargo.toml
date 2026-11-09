@@ -37,6 +37,7 @@ webpki-roots = "0.26"
 socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"
 base64 = "0.22"
+notify = "6.1.1"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]

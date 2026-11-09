@@ -48,8 +48,8 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrps。
     if let Err(e) = rfrps::cli::apply_cli_overrides(
         &mut cfg,
-        args.bind,
-        args.token,
+        args.bind.clone(),
+        args.token.clone(),
         args.tls_enable,
         args.work_conn_tls,
     ) {
@@ -64,13 +64,13 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         print_server_config_summary(&args.config, &cfg);
         return ExitCode::SUCCESS;
     }
-    init_logging(&cfg.log, &log);
+    let log_reload = init_logging(&cfg.log, &log);
     log_server_summary(&cfg);
     rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
         cfg.server.tcp_keepalive_secs,
     ));
 
-    let server = match rfrps::Server::new(cfg).await {
+    let server = match rfrps::Server::new(cfg.clone()).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "failed to start server");
@@ -93,7 +93,92 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         None => server,
     };
     tracing::info!(addr = %server.local_addr(), "rfrps listening");
-    match server.run().await {
+
+    let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(cfg.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _watcher = match crate::reload::watch_config_file(&args.config, event_tx) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            tracing::warn!(
+                path = %args.config.display(),
+                error = %e,
+                "failed to watch config file; hot reload disabled"
+            );
+            None
+        }
+    };
+    let reload_shutdown = server.shutdown_token();
+    let reload_path = args.config.clone();
+    let reload_bind = args.bind.clone();
+    let reload_token = args.token.clone();
+    let reload_tls = args.tls_enable;
+    let reload_work_tls = args.work_conn_tls;
+    let reload_task = tokio::spawn(async move {
+        while !reload_shutdown.is_cancelled() {
+            let event = tokio::select! {
+                _ = reload_shutdown.cancelled() => break,
+                event = event_rx.recv() => event,
+            };
+            let Some(()) = event else {
+                break;
+            };
+            // 编辑器保存往往产生多个事件（truncate/write/rename），合并后读取。
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while event_rx.try_recv().is_ok() {}
+
+            let mut loaded = None;
+            for attempt in 0..2 {
+                match rfrp_common::config::load_server_config(&reload_path) {
+                    Ok(mut new_cfg) => {
+                        if let Err(e) = rfrps::cli::apply_cli_overrides(
+                            &mut new_cfg,
+                            reload_bind.clone(),
+                            reload_token.clone(),
+                            reload_tls,
+                            reload_work_tls,
+                        ) {
+                            tracing::warn!(error = %e, "config reload rejected by CLI overrides");
+                            break;
+                        }
+                        if let Err(e) = new_cfg.validate() {
+                            tracing::warn!(error = %e, "config reload validation failed");
+                            break;
+                        }
+                        loaded = Some(new_cfg);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt == 0 {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        tracing::warn!(
+                            path = %reload_path.display(),
+                            error = %e,
+                            "config reload failed; keeping previous config"
+                        );
+                    }
+                }
+            }
+            let Some(new_cfg) = loaded else {
+                continue;
+            };
+            if let Some(handle) = &log_reload {
+                if let Err(e) = handle.reload(&new_cfg.log) {
+                    tracing::warn!(error = %e, "log config change not applied");
+                }
+            }
+            tracing::info!(path = %reload_path.display(), "configuration reloaded");
+            if cfg_tx.send(new_cfg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = server.run_with_reload(cfg_rx).await;
+    reload_task.abort();
+    let _ = reload_task.await;
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "rfrps exited with error");
@@ -117,8 +202,8 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
     // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrpc。
     if let Err(e) = rfrpc::cli::apply_cli_overrides(
         &mut cfg,
-        args.server,
-        args.token,
+        args.server.clone(),
+        args.token.clone(),
         args.tls_enable,
         args.work_conn_tls,
     ) {
@@ -133,20 +218,104 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
         print_client_config_summary(&args.config, &cfg);
         return ExitCode::SUCCESS;
     }
-    init_logging(&cfg.log, &log);
+    let log_reload = init_logging(&cfg.log, &log);
     log_client_summary(&cfg);
     rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
         cfg.client.tcp_keepalive_secs,
     ));
 
-    let client = match rfrpc::Client::new(cfg) {
+    let client = match rfrpc::Client::new(cfg.clone()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to create client");
             return ExitCode::FAILURE;
         }
     };
-    match client.run().await {
+
+    let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(cfg.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _watcher = match crate::reload::watch_config_file(&args.config, event_tx) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            tracing::warn!(
+                path = %args.config.display(),
+                error = %e,
+                "failed to watch config file; hot reload disabled"
+            );
+            None
+        }
+    };
+    let reload_shutdown = client.shutdown_token();
+    let reload_path = args.config.clone();
+    let reload_server = args.server.clone();
+    let reload_token = args.token.clone();
+    let reload_tls = args.tls_enable;
+    let reload_work_tls = args.work_conn_tls;
+    let reload_task = tokio::spawn(async move {
+        while !reload_shutdown.is_cancelled() {
+            let event = tokio::select! {
+                _ = reload_shutdown.cancelled() => break,
+                event = event_rx.recv() => event,
+            };
+            let Some(()) = event else {
+                break;
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while event_rx.try_recv().is_ok() {}
+
+            let mut loaded = None;
+            for attempt in 0..2 {
+                match rfrp_common::config::load_client_config(&reload_path) {
+                    Ok(mut new_cfg) => {
+                        if let Err(e) = rfrpc::cli::apply_cli_overrides(
+                            &mut new_cfg,
+                            reload_server.clone(),
+                            reload_token.clone(),
+                            reload_tls,
+                            reload_work_tls,
+                        ) {
+                            tracing::warn!(error = %e, "config reload rejected by CLI overrides");
+                            break;
+                        }
+                        if let Err(e) = new_cfg.validate() {
+                            tracing::warn!(error = %e, "config reload validation failed");
+                            break;
+                        }
+                        loaded = Some(new_cfg);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt == 0 {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        tracing::warn!(
+                            path = %reload_path.display(),
+                            error = %e,
+                            "config reload failed; keeping previous config"
+                        );
+                    }
+                }
+            }
+            let Some(new_cfg) = loaded else {
+                continue;
+            };
+            if let Some(handle) = &log_reload {
+                if let Err(e) = handle.reload(&new_cfg.log) {
+                    tracing::warn!(error = %e, "log config change not applied");
+                }
+            }
+            tracing::info!(path = %reload_path.display(), "configuration reloaded");
+            if cfg_tx.send(new_cfg).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = client.run_with_reload(cfg_rx).await;
+    reload_task.abort();
+    let _ = reload_task.await;
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "rfrpc exited with error");

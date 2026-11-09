@@ -70,6 +70,7 @@
 | 指标 | `prometheus` | 指标暴露 |
 | Dashboard | `axum` | Dashboard HTTP 服务（基于 hyper，复用 tokio） |
 | 静态资源 | `rust-embed` | Dashboard 前端页面嵌入二进制 |
+| 文件监听 | `notify` | 配置文件变更事件（inotify/ReadDirectoryChangesW/FSEvents） |
 | 工具 | `bytes` / `tokio-util` | 缓冲区、codec |
 
 > 心跳时间戳 `ts`（Unix 毫秒）用 `std::time::SystemTime` 获取，不引入 `chrono` 等外部时间库。
@@ -330,7 +331,7 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 - **配置/协议错误**：如帧格式错误、不兼容的 NewProxy 类型（rfrps 发 `Close` 后断开）。
 - **版本不匹配**：发生在 Login 阶段，rfrps 返回 `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [...]"}` 后断开，不发 Close（错误前缀固定为 `version mismatch`，客户端按前缀判定致命）。
 - **鉴权失败**：rfrps 不发 Close，直接断开（避免回显，见 10.2）。
-- **rfrps 主动下线单 Proxy**：首版不支持运行期动态下线（无热重载）；但若 rfrps 在 NewProxy 后因 bind remote_port 失败需清理已注册的 Proxy 条目，rfrps **不发 Close**（控制连接仍存活，仅该 Proxy 失效），rfrpc 已通过 NewProxyResp{ok:false} 获知失败，无需额外通知。若未来支持动态下线，可扩展 `Close{reason:"proxy removed", proxy_name?}` 携带 proxy_name 字段（首版不实现，Close 不含 proxy_name）。
+- **rfrps 主动下线单 Proxy**：协议层仍不支持按 Proxy 动态注销；配置热重载通过 rfrpc 重连控制面、rfrps 按 run_id 清理旧代理并重新注册实现（见 9.6）。若未来需要单 Proxy 增量下发，可扩展 `Close{reason:"proxy removed", proxy_name?}` 携带 proxy_name 字段（当前 Close 不含 proxy_name）。
 - `reason` 字段可选，用于日志诊断，不影响对端行为（对端收到 Close 后应清理资源并视情况重连）。
 - **可靠性**：Close 是"尽力通知"，发送后立即断开 TCP，rfrps 可能因缓冲未刷新而收不到。收不到则靠心跳超时（10s）兜底清理 Session。
 - **心跳超时触发断开**：一方发出 Heartbeat 后 10s 未收到 HeartbeatResp，判定对端已死，**直接断开 TCP，不发 Close**（对端可能已崩溃，发了也收不到；发 Close 反而增加延迟）。rfrps 侧断开后清理 Session 与所有 Proxy 占用；rfrpc 侧断开后触发指数退避重连。
@@ -758,7 +759,7 @@ rfrps 对单个代理最多保留 `MAX_POOLED_WORK_CONNS_PER_PROXY`(32) 条空�
   `sessions` 锁做全表扫描。
 - **HTTP**：rfrps 用 `hyper` 读取请求头判定 Host，命中后将**已读缓冲区连同后续流**一起桥接到工作连接（不丢失已读字节）。
 - **HTTPS**：TLS 终止在 rfrps（使用 `vhost_tls_cert` / `vhost_tls_key`），rfrps 完成 TLS 握手拿到 SNI 后，按明文 HTTP 处理取 Host，再将**解密后的明文流**桥接到工作连接。工作连接承载明文，本地服务收到的是明文 HTTP。
-- HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。**证书在 rfrps 启动时一次性加载到内存**（`rustls::ServerConfig` 持有），运行期不重新读取；证书文件更换需重启 rfrps 生效（首版不支持热重载，见非目标）。
+- HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。阶段 1 证书在 rfrps 启动时一次性加载到内存（`rustls::ServerConfig` 持有），文件更换需重启；阶段 2 计划在配置热重载时重建 TLS acceptor（见 9.6）。
 - 命中 Proxy 后向 rfrpc 请求工作连接，流程同 TCP（8.2）。
 - **HTTP 与 HTTPS 独立**：一个 `[[proxy]]` 的 `type` 只能是 `http` 或 `https` 之一。若同一后端需同时暴露 HTTP 和 HTTPS，应声明两个 Proxy 条目（配置 `name` 不同，即协议 `proxy_name` 不同），`custom_domains` 可相同，分别走 `vhost_http_port` / `vhost_https_port`。
 
@@ -978,6 +979,31 @@ CLI 参数 > 配置文件 > 默认值。
 - 非法格式（如 `abc`、`7000-`、`8000-7000`）启动时报错中止。
 
 ---
+
+### 9.6 配置热重载
+
+配置文件由 `notify` 文件系统事件监听：监听配置所在目录，按目标文件名过滤
+`Create/Modify/Remove` 事件（含编辑器原子 rename），事件后 300ms 防抖。解析/校验
+失败时保留旧配置并告警，进程不退出。CLI 参数每次重载后重新应用，优先级仍高于文件。
+
+**阶段 1（当前）**：
+
+- 客户端：`server_addr/server_port/token/tls_*`、心跳、`[[proxy]]` 变更通过“结束当前控制
+  连接并按新配置重连”生效；服务端按 run_id 清理旧代理监听后重新注册。已桥接的 TCP
+  用户连接保留，UDP 会话重建。`status_addr`、`run_id_file`、`tcp_keepalive_secs`
+  变更需重启（保留旧值并告警）。
+- 服务端：token 只影响新登录；心跳只影响新控制会话；`allow_ports` 对新注册生效；
+  Dashboard `user/password` 每次请求读取；`grace_secs`、`[log].level` 立即生效。
+  已有 UDP 代理的 `udp_session_timeout` 保持注册时值。
+- 服务端 `bind_addr/bind_port`、TLS 开关/证书、vhost 端口、`dashboard.addr` 以及
+  `tcp_keepalive_secs` 在阶段 1 冻结为启动值并告警需重启，避免运行时配置与实际监听不一致。
+- 日志 `output/format` 变更需重启；日志级别通过 `tracing-subscriber` reload layer 热更新。
+
+**阶段 2（计划）**：服务端控制/vhost/Dashboard 监听与 TLS acceptor 先绑定新资源再切换，
+失败保留旧资源；客户端 `status_addr` 重建；UDP 超时对已有代理解释为可动态更新。
+
+> 安全性：token 变更不主动踢掉已有会话，避免热重载无故中断长连接；需要立即失效时
+> 应重启服务端或后续增加显式“踢会话”操作。配置热重载不改变协议版本和帧格式。
 
 ## 10. 鉴权与加密
 

@@ -1,7 +1,7 @@
 //! 客户端主控：连接服务端、登录、按配置串行注册代理，长驻控制循环；
 //! 断开后按指数退避重连，并复用 run_id 恢复代理（DESIGN §8.1 / §8.3 / §6.6）。
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::control;
+use crate::control::{self, ControlLoopOptions};
 use crate::metrics::ClientMetrics;
 
 /// 客户端运行时共享状态（控制循环与注册逻辑共享）。
@@ -68,13 +68,12 @@ enum ConnectOutcome {
 
 /// rfrpc 客户端实例。
 pub struct Client {
-    config: ClientConfig,
-    /// 缓存的客户端 TLS 配置（重建连接时复用，避免每次重连读 CA 文件）。
-    tls: Option<ClientTls>,
-    /// 心跳发送间隔（控制连接保活/失联检测）。
-    heartbeat_interval: Duration,
-    /// 心跳响应等待超时：超时判定控制连接已死并触发重连。
-    heartbeat_timeout: Duration,
+    /// 运行期配置：热重载时整体替换，下一次连接使用新快照。
+    config: Arc<RwLock<ClientConfig>>,
+    /// 缓存的客户端 TLS 配置；热重载时重建。
+    tls: Arc<RwLock<Option<ClientTls>>>,
+    /// 测试/调用方显式覆盖的心跳参数（优先于配置）。
+    heartbeat_override: Option<(Duration, Duration)>,
     /// 进程级运行指标。
     metrics: Arc<ClientMetrics>,
     /// 优雅退出令牌：信号或外部触发后停止重连并退出（§14.4）。
@@ -83,21 +82,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
-        // 只要配置了 tls_server_name 就构建 TLS 客户端，以便服务端在 LoginResp 中要求
-        // 工作连接升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
-        let tls = if config.client.tls_enable
-            || config.client.work_conn_tls
-            || config.client.tls_server_name.is_some()
-        {
-            Some(ClientTls::new(&config.client)?)
-        } else {
-            None
-        };
+        let tls = build_client_tls(&config)?;
         Ok(Self {
-            heartbeat_interval: config.client.heartbeat_interval(),
-            heartbeat_timeout: config.client.heartbeat_timeout(),
-            config,
-            tls,
+            config: Arc::new(RwLock::new(config)),
+            tls: Arc::new(RwLock::new(tls)),
+            heartbeat_override: None,
             metrics: Arc::new(ClientMetrics::new()),
             shutdown: CancellationToken::new(),
         })
@@ -105,8 +94,7 @@ impl Client {
 
     /// 覆盖心跳间隔与响应超时（主要用于测试：缩短失联检测时间）。
     pub fn with_heartbeat(mut self, interval: Duration, timeout: Duration) -> Self {
-        self.heartbeat_interval = interval;
-        self.heartbeat_timeout = timeout;
+        self.heartbeat_override = Some((interval, timeout));
         self
     }
 
@@ -118,12 +106,25 @@ impl Client {
     /// 长驻运行：连接 → 注册 → 控制循环；断开后按指数退避重连（§8.3）。
     /// 仅当收到致命 Login 失败（鉴权 / 版本不兼容）时返回错误退出。
     pub async fn run(self) -> AnyResult<()> {
+        let initial = self.config.read().clone();
+        let (tx, rx) = tokio::sync::watch::channel(initial);
+        let result = self.run_with_reload(rx).await;
+        drop(tx);
+        result
+    }
+
+    /// 长驻运行，并接收配置热重载通知。
+    pub async fn run_with_reload(
+        self,
+        mut reload_rx: tokio::sync::watch::Receiver<ClientConfig>,
+    ) -> AnyResult<()> {
         let run_id = self.load_or_create_run_id();
         let shutdown = self.shutdown.clone();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
         // 可选状态端点（[client] status_addr）：绑定失败只告警，不影响隧道功能。
-        if let Some(addr) = &self.config.client.status_addr {
+        let initial = self.config.read().clone();
+        if let Some(addr) = &initial.client.status_addr {
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     if !addr.starts_with("127.")
@@ -133,7 +134,7 @@ impl Client {
                         tracing::warn!(%addr, "status endpoint bound to non-loopback address; it has no authentication");
                     }
                     tracing::info!(%addr, "status endpoint listening");
-                    let cfg = self.config.clone();
+                    let cfg = initial.clone();
                     let metrics = self.metrics.clone();
                     let sd = shutdown.clone();
                     tokio::spawn(async move {
@@ -145,6 +146,7 @@ impl Client {
         }
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
         let mut attempt: u32 = 0;
+        let mut reload_enabled = true;
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("shutdown requested, exiting client");
@@ -153,7 +155,58 @@ impl Client {
             attempt += 1;
             tracing::debug!(attempt, "connection attempt");
             let attempt_started = std::time::Instant::now();
-            match self.connect_once(&run_id, &shutdown).await {
+            let cfg = self.config.read().clone();
+            let (heartbeat_interval, heartbeat_timeout) = self.heartbeat_override.unwrap_or((
+                cfg.client.heartbeat_interval(),
+                cfg.client.heartbeat_timeout(),
+            ));
+            let reload_token = CancellationToken::new();
+            let mut connect = Box::pin(self.connect_once(
+                &run_id,
+                &shutdown,
+                &cfg,
+                heartbeat_interval,
+                heartbeat_timeout,
+                reload_token.clone(),
+            ));
+            let mut immediate = false;
+            let outcome: AnyResult<ConnectOutcome> = loop {
+                tokio::select! {
+                    out = &mut connect => break out,
+                    changed = reload_rx.changed(), if reload_enabled => {
+                        match changed {
+                            Ok(()) => {
+                                let new = reload_rx.borrow().clone();
+                                match self.apply_config(new) {
+                                    Ok(()) => {
+                                        tracing::info!("client configuration reloaded; reconnecting");
+                                        reload_token.cancel();
+                                        if tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            &mut connect,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "connect task did not stop after config reload; dropping"
+                                            );
+                                        }
+                                        immediate = true;
+                                        break Ok(ConnectOutcome::Reconnect { connected: false });
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "client config reload rejected; keeping current config"
+                                    ),
+                                }
+                            }
+                            Err(_) => reload_enabled = false,
+                        }
+                    }
+                }
+            };
+            match outcome {
                 Ok(ConnectOutcome::Fatal(reason)) => {
                     sig.abort();
                     return Err(anyhow::anyhow!("login fatal: {reason}"));
@@ -163,6 +216,11 @@ impl Client {
                         break;
                     }
                     self.metrics.inc_reconnect();
+                    if immediate {
+                        attempt = 0;
+                        backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
+                        continue;
+                    }
                     // 仅"稳定连接"重置退避：会话刚建立即断开（抖动/被顶替）时保持退避增长，
                     // 避免 1s 间隔的重连风暴。
                     let lived = attempt_started.elapsed();
@@ -197,15 +255,44 @@ impl Client {
         Ok(())
     }
 
+    /// 应用热重载后的客户端配置。失败时保留旧配置。
+    fn apply_config(&self, mut new: ClientConfig) -> std::result::Result<(), String> {
+        let old = self.config.read().clone();
+        if old.client.status_addr != new.client.status_addr {
+            tracing::warn!(
+                "[client].status_addr change requires restart; keeping current status endpoint"
+            );
+            new.client.status_addr = old.client.status_addr.clone();
+        }
+        if old.client.run_id_file != new.client.run_id_file {
+            tracing::warn!("[client].run_id_file change requires restart; keeping current run_id");
+            new.client.run_id_file = old.client.run_id_file.clone();
+        }
+        if old.client.tcp_keepalive_secs != new.client.tcp_keepalive_secs {
+            tracing::warn!(
+                "[client].tcp_keepalive_secs change requires restart; keeping current keepalive"
+            );
+            new.client.tcp_keepalive_secs = old.client.tcp_keepalive_secs;
+        }
+        let tls = build_client_tls(&new).map_err(|e| e.to_string())?;
+        *self.tls.write() = tls;
+        *self.config.write() = new;
+        Ok(())
+    }
+
     /// 单次连接：建连、登录、注册代理、长驻控制循环直到断开。
     async fn connect_once(
         &self,
         run_id: &str,
         shutdown: &CancellationToken,
+        config: &ClientConfig,
+        heartbeat_interval: Duration,
+        heartbeat_timeout: Duration,
+        reload: CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
         // 允许 server_addr 为域名：每次建连都重新解析（IP 字面量则直接使用）。
-        let server_addr = self.config.client.resolve_server_addr().await?;
-        let tls = self.tls.clone();
+        let server_addr = config.client.resolve_server_addr().await?;
+        let tls = self.tls.read().clone();
         // 带超时建连：防火墙静默丢包时 connect 可能阻塞约 2 分钟（Linux），
         // 期间无法感知失败、也无法进入退避重试。
         let stream = match tokio::time::timeout(
@@ -239,7 +326,7 @@ impl Client {
         );
 
         // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
-        let stream: BoxedStream = if self.config.client.tls_enable {
+        let stream: BoxedStream = if config.client.tls_enable {
             let tls = tls.as_ref().expect("tls built above");
             // 控制链路 TLS 握手必须有超时：服务端/中间设备接受 TCP 但不完成握手时，
             // 否则客户端会永久挂起、既不重连也没有日志（工作连接 TLS 已有超时）。
@@ -273,8 +360,7 @@ impl Client {
         let state = Arc::new(ClientState {
             server_addr,
             run_id: run_id.to_string(),
-            proxies: self
-                .config
+            proxies: config
                 .proxies
                 .iter()
                 .map(|p| (p.name.clone(), p.clone()))
@@ -282,7 +368,7 @@ impl Client {
             resps: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls,
-            work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
+            work_conn_tls: Mutex::new(config.client.work_conn_tls),
             work_conn_token: Mutex::new(None),
             inflight_work: Mutex::new(HashSet::new()),
             metrics: self.metrics.clone(),
@@ -291,14 +377,17 @@ impl Client {
         let (login_otx, login_orx) = oneshot::channel();
         state.login_tx.lock().replace(login_otx);
 
-        let ctrl = tokio::spawn(control::control_loop(
+        let ctrl = tokio::spawn(control::control_loop_with_reload(
             stream,
             rx,
             state.clone(),
-            self.config.clone(),
+            config.clone(),
             shutdown.clone(),
-            self.heartbeat_interval,
-            self.heartbeat_timeout,
+            ControlLoopOptions {
+                heartbeat_interval,
+                heartbeat_timeout,
+                reload,
+            },
         ));
 
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
@@ -310,7 +399,7 @@ impl Client {
                     // 否则登录/注册都成功、所有工作连接却静默失败。
                     let work_tls = match resolve_work_tls(
                         resp.work_conn_tls,
-                        self.config.client.work_conn_tls,
+                        config.client.work_conn_tls,
                         state.tls.is_some(),
                     ) {
                         Ok(v) => v,
@@ -416,7 +505,7 @@ impl Client {
 
     /// 生成或复用 run_id 并持久化（§6.6 / §8.3 重连身份）。
     fn load_or_create_run_id(&self) -> String {
-        let path = resolve_run_id_path(&self.config.client.run_id_file);
+        let path = resolve_run_id_path(&self.config.read().client.run_id_file);
         if let Ok(s) = std::fs::read_to_string(&path) {
             let s = s.trim().to_string();
             if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN && uuid::Uuid::parse_str(&s).is_ok() {
@@ -456,6 +545,18 @@ impl Client {
             }
         }
         rid
+    }
+}
+
+/// 按客户端配置构建 TLS；未启用 TLS 时返回 `None`。
+fn build_client_tls(config: &ClientConfig) -> RfrpResult<Option<ClientTls>> {
+    if config.client.tls_enable
+        || config.client.work_conn_tls
+        || config.client.tls_server_name.is_some()
+    {
+        Ok(Some(ClientTls::new(&config.client)?))
+    } else {
+        Ok(None)
     }
 }
 

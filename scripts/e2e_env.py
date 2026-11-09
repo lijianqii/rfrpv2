@@ -85,10 +85,17 @@ def basic_auth() -> str:
     return base64.b64encode(f"{DASH_USER}:{DASH_PASSWORD}".encode()).decode()
 
 
-def http_get(port: int, path: str, auth: bool = True) -> tuple[int, str]:
+def http_get(
+    port: int,
+    path: str,
+    auth: bool = True,
+    user: str = DASH_USER,
+    password: str = DASH_PASSWORD,
+) -> tuple[int, str]:
     headers = {}
     if auth:
-        headers["Authorization"] = "Basic " + basic_auth()
+        credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers["Authorization"] = "Basic " + credentials
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", headers=headers
     )
@@ -672,7 +679,11 @@ class E2E(unittest.TestCase):
                         f"--- {name} ---\n{path.read_text(encoding='utf-8')}",
                         file=sys.stderr,
                     )
-        self.tempdir.cleanup()
+        if failed and os.environ.get("E2E_KEEP_TEMP") == "1":
+            self.tempdir._finalizer.detach()
+            print(f"E2E temp dir preserved: {self.temp}", file=sys.stderr)
+        else:
+            self.tempdir.cleanup()
 
     def logs_tail(self, lines: int = 60) -> str:
         parts = []
@@ -693,6 +704,56 @@ class E2E(unittest.TestCase):
         self.echoes.append(echo)
         return echo
 
+    def start_extra_client(
+        self,
+        *,
+        token: str,
+        local_port: int,
+        remote_port: int,
+        name: str,
+    ) -> subprocess.Popen:
+        binary = BIN
+        if binary is None:
+            raise AssertionError("rfrp binary is not initialized")
+        config = self.temp / f"client-{name}.toml"
+        log_path = self.temp / f"client-{name}.log"
+        config.write_text(
+            "\n".join(
+                [
+                    "[client]",
+                    'server_addr = "127.0.0.1"',
+                    f"server_port = {self._stack_control_port}",
+                    f'token = "{token}"',
+                    "work_conn_tls = false",
+                    "heartbeat_interval_secs = 5",
+                    "heartbeat_timeout_secs = 3",
+                    f'run_id_file = "{(self.temp / f"run-id-{name}").as_posix()}"',
+                    "",
+                    "[[proxy]]",
+                    'name = "extra"',
+                    'type = "tcp"',
+                    'local_ip = "127.0.0.1"',
+                    f"local_port = {local_port}",
+                    f"remote_port = {remote_port}",
+                    "pool_size = 0",
+                    "",
+                    "[log]",
+                    'level = "warn"',
+                    f'output = "file:{(self.temp / f"client-{name}.rfrpc.log").as_posix()}"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        log = open(log_path, "ab", buffering=0)
+        proc = subprocess.Popen(
+            [str(binary), "client", "-c", str(config)],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        self.processes.append((proc, log))
+        return proc
+
     def http_echo(self) -> HttpEchoServer:
         echo = HttpEchoServer()
         self.echoes.append(echo)
@@ -704,7 +765,217 @@ class E2E(unittest.TestCase):
         except Exception as exc:
             raise AssertionError(f"stack setup failed: {exc}\n{self.logs_tail()}") from exc
         self.stacks.append(stack)
+        self._stack_control_port = stack.control_port
         return stack
+
+    def test_config_hot_reload(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port)
+        original_client = stack.client_config.read_text(encoding="utf-8")
+        original_server = stack.server_config.read_text(encoding="utf-8")
+        second_echo = self.tcp_echo()
+        second_remote = free_tcp_port()
+        while second_remote in {
+            stack.remote_tcp,
+            stack.control_port,
+            stack.dashboard_port,
+        }:
+            second_remote = free_tcp_port()
+
+        # 1) 新增代理：客户端收到文件事件后重连并注册新代理。
+        stack.client_config.write_text(
+            original_client
+            + "\n[[proxy]]\n"
+            + 'name = "tcp2"\n'
+            + 'type = "tcp"\n'
+            + 'local_ip = "127.0.0.1"\n'
+            + f"local_port = {second_echo.port}\n"
+            + f"remote_port = {second_remote}\n"
+            + "pool_size = 0\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(second_remote, b"hot-added", timeout=0.5),
+                20.0,
+            ),
+            "new proxy from hot-reloaded config did not become ready",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"original-still-works"),
+            "existing proxy broke after client config reload",
+        )
+
+        # 2) 非法配置：保留旧配置且进程继续服务。
+        stack.client_config.write_text("invalid = [\n", encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(stack.client_proc.poll())
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-invalid-config"),
+            "client did not keep serving after invalid config",
+        )
+
+        # 3) 删除代理：恢复原配置后新代理端口应释放。
+        stack.client_config.write_text(original_client, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: not tcp_roundtrip(second_remote, b"gone", timeout=0.5),
+                20.0,
+            ),
+            "removed proxy port was not released",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-proxy-removal"),
+            "original proxy broke after proxy removal",
+        )
+
+        # 4) Dashboard 凭据热更新：旧密码失效，新密码生效。
+        new_password = "new-secret-456"
+        stack.server_config.write_text(
+            original_server.replace(
+                'password = "secret123"', f'password = "{new_password}"'
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(
+                    stack.dashboard_port,
+                    "/api/status",
+                    password=new_password,
+                )[0]
+                == 200,
+                15.0,
+            ),
+            "new dashboard password did not take effect",
+        )
+        old_status, _ = http_get(
+            stack.dashboard_port,
+            "/api/status",
+            password=DASH_PASSWORD,
+        )
+        self.assertEqual(old_status, 401, "old dashboard password must be rejected")
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-dashboard-reload"),
+            "proxy broke after server config reload",
+        )
+
+        # 收尾：恢复原始配置，确保后续事件不会影响其他测试。
+        stack.server_config.write_text(original_server, encoding="utf-8")
+        stack.client_config.write_text(original_client, encoding="utf-8")
+
+    def test_log_level_hot_reload(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original = stack.server_config.read_text(encoding="utf-8")
+        log_path = self.temp / "rfrps.log"
+        self.assertNotIn(
+            "DEBUG",
+            log_path.read_text(encoding="utf-8", errors="replace")
+            if log_path.is_file()
+            else "",
+            "info-level server log must not contain DEBUG before reload",
+        )
+        stack.server_config.write_text(
+            original.replace('level = "info"', 'level = "debug"'),
+            encoding="utf-8",
+        )
+        time.sleep(1.0)
+        self.assertTrue(tcp_roundtrip(stack.remote_tcp, b"generate-debug-log"))
+        self.assertTrue(
+            wait_until(
+                lambda: "DEBUG"
+                in log_path.read_text(encoding="utf-8", errors="replace"),
+                15.0,
+            ),
+            "log.level hot reload to debug did not take effect",
+        )
+        stack.server_config.write_text(original, encoding="utf-8")
+
+    def test_server_token_change_only_affects_new_login(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original = stack.server_config.read_text(encoding="utf-8")
+        rotated = "rotated-token-123"
+        stack.server_config.write_text(
+            original.replace('token = "e2e-token"', f'token = "{rotated}"'),
+            encoding="utf-8",
+        )
+        time.sleep(1.0)
+        # 已建立的控制会话继续服务，不因 token 变更被踢掉。
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"existing-session-token"),
+            "existing session was affected by token reload",
+        )
+        self.assertIsNone(stack.client_proc.poll())
+
+        echo2 = self.tcp_echo()
+        remote2 = free_tcp_port()
+        while remote2 in {
+            stack.remote_tcp,
+            stack.control_port,
+            stack.dashboard_port,
+        }:
+            remote2 = free_tcp_port()
+        new_client = self.start_extra_client(
+            token=rotated,
+            local_port=echo2.port,
+            remote_port=remote2,
+            name="rotated-token",
+        )
+        if not wait_until(
+            lambda: tcp_roundtrip(remote2, b"new-token-login", timeout=0.5),
+            20.0,
+        ):
+            for name in (
+                "client-rotated-token.log",
+                "client-rotated-token.rfrpc.log",
+            ):
+                path = self.temp / name
+                if path.is_file():
+                    print(
+                        f"--- {name} ---\n"
+                        f"{path.read_text(encoding='utf-8', errors='replace')[-4000:]}",
+                        file=sys.stderr,
+                    )
+            self.fail("client with rotated token could not log in")
+
+        echo3 = self.tcp_echo()
+        remote3 = free_tcp_port()
+        while remote3 in {
+            stack.remote_tcp,
+            stack.control_port,
+            stack.dashboard_port,
+            remote2,
+        }:
+            remote3 = free_tcp_port()
+        old_client = self.start_extra_client(
+            token="e2e-token",
+            local_port=echo3.port,
+            remote_port=remote3,
+            name="old-token",
+        )
+        self.assertIsNotNone(
+            old_client.wait(timeout=8),
+            "client with old token should exit after auth failure",
+        )
+        self.assertFalse(
+            tcp_roundtrip(remote3, b"old-token-rejected", timeout=0.5),
+            "old token must not register a proxy",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"existing-after-token"),
+            "existing session stopped after token reload",
+        )
+
+        for proc in (new_client, old_client):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        stack.server_config.write_text(original, encoding="utf-8")
 
     def test_tcp_proxy_concurrent_and_large_transfer(self) -> None:
         echo = self.tcp_echo()

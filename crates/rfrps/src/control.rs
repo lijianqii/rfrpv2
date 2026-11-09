@@ -11,7 +11,7 @@
 //! 不存储许可，任务未恰好在等待时会丢信号；`CancellationToken::cancelled()` 每次 poll
 //! 都重新检查标志位，不会漏掉取消。
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,7 +68,7 @@ where
     Ok(())
 }
 
-/// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
+/// 控制连接主循环（固定配置版本；测试/兼容入口）。
 pub async fn handle_control_login<S>(
     login_frame: Frame,
     stream: S,
@@ -81,6 +81,36 @@ pub async fn handle_control_login<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let shared = Arc::new(RwLock::new(config));
+    handle_control_login_shared(
+        login_frame,
+        stream,
+        peer_ip,
+        state,
+        shared,
+        heartbeat_interval,
+        heartbeat_timeout,
+    )
+    .await
+}
+
+/// 控制连接主循环。`S` 为任意双向流（生产用 `TcpStream`，测试用 `DuplexStream`）。
+///
+/// 登录时读取共享配置中的 token；每次 NewProxy 再读取最新 `allow_ports`，因此
+/// 配置热重载对新注册生效，已有会话不受影响。
+pub(crate) async fn handle_control_login_shared<S>(
+    login_frame: Frame,
+    stream: S,
+    peer_ip: std::net::IpAddr,
+    state: Arc<ServerState>,
+    config: Arc<RwLock<ServerConfig>>,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let login_cfg = config.read().clone();
     // 同一 IP 的“检查限速 → 校验 token → 记录失败/清除”必须串行；
     // 否则并发尝试可以同时通过检查，再一起记录失败，突破失败次数上限。
     let login_guard = state.login_lock(peer_ip).lock().await;
@@ -127,7 +157,7 @@ where
     }
 
     // token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
-    if !verify_token(&config.server.token, &token) {
+    if !verify_token(&login_cfg.server.token, &token) {
         state.record_login_failure(peer_ip);
         drop(login_guard);
         tracing::warn!(run_id = %run_id, %peer_ip, "login rejected: token mismatch");
@@ -257,7 +287,7 @@ where
             ok: true,
             error: None,
             session_id: Some(session_id.clone()),
-            work_conn_tls: Some(config.server.work_conn_tls),
+            work_conn_tls: Some(login_cfg.server.work_conn_tls),
             work_conn_token: Some(work_conn_token),
             protocol_version: Some(negotiated_version),
         }),
@@ -369,7 +399,8 @@ where
                                     }
                                     continue;
                                 }
-                                let result = listener::register_proxy(&np, &session, &state, &config).await;
+                                let proxy_cfg = config.read().clone();
+                                let result = listener::register_proxy(&np, &session, &state, &proxy_cfg).await;
                                 let (ok, error) = match result {
                                     Ok(()) => (true, None),
                                     Err(e) => {

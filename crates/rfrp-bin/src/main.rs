@@ -8,6 +8,7 @@
 mod cli;
 mod commands;
 mod logging;
+mod reload;
 mod summary;
 
 /// 可选的高性能分配器（构建时加 `--features mimalloc` 启用）。

@@ -24,9 +24,16 @@ use tokio_util::sync::CancellationToken;
 use crate::client::ClientState;
 use crate::workconn;
 
+/// 控制循环的可热重载参数。
+pub(crate) struct ControlLoopOptions {
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub reload: CancellationToken,
+}
+
 pub async fn control_loop<S>(
     stream: S,
-    mut rx: mpsc::Receiver<Message>,
+    rx: mpsc::Receiver<Message>,
     state: Arc<ClientState>,
     config: ClientConfig,
     shutdown: CancellationToken,
@@ -36,6 +43,38 @@ pub async fn control_loop<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    control_loop_with_reload(
+        stream,
+        rx,
+        state,
+        config,
+        shutdown,
+        ControlLoopOptions {
+            heartbeat_interval,
+            heartbeat_timeout,
+            reload: CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+/// 可被配置热重载打断的控制循环。
+pub(crate) async fn control_loop_with_reload<S>(
+    stream: S,
+    mut rx: mpsc::Receiver<Message>,
+    state: Arc<ClientState>,
+    config: ClientConfig,
+    shutdown: CancellationToken,
+    options: ControlLoopOptions,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let ControlLoopOptions {
+        heartbeat_interval,
+        heartbeat_timeout,
+        reload,
+    } = options;
     let (read_half, write_half) = split(stream);
     let mut reader = FramedRead::new(read_half, FrameCodec);
     let mut writer = FramedWrite::new(write_half, FrameCodec);
@@ -259,6 +298,17 @@ where
             }
             _ = disconnect.notified() => {
                 tracing::warn!("control connection dead (heartbeat timeout), reconnecting");
+                break;
+            }
+            _ = reload.cancelled() => {
+                tracing::info!("config reload requested; closing control connection");
+                let _ = send_with_timeout(
+                    &out_tx,
+                    Message::Close(Close {
+                        reason: Some("config reload".into()),
+                    }),
+                )
+                .await;
                 break;
             }
             _ = shutdown.cancelled() => {

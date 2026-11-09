@@ -12,12 +12,18 @@ pub struct LogOverrides {
 }
 
 /// 按“CLI 参数 > 配置文件 > 默认值”合并日志设置并初始化。
-pub fn init_logging(log: &LogSection, overrides: &LogOverrides) {
+///
+/// 返回值用于配置文件热重载；`None` 表示全局 subscriber 已安装或无法重载。
+pub fn init_logging(
+    log: &LogSection,
+    overrides: &LogOverrides,
+) -> Option<crate::logging::LogReloadHandle> {
     crate::logging::init_logging(
         overrides.level.as_deref().or(log.level.as_deref()),
         overrides.output.as_deref().or(log.output.as_deref()),
         overrides.format.as_deref().or(log.format.as_deref()),
-    );
+        overrides.level.is_some(),
+    )
 }
 
 /// 打印服务端启动摘要（版本与关键配置；不打印 token）。
