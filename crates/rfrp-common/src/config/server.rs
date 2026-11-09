@@ -116,9 +116,28 @@ pub struct DashboardSection {
     pub addr: String,
     pub user: String,
     pub password: String,
+    /// 会话 Cookie 有效期（秒）；缺省 [`DASHBOARD_SESSION_TTL_SECS`]（8 小时）。
+    ///
+    /// 此前 Cookie 无过期时间，浏览器会话结束前一直可用；给出明确有效期可限制
+    /// 凭据泄露后的暴露窗口。
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
+    /// 是否给会话 Cookie 加上 `Secure` 属性（仅通过 HTTPS 回传）。
+    ///
+    /// 默认关闭：Dashboard 默认走明文 HTTP（通常绑回环），此时浏览器会拒绝回传
+    /// 带 `Secure` 的 Cookie，登录将直接失效。**把 Dashboard 放在 HTTPS 反向代理
+    /// 之后时应打开此项**。
+    #[serde(default)]
+    pub cookie_secure: bool,
 }
 
 impl DashboardSection {
+    /// 生效的会话 Cookie 有效期（秒）。
+    pub fn session_ttl(&self) -> u64 {
+        self.session_ttl_secs
+            .unwrap_or(crate::constants::DASHBOARD_SESSION_TTL_SECS)
+    }
+
     pub fn validate(&self) -> Result<()> {
         // 地址必须可解析为带端口的 SocketAddr。
         self.addr.parse::<SocketAddr>().map_err(|e| {
@@ -132,6 +151,18 @@ impl DashboardSection {
         }
         if self.password.len() < 6 {
             return Err(config("dashboard.password must be at least 6 characters"));
+        }
+        if let Some(secs) = self.session_ttl_secs {
+            if !(crate::constants::DASHBOARD_SESSION_TTL_MIN_SECS
+                ..=crate::constants::DASHBOARD_SESSION_TTL_MAX_SECS)
+                .contains(&secs)
+            {
+                return Err(config(format!(
+                    "dashboard.session_ttl_secs {secs} out of range {}-{}",
+                    crate::constants::DASHBOARD_SESSION_TTL_MIN_SECS,
+                    crate::constants::DASHBOARD_SESSION_TTL_MAX_SECS
+                )));
+            }
         }
         Ok(())
     }
@@ -243,6 +274,13 @@ impl ServerConfig {
         }
         if self.server.token.is_empty() {
             return Err(config("server token must not be empty"));
+        }
+        if self.server.token.len() > crate::constants::MAX_TOKEN_LEN {
+            return Err(config(format!(
+                "server token length {} exceeds max {}",
+                self.server.token.len(),
+                crate::constants::MAX_TOKEN_LEN
+            )));
         }
         if self.server.tls_enable || self.server.work_conn_tls {
             let missing_tls = format!(

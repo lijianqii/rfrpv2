@@ -17,8 +17,8 @@ cargo bench -p rfrp-common --bench forward
 |---|---|---|
 | frame_encode_decode_256b | ~86.6 ns | 256 字节帧编解码一次 |
 | bridge_1mib/buf_8k | 3.43 GiB/s | 每方向 8 KiB 缓冲（tokio 默认） |
-| bridge_1mib/buf_32k | 6.03 GiB/s | `BRIDGE_BUF_SIZE`（当前默认） |
-| bridge_1mib/buf_64k | 6.45 GiB/s | 相对 32 KiB 仅 +7%，但缓冲内存翻倍 |
+| bridge_1mib/buf_32k | 6.03 GiB/s | 每方向 32 KiB 缓冲 |
+| bridge_1mib/buf_64k | 6.45 GiB/s | `BRIDGE_BUF_SIZE`（**当前默认**） |
 | config_parse_server | ~2.36 µs | 服务端配置解析 + 校验 |
 | config_parse_client | ~4.23 µs | 客户端配置解析 + 校验 |
 
@@ -40,9 +40,39 @@ cargo bench -p rfrp-common --bench forward
   原因是 `pool_size=1` 时"命中 → 请求补充"的补充连接常常赶不上下一个用户连接，于是退化为
   按需建连（含完整 TLS 握手）；池子稍大便能吸收这种突发。
 - 明文场景 `pool_size=1` 已经够（194 µs ≈ pool=4 的 193 µs）。
-- `BRIDGE_BUF_SIZE = 32 KiB` 是合理取舍：相比 8 KiB 吞吐 +76%，相比 64 KiB 只差 7% 却省一半缓冲内存。
+- `BRIDGE_BUF_SIZE = 64 KiB` 是当前取值：相比 tokio 默认 8 KiB 吞吐 +88%，相比 32 KiB 再 +7%，
+  代价是每条桥接连接多占 64 KiB 内存（详见「数据面调优结论」）。
 - 端到端吞吐约为直连的 1/4：路径上有两次桥接（rfrps 一次、rfrpc 一次），每跳都是用户态
   拷贝 + 读写系统调用。这是当前最大的优化空间（Linux 可考虑 `splice` 零拷贝，需评估可移植性）。
+
+## socket 缓冲
+
+数据面每条 TCP 连接（控制口、工作连接、本地回连）建立后都会申请 **512 KiB** 的
+`SO_RCVBUF` / `SO_SNDBUF`（`constants::TCP_SOCKET_BUF_BYTES`，best-effort）。
+
+| 场景 | 缓冲大小 | 实测（loopback，TLS，`pool_size=2`） |
+|---|---|---|
+| 仅桥接缓冲 32 KiB、socket 缓冲默认 | 32 KiB / 系统默认 | 14.8 MB/s |
+| 桥接缓冲 64 KiB + socket 缓冲 512 KiB | 64 KiB / 512 KiB | **206.6 MB/s** |
+
+> 两个改动是叠加生效的，无法从这组数据里单独归因；已分别保留为独立提交。
+> SSH 小包延迟基本不变，连接建立多约 0.3 ms。
+
+**内核会截断，这是最常见的"改了没效果"原因**：Linux 按 `net.core.rmem_max` /
+`net.core.wmem_max` 封顶，且内部按 **2 倍**记账后回读该值。系统默认
+`rmem_max = 212992`（208 KiB）时，请求 512 KiB 实际只生效 **416 KiB**：
+
+```bash
+# 实测当前生效值（Python 与 Rust 结果一致）
+python3 -c "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512*1024); print(s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))"
+# -> 425984（即 2 × 212992）
+
+# 要真正拿到 512 KiB：
+sudo sysctl -w net.core.rmem_max=1048576 net.core.wmem_max=1048576
+```
+
+rfrp 侧对 `setsockopt` 的失败**不报错**（best-effort），因此系统不支持或权限不足时
+只是没有吞吐收益，不影响功能。
 
 ## 复现方式（UDP 通路）
 
@@ -62,16 +92,21 @@ scripts/bench-udp.py latency   # 200B 小包往返：直连 vs 代理（P50/P95/
 
 | 场景 | 分配次数 | 分配字节 |
 |---|---|---|
-| 短连接 churn（每条连接：用户连接 + 工作连接 + 本地连接） | **43.2 次/连接** | **159.9 KiB/连接** |
-| 大流量传输（单连接 128 MiB） | **0.18 次/MiB** | 8.6 KiB/MiB |
+| 短连接 churn（每条连接：用户连接 + 工作连接 + 本地连接） | **41.9 次/连接** | **288.2 KiB/连接** |
+| 大流量传输（单连接 128 MiB） | **0.031 次/MiB** | ~0 KiB/MiB（收到 128 MiB） |
+
+> 2026-10-16 重测（`BRIDGE_BUF_SIZE` 由 32 KiB 提到 64 KiB 之后）。上一版
+> （2026-09-19，32 KiB 缓冲）为 43.2 次/连接、159.9 KiB/连接、0.18 次/MiB、8.6 KiB/MiB：
+> 缓冲翻倍使每连接的清零成本从 128 KiB 升到 256 KiB，但**大流量路径反而更省**
+> （分配次数降 5.8×、字节降为 0）——缓冲够大时传输过程中不再需要额外分配。
 
 结论：
 
-- **大流量与分配器无关**：传输路径每 MiB 只有 0.18 次分配（连接建立时的一次性分配），
+- **大流量与分配器无关**：传输路径每 MiB 只有 0.031 次分配（连接建立时的一次性分配），
   换 mimalloc/jemalloc 不会改变吞吐。
-- **churn 才可能受益**：每连接 43 次分配、160 KiB，其中大头是 tokio
-  `copy_bidirectional_with_sizes` 每次桥接都 `vec![0; 32 KiB]`——一条用户连接两次桥接
-  （服务端 + 客户端）= **128 KiB 清零**，这是分配/内存带宽成本的主体。
+- **churn 才可能受益**：每连接 41 次分配、288 KiB，其中大头是 tokio
+  `copy_bidirectional_with_sizes` 每次桥接都 `vec![0; BRIDGE_BUF_SIZE]`（现 64 KiB）——
+  一条用户连接两次桥接（服务端 + 客户端）= **256 KiB 清零**，这是分配/内存带宽成本的主体。
   按 macOS 实测的候选分配器 A/B：**系统分配器 1100 conn/s vs mimalloc 1090 conn/s（噪声内）**。
   同一次实验的后续轮次因**测试端 TIME_WAIT 端口耗尽**而失真（两种二进制同样塌到几十 conn/s），
   因此这台机器上的 A/B 只能作为参考，结论不足以支持默认启用。
@@ -87,8 +122,9 @@ cargo build --release -p rfrp-bin --features mimalloc    # mimalloc（可选 fea
 
 ## 桥接缓冲复用（已实验，**未采纳**）
 
-动机：tokio 的 `copy_bidirectional` 每次调用都 `vec![0; 32 KiB]`（零初始化），而一条用户
-连接要过两次桥接（服务端 + 客户端），等于**每连接多写 128 KiB 的零**。
+动机：tokio 的 `copy_bidirectional` 每次调用都 `vec![0; buf_size]`（零初始化），而一条用户
+连接要过两次桥接（服务端 + 客户端），等于**每连接多写一份缓冲大小的零**（当时 32 KiB/次，
+合计 128 KiB；现 64 KiB/次，合计 256 KiB）。
 
 实测（macOS，release）：
 
@@ -126,9 +162,13 @@ socket，必须先用 `tokio::io::split`，**它让同一 socket 的读半端与
 
 ## 数据面调优结论
 
-- **桥接缓冲 32 KiB**：`bridge()` 由 tokio 默认 8 KiB 提升到 32 KiB，loopback 实测吞吐
-  **+12%**（318 → 357 MiB/s）；64 KiB 相比 32 KiB 仅 +0.7%（收益饱和），故取 32 KiB。
-  代价是每条桥接连接约 2×32 KiB 缓冲内存（8 KiB 时为 2×8 KiB）。
+- **桥接缓冲 64 KiB**：`bridge()` 由 tokio 默认 8 KiB 提升到 64 KiB。loopback 实测
+  桥接吞吐 8 KiB → 32 KiB 为 **+12%**（318 → 357 MiB/s），32 KiB → 64 KiB 再 **+0.7%**
+  （收益已饱和，但绝对吞吐仍在上升）。2026-10-16 正式取 64 KiB，与 socket 缓冲
+  放大一起把 RDP 吞吐从 14.8 提到 206.6 MB/s（见上一节）。
+  代价是每条桥接连接约 2×64 KiB 缓冲内存（8 KiB 时为 2×8 KiB）。
+- **socket 缓冲 512 KiB**：见上一节；注意内核按 `rmem_max`/`wmem_max` 截断，
+  系统默认上限下实际只生效 416 KiB。
 - **流量计数批量化**：`CountingStream` 改为本地累计，每 256 KiB、或距上次刷新超过 1s、
   或连接关闭时写入全局原子计数器，避免高并发大流量下多核争用同一 cache line；
   监控滞后 ≤ 1s / 256 KiB（低速长连接也能及时反映）。

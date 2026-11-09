@@ -8,11 +8,50 @@
 /// `StartWorkConn` 必须携带并由服务端校验（防止未认证连接注入池/劫持 pending）。
 pub const PROTOCOL_VERSION: u8 = 2;
 
+/// 本实现接受的**最低**协议版本。
+///
+/// 与 [`PROTOCOL_VERSION`] 一起构成可接受区间 `[MIN, MAX]`：
+/// 服务端在区间内按客户端声明的版本协商，区间外一律拒绝（DESIGN §6.4）。
+///
+/// v1 与 v2 **不兼容**（v2 强制工作连接鉴权），因此下限同样是 2：即使服务端
+/// 的最高版本更高，也不会降级到 v1——降级需要两端都实现对应语义。
+/// 将来发布 v3 时：若 v3 的消息结构与 v2 向后兼容，把上限提到 3 即可同时接受
+/// v2 客户端（服务端按协商结果走 v2 语义）；否则把下限一并提到 3。
+pub const PROTOCOL_MIN_VERSION: u8 = 2;
+
+/// 判断某个协议版本是否在本实现支持的区间内。
+pub fn is_supported_protocol_version(version: u8) -> bool {
+    (PROTOCOL_MIN_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
+/// 协商协议版本（DESIGN §6.4）。
+///
+/// 客户端在 `Login.version` 声明自己的版本，服务端在支持区间内选取：
+/// - 命中 → 返回协商结果（当前实现即客户端声明的版本）；
+/// - 未命中 → 返回 `None`，服务端拒绝登录（客户端按致命错误处理）。
+///
+/// 返回的版本会经 `LoginResp.protocol_version` 回传给客户端，双方据此使用
+/// 同一套语义。
+pub fn negotiate_protocol_version(client_version: u8) -> Option<u8> {
+    is_supported_protocol_version(client_version).then_some(client_version)
+}
+
+/// 本实现支持的版本列表（用于错误提示与文档）。
+pub const PROTOCOL_VERSIONS_SUPPORTED: &[u8] = &[PROTOCOL_VERSION];
+
 /// 帧头长度：Version(1) + MsgType(1) + Length(4)。
 pub const FRAME_HEADER_LEN: usize = 6;
 
 /// 单帧 Payload 上限（16 MiB）。
 pub const FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
+
+/// 控制消息单帧上限（64 KiB）。
+///
+/// 控制消息（Login/NewProxy/心跳/Close 等）远小于此；服务端在认证前读取首帧时
+/// 也使用该上限，避免未认证连接只发 6 字节头声明 16 MiB 就触发等量内存分配。
+/// 配合 [`MAX_UNAUTHENTICATED_CONNECTIONS`]，未认证阶段的最坏预分配被限制在
+/// 约 64 MiB（1024 × 64 KiB），而不是 16 GiB。
+pub const CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024;
 
 /// work_id = 0 的保留值，表示「池化预备 / 补充池」语义（DESIGN §8.2）。
 pub const WORK_ID_POOL_RESERVED: u64 = 0;
@@ -78,6 +117,33 @@ pub const TCP_KEEPALIVE_INTERVAL: u64 = 30;
 /// TCP keepalive 探测间隔（秒）。
 pub const TCP_KEEPALIVE_PROBE_INTERVAL: u64 = 5;
 
+// ---- socket 缓冲 ----
+
+/// 数据面 socket 收发缓冲目标值（字节，best-effort）。
+///
+/// 增大 socket 缓冲可减少大流量突发时的窗口溢出（实测 loopback RDP 吞吐
+/// 14.8 → 206.6 MB/s，见 docs/BENCHMARKS.md「socket 缓冲」）。
+///
+/// **内核会截断**：Linux 按 `net.core.rmem_max` / `net.core.wmem_max` 封顶
+/// （内核内部按 2 倍记账并回读该值）。系统默认 212992（208 KiB）时，
+/// 请求 512 KiB 实际只生效 416 KiB；要真正拿到 512 KiB 需调大系统上限：
+///
+/// ```bash
+/// sysctl -w net.core.rmem_max=1048576 net.core.wmem_max=1048576
+/// ```
+///
+/// 设置失败不影响功能（best-effort），仅吞吐收益不生效。
+pub const TCP_SOCKET_BUF_BYTES: usize = 512 * 1024;
+
+// ---- Dashboard 会话 ----
+
+/// Dashboard 会话 Cookie 默认有效期（秒，8 小时）。
+pub const DASHBOARD_SESSION_TTL_SECS: u64 = 8 * 3600;
+/// `session_ttl_secs` 可配置下限（秒，1 分钟）。
+pub const DASHBOARD_SESSION_TTL_MIN_SECS: u64 = 60;
+/// `session_ttl_secs` 可配置上限（秒，30 天）。
+pub const DASHBOARD_SESSION_TTL_MAX_SECS: u64 = 30 * 24 * 3600;
+
 // ---- 代理注册重试（运行时冲突，DESIGN §6.6）----
 
 /// 注册失败（port occupied / domain conflict）后的首次重试延迟。
@@ -123,8 +189,13 @@ pub const MIN_STABLE_CONNECTION_SECS: u64 = 60;
 pub const MAX_CUSTOM_DOMAINS: usize = 16;
 /// 工作连接池默认大小。
 pub const POOL_SIZE_DEFAULT: u32 = 1;
-/// 池大小告警阈值（超过记警告但不拒绝）。
+/// 池大小告警阈值（超过记警告）。
 pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
+/// 客户端 `pool_size` 硬上限（与服务端单代理池上限对齐）。
+///
+/// 服务端最多保留 [`MAX_POOLED_WORK_CONNS_PER_PROXY`] 条池连接；客户端配置更大
+/// 只会先建立再被拒绝。该上限同时防止配置笔误（如多写几个零）触发连接/任务风暴。
+pub const POOL_SIZE_MAX: u32 = 32;
 /// 单个代理在**服务端**保留的预热工作连接上限。
 ///
 /// `pool_size` 是客户端本地配置、不随协议上送，服务端必须自己设上限：否则持有有效
@@ -134,6 +205,11 @@ pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
 pub const MAX_POOLED_WORK_CONNS_PER_PROXY: usize = 32;
 /// 单个 UDP 代理同时允许的待配对会话上限（超出直接丢弃，防伪造源放大/耗尽）。
 pub const MAX_PENDING_UDP_SESSIONS: usize = 256;
+/// 单个 UDP 代理同时保留的已配对会话上限。
+///
+/// pending 上限只约束“尚未建立工作连接”的源地址；已配对会话若不设上限，
+/// 持续更换源地址可让客户端不断建立工作连接并占用服务端/本机资源。
+pub const MAX_UDP_SESSIONS_PER_PROXY: usize = 4096;
 /// 单个 UDP 包最大字节数（IPv4 UDP payload 上限）。
 pub const MAX_UDP_PACKET_SIZE: usize = 65507;
 /// 每个 UDP 会话的待发送队列深度（数据报个数）。
@@ -155,13 +231,22 @@ pub const UDP_SOCKET_RECV_BUF_BYTES: usize = 1 << 20;
 
 /// 数据面桥接缓冲区大小（每方向，字节）。
 ///
-/// tokio `copy_bidirectional` 默认 8 KiB；此处提高到 32 KiB 以减少大流量
+/// tokio `copy_bidirectional` 默认 8 KiB；此处提高到 64 KiB 以减少大流量
 /// （文件传输等）下的 read/write 系统调用次数，小包交互场景不受影响。
 /// 每条约 2×该值 的连接内存开销。
+///
+/// 取舍见 docs/BENCHMARKS.md「数据面调优结论」：相对 32 KiB 吞吐 +7%，
+/// 代价是每条连接多占 64 KiB 内存。
 pub const BRIDGE_BUF_SIZE: usize = 64 * 1024;
 
 /// 服务端最大并发用户连接数（防 DoS 兜底）。
 pub const MAX_ACTIVE_CONNECTIONS: i64 = 65536;
+
+/// 服务端同时处于首帧握手阶段（peek/TLS/首帧读取）的连接上限。
+///
+/// 该阶段尚未认证，不占用 `MAX_SESSIONS`；限流可防止大量半开连接在认证前
+/// 占用任务/套接字（配合控制帧长度上限，避免每连接预分配大缓冲）。
+pub const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
 
 // ---- 字符串长度上限（字节）----
 
@@ -169,3 +254,41 @@ pub const MAX_RUN_ID_LEN: usize = 64;
 pub const MAX_TOKEN_LEN: usize = 256;
 pub const MAX_PROXY_NAME_LEN: usize = 64;
 pub const MAX_DOMAIN_LEN: usize = 253;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_version_range() {
+        // 当前区间为 [2,2]：v1 与 v2 不兼容，下限同样是 2。
+        assert!(is_supported_protocol_version(PROTOCOL_VERSION));
+        assert!(is_supported_protocol_version(PROTOCOL_MIN_VERSION));
+        assert!(!is_supported_protocol_version(PROTOCOL_VERSION + 1));
+        assert!(!is_supported_protocol_version(PROTOCOL_MIN_VERSION - 1));
+        assert!(!is_supported_protocol_version(0));
+        assert!(!is_supported_protocol_version(255));
+    }
+
+    #[test]
+    fn negotiate_returns_version_in_range() {
+        assert_eq!(
+            negotiate_protocol_version(PROTOCOL_VERSION),
+            Some(PROTOCOL_VERSION)
+        );
+        // 区间外一律拒绝（None），不降级。
+        assert_eq!(negotiate_protocol_version(PROTOCOL_VERSION + 1), None);
+        assert_eq!(negotiate_protocol_version(PROTOCOL_MIN_VERSION - 1), None);
+    }
+
+    #[test]
+    fn supported_versions_list_matches_current() {
+        assert!(PROTOCOL_VERSIONS_SUPPORTED.contains(&PROTOCOL_VERSION));
+        for v in PROTOCOL_VERSIONS_SUPPORTED {
+            assert!(
+                is_supported_protocol_version(*v),
+                "listed version {v} must be inside the accepted range"
+            );
+        }
+    }
+}

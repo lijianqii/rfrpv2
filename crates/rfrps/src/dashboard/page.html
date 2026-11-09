@@ -122,7 +122,7 @@ tr:last-child td{border-bottom:0}
   <section class="panel">
     <h2>会话 <span class="count" id="session-count"></span></h2>
     <table>
-      <thead><tr><th>run_id</th><th>session_id</th><th>代理</th></tr></thead>
+      <thead><tr><th>run_id</th><th>session_id</th><th>代理</th><th>RTT</th></tr></thead>
       <tbody id="sessions"></tbody>
     </table>
   </section>
@@ -284,7 +284,7 @@ tr:last-child td{border-bottom:0}
     if (!list.length) {
       var tr = document.createElement("tr");
       var td = document.createElement("td");
-      td.colSpan = 3;
+      td.colSpan = 4;
       td.className = "empty";
       td.textContent = "暂无活跃控制会话";
       tr.appendChild(td);
@@ -305,6 +305,11 @@ tr:last-child td{border-bottom:0}
         return p.name + " (" + p.kind + ")";
       }).join(", ") || "-";
       tr.appendChild(td);
+      // 逐会话 RTT（全局 KPI 显示的是各会话里的最差值）。
+      var rtt = document.createElement("td");
+      rtt.className = "mono";
+      rtt.textContent = s.rtt_ms ? s.rtt_ms + " ms" : "-";
+      tr.appendChild(rtt);
       body.appendChild(tr);
     });
   }

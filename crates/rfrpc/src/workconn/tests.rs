@@ -20,6 +20,15 @@ fn tcp_proxy(local_port: u16) -> ClientProxy {
     }
 }
 
+#[test]
+fn udp_bind_addr_matches_local_address_family() {
+    assert_eq!(udp_bind_addr("127.0.0.1"), "0.0.0.0:0");
+    assert_eq!(udp_bind_addr("::1"), "[::]:0");
+    assert_eq!(udp_bind_addr("[::1]"), "[::]:0");
+    // 域名暂按 IPv4 绑定；若解析到 IPv6，connect 仍可能失败（见函数注释）。
+    assert_eq!(udp_bind_addr("localhost"), "0.0.0.0:0");
+}
+
 #[tokio::test]
 async fn unknown_proxy_returns_ok() {
     // 未知 proxy_name：不应连接、不应 panic，直接 Ok 返回（§8.2 负路径）。

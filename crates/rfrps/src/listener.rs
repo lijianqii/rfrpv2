@@ -66,70 +66,89 @@ pub async fn register_proxy(
     if matches!(np.r#type, ProxyType::Http | ProxyType::Https) && domains.is_empty() {
         return Err(ProxyError::InvalidField);
     }
-    // 域名全局唯一（DESIGN §6.6）：所有类型统一校验，避免 TCP/UDP 代理抢占域名后，
-    // 同名 vhost 请求被路由到类型不匹配的代理（用户只会看到 404）。
-    // 冲突细节（域名/占用者）只写服务端日志，不回显给对端。
-    for d in &domains {
-        if let Some((_, owner)) = state.session_for_domain(d) {
-            tracing::warn!(
-                proxy = %np.proxy_name, domain = %d, owner = %owner,
-                "vhost domain conflict, registration rejected"
-            );
-            return Err(ProxyError::DomainConflict);
-        }
+    // 服务端独立校验域名格式：不能只依赖客户端配置校验（恶意客户端可绕过）。
+    if domains
+        .iter()
+        .any(|d| !rfrp_common::config::is_valid_domain(d))
+    {
+        return Err(ProxyError::InvalidField);
     }
 
     let kind = np.r#type;
+    // 先做字段/端口校验，避免为无效请求预留全局资源。
+    let remote_port = match kind {
+        ProxyType::Tcp | ProxyType::Udp => {
+            let rp = np.remote_port.ok_or(ProxyError::InvalidField)?;
+            // bind(0) 会分配随机端口，但客户端/协议不知道实际端口；必须拒绝。
+            if rp == 0 {
+                return Err(ProxyError::InvalidField);
+            }
+            if !port_allowed(config, rp) {
+                tracing::warn!(
+                    proxy = %np.proxy_name, remote_port = rp,
+                    allow_ports = %config.proxy.allow_ports,
+                    "remote_port not allowed by [proxy].allow_ports"
+                );
+                return Err(ProxyError::PortNotAllowed);
+            }
+            Some(rp)
+        }
+        ProxyType::Http | ProxyType::Https => None,
+    };
+
+    // 全局 proxy_name 唯一（DESIGN §6.6）：在 bind 之前原子预留，失败路径负责回滚。
+    if !state.reserve_proxy(&np.proxy_name, session) {
+        tracing::warn!(proxy = %np.proxy_name, "proxy name already registered in another session");
+        return Err(ProxyError::NameExists);
+    }
+    // 域名同样在 bind 前原子预留，关闭“查重 → bind → 登记”的 TOCTOU 窗口。
+    if !domains.is_empty() && !state.reserve_domains(&domains, session, &np.proxy_name) {
+        tracing::warn!(proxy = %np.proxy_name, "vhost domain conflict, registration rejected");
+        state.release_proxy(&np.proxy_name, session);
+        return Err(ProxyError::DomainConflict);
+    }
+
     let handle = match kind {
         // vhost 代理不绑定独立端口，仅登记域名与元信息（共享 vhost 监听在 Server 启动时创建）。
         ProxyType::Http | ProxyType::Https => tokio::spawn(async {}),
         ProxyType::Udp => {
-            let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
-            if !port_allowed(config, remote_port) {
-                tracing::warn!(
-                    proxy = %np.proxy_name, remote_port,
-                    allow_ports = %config.proxy.allow_ports,
-                    "udp remote_port not allowed by [proxy].allow_ports"
-                );
-                return Err(ProxyError::PortNotAllowed);
-            }
-            crate::udp::register_udp_proxy(
+            let rp = remote_port.expect("validated above");
+            match crate::udp::register_udp_proxy(
                 np.proxy_name.clone(),
-                remote_port,
+                rp,
                 session,
                 state,
                 &config.server.bind_addr,
                 config.server.udp_session_timeout(),
             )
-            .await?
+            .await
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    release_reservation(state, session, &np.proxy_name, &domains);
+                    return Err(e);
+                }
+            }
         }
         ProxyType::Tcp => {
-            let remote_port = np.remote_port.ok_or(ProxyError::InvalidField)?;
-            if !port_allowed(config, remote_port) {
-                tracing::warn!(
-                    proxy = %np.proxy_name, remote_port,
-                    allow_ports = %config.proxy.allow_ports,
-                    "tcp remote_port not allowed by [proxy].allow_ports"
-                );
-                return Err(ProxyError::PortNotAllowed);
-            }
-            let listener =
-                match TcpListener::bind((config.server.bind_addr.as_str(), remote_port)).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
-                        // 权限不足等归为不可重试的内部错误。
-                        tracing::warn!(
-                            proxy = %np.proxy_name, remote_port, error = %e,
-                            "failed to bind proxy port"
-                        );
-                        return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
-                            ProxyError::PortOccupied
-                        } else {
-                            ProxyError::Internal
-                        });
-                    }
-                };
+            let rp = remote_port.expect("validated above");
+            let listener = match TcpListener::bind((config.server.bind_addr.as_str(), rp)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
+                    // 权限不足等归为不可重试的内部错误。
+                    tracing::warn!(
+                        proxy = %np.proxy_name, remote_port = rp, error = %e,
+                        "failed to bind proxy port"
+                    );
+                    release_reservation(state, session, &np.proxy_name, &domains);
+                    return Err(if e.kind() == std::io::ErrorKind::AddrInUse {
+                        ProxyError::PortOccupied
+                    } else {
+                        ProxyError::Internal
+                    });
+                }
+            };
             let proxy_name = np.proxy_name.clone();
             let session = session.clone();
             let state_loop = state.clone();
@@ -139,17 +158,22 @@ pub async fn register_proxy(
         }
     };
 
-    // 登记：vhost 域名映射 + 会话内条目 + 全局归属索引。
-    if !domains.is_empty() {
-        {
-            let mut map = session.proxy_domains.lock();
-            for d in &domains {
-                map.insert(d.clone(), np.proxy_name.clone());
-            }
+    // bind 期间控制会话可能已被同 run_id 重连替换或被清理：此时不能把条目提交到
+    // 已失效的会话，否则监听任务会通过 Arc<Session> 存活并永久占用端口。
+    if !state.is_current_session(session) {
+        handle.abort();
+        if kind == ProxyType::Udp {
+            remove_udp_proxy_if_owner(state, session, &np.proxy_name);
         }
-        // 全局索引在会话锁之外写入，避免 `proxy_domains → domain_index` 嵌套。
+        release_reservation(state, session, &np.proxy_name, &domains);
+        return Err(ProxyError::Internal);
+    }
+
+    // 登记会话内映射；全局索引已在 bind 前预留，此处不再重复写入。
+    if !domains.is_empty() {
+        let mut map = session.proxy_domains.lock();
         for d in &domains {
-            state.index_domain(d, &session.run_id, &np.proxy_name);
+            map.insert(d.clone(), np.proxy_name.clone());
         }
     }
     session.proxies.lock().insert(
@@ -158,10 +182,32 @@ pub async fn register_proxy(
             handle,
             kind,
             remote_port: np.remote_port,
-            custom_domains: domains,
+            custom_domains: domains.clone(),
         },
     );
-    state.index_proxy(&np.proxy_name, &session.run_id);
+
+    // 插入后再确认一次：cleanup 可能恰好发生在“检查”与“插入”之间。此时
+    // cleanup 已经 drain 过 proxies，不会再 abort 这个条目；必须在这里回滚，
+    // 否则监听任务会随 Arc<Session> 一起存活。
+    if session.stop.is_cancelled() || !state.is_current_session(session) {
+        if let Some(entry) = session.proxies.lock().remove(&np.proxy_name) {
+            entry.handle.abort();
+        }
+        if !domains.is_empty() {
+            let mut map = session.proxy_domains.lock();
+            for d in &domains {
+                if map.get(d) == Some(&np.proxy_name) {
+                    map.remove(d);
+                }
+            }
+        }
+        if kind == ProxyType::Udp {
+            remove_udp_proxy_if_owner(state, session, &np.proxy_name);
+        }
+        release_reservation(state, session, &np.proxy_name, &domains);
+        return Err(ProxyError::Internal);
+    }
+
     match kind {
         ProxyType::Udp => {
             tracing::info!(proxy = %np.proxy_name, remote_port = ?np.remote_port, "proxy registered (udp)")
@@ -172,6 +218,32 @@ pub async fn register_proxy(
         other => tracing::info!(proxy = %np.proxy_name, typ = ?other, "proxy registered (vhost)"),
     }
     Ok(())
+}
+
+/// 回滚 bind 前预留的全局名称/域名。
+fn release_reservation(
+    state: &ServerState,
+    session: &Session,
+    proxy_name: &str,
+    domains: &[String],
+) {
+    if !domains.is_empty() {
+        state.release_domains(domains, session, proxy_name);
+    }
+    state.release_proxy(proxy_name, session);
+}
+
+/// 条件移除本会话的 UDP 运行态，并取消其停止令牌。
+fn remove_udp_proxy_if_owner(state: &ServerState, session: &Session, proxy_name: &str) {
+    let mut udp = state.udp.lock();
+    if udp
+        .get(proxy_name)
+        .is_some_and(|p| p.owner_session_id == session.session_id)
+    {
+        if let Some(proxy) = udp.remove(proxy_name) {
+            proxy.stop.cancel();
+        }
+    }
 }
 
 async fn proxy_accept_loop(
@@ -211,6 +283,12 @@ async fn proxy_accept_loop(
             }
             _ = state.shutdown.cancelled() => {
                 tracing::info!(%proxy_name, "shutdown requested, closing proxy listener");
+                break;
+            }
+            // 会话被替换/清理：即使 cleanup 因注册竞态漏掉了该任务，也必须退出，
+            // 否则任务持有的 Arc<Session> 会让会话与端口永久存活。
+            _ = session.stop.cancelled() => {
+                tracing::info!(%proxy_name, "session stopped, closing proxy listener");
                 break;
             }
         }
@@ -301,7 +379,7 @@ pub(crate) fn dispatch_user_connection<S>(
         .total_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 每代理统计（Dashboard/每代理指标）。
-    let stats = state.proxy_stats_for(&proxy_name);
+    let stats = state.proxy_stats_for_owner(&proxy_name, &session.session_id);
     stats
         .connections_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

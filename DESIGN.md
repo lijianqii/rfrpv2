@@ -328,7 +328,7 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 - **rfrpc 主动退出**：收到 SIGTERM/Ctrl-C，发送 `Close{reason:"client shutdown"}` 后断开。
 - **rfrps 主动退出**：收到信号，向所有 Session 发送 `Close{reason:"server shutdown"}` 后断开。
 - **配置/协议错误**：如帧格式错误、不兼容的 NewProxy 类型（rfrps 发 `Close` 后断开）。
-- **版本不匹配**：发生在 Login 阶段，rfrps 返回 `LoginResp{ok:false, error:"version mismatch"}` 后断开，不发 Close。
+- **版本不匹配**：发生在 Login 阶段，rfrps 返回 `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [...]"}` 后断开，不发 Close（错误前缀固定为 `version mismatch`，客户端按前缀判定致命）。
 - **鉴权失败**：rfrps 不发 Close，直接断开（避免回显，见 10.2）。
 - **rfrps 主动下线单 Proxy**：首版不支持运行期动态下线（无热重载）；但若 rfrps 在 NewProxy 后因 bind remote_port 失败需清理已注册的 Proxy 条目，rfrps **不发 Close**（控制连接仍存活，仅该 Proxy 失效），rfrpc 已通过 NewProxyResp{ok:false} 获知失败，无需额外通知。若未来支持动态下线，可扩展 `Close{reason:"proxy removed", proxy_name?}` 携带 proxy_name 字段（首版不实现，Close 不含 proxy_name）。
 - `reason` 字段可选，用于日志诊断，不影响对端行为（对端收到 Close 后应清理资源并视情况重连）。
@@ -377,10 +377,19 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 ### 6.4 版本协商
 
-- 帧头 `Version` 与 `Login.version` 字段**必须一致**，否则服务端拒绝并返回 `LoginResp{ok:false, error:"version mismatch"}`。
-- 客户端发送的帧头 Version 即其声明版本；服务端支持的最高版本若 ≥ 客户端版本则接受，否则拒绝。
-- 当前版本为 **2**；v1 与 v2 不兼容（v2 强制工作连接鉴权），因此不实现降级：版本不符即拒绝登录，客户端按致命错误处理并提示升级。
-- 未来版本通过 `Login.version` 字段协商降级。
+- 帧头 `Version` 与 `Login.version` 字段**必须一致**，且都落在服务端支持区间
+  `[PROTOCOL_MIN_VERSION, PROTOCOL_VERSION]` 内；否则服务端拒绝并返回
+  `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [...]"}`。
+- 客户端发送的帧头 Version 即其声明版本；服务端在支持区间内**协商**出本次会话使用的版本，
+  并通过 `LoginResp.protocol_version` **回传给客户端**，双方据此使用同一套语义。
+  旧服务端不回传该字段时，客户端按"沿用自己声明的版本"处理。
+- 当前版本为 **2**，`PROTOCOL_MIN_VERSION` 同为 **2**：v1 与 v2 不兼容（v2 强制工作连接鉴权），
+  因此**不降级到 v1**——降级要求两端都实现对应语义。版本不符即拒绝登录，客户端按致命错误
+  处理并提示升级（错误前缀固定为 `version mismatch`，客户端按前缀判定致命）。
+- 将来发布 v3 时：若 v3 的消息结构与 v2 向后兼容，把 `PROTOCOL_VERSION` 提到 3 即可同时接受
+  v2 客户端（服务端按协商结果走 v2 语义）；否则把 `PROTOCOL_MIN_VERSION` 一并提到 3。
+  **前提**：新增可选字段必须保持 serde 向后兼容（带缺省值 + 忽略未知字段），
+  `LoginResp` 派生 `Default` 即为此目的。
 
 ### 6.5 工作连接加密
 
@@ -484,7 +493,7 @@ rfrp/
 │   │       ├── constants.rs   # 协议/超时/上限等集中常量
 │   │       ├── error.rs       # 统一错误类型
 │   │       └── util/          # 通用工具
-│   │           ├── bridge.rs    # 双向桥接（32 KiB 缓冲）
+│   │           ├── bridge.rs    # 双向桥接（64 KiB 缓冲）
 │   │           ├── control.rs   # 控制消息发送原语（try_send / 超时发送 / 优雅关闭）
 │   │           ├── http.rs      # 极简 HTTP 响应工具（Dashboard/客户端状态端点共用）
 │   │           ├── counting.rs  # 流量计数流包装（批量刷新）
@@ -537,7 +546,7 @@ rfrp/
 `crates/rfrp-common/benches/`。
 
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
-> - 协议：`PROTOCOL_VERSION = 1`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`WORK_ID_POOL_RESERVED = 0`
+> - 协议：`PROTOCOL_VERSION = 2`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024`（控制帧实际上限）、`WORK_ID_POOL_RESERVED = 0`
 > - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 300`（可通过服务端 `udp_session_timeout_secs` 覆盖）、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
 > - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP）
@@ -942,7 +951,7 @@ CLI 参数 > 配置文件 > 默认值。
 - **grace_secs 范围**：0–3600（秒）；缺省 30，0 表示不等待在途连接直接退出。
 - **udp_session_timeout_secs 范围**：1–86400（秒）；缺省 300。RDP-UDP 建议 300–600。
 - **status_addr 格式**：客户端可选状态端点地址，提供时必须可解析为 `SocketAddr`（如 `127.0.0.1:7400`）。
-- **pool_size 通用**：`pool_size` 对所有代理类型（tcp/udp/http/https）生效，省略默认 1。类型为 u32，≥0；0 表示禁用预热纯按需（见 8.2）；建议上限 16（超过记警告但不拒绝，防止资源耗尽）。
+- **pool_size 通用**：`pool_size` 对 tcp/http/https 生效；UDP 当前不支持工作连接池化（服务端拒绝 `work_id=0`，rfrpc 也不对 UDP 预热）。省略默认 1。类型为 u32；0 表示禁用预热纯按需（见 8.2）；建议值 16 以内，硬上限 32（超过直接拒绝，防止资源耗尽）。
 - **vhost 端口与 proxy 类型交叉**：`vhost_http_port` 配置但无 HTTP 类型 proxy、`vhost_https_port` 配置但无 HTTPS 类型 proxy——视为**配置冗余，不报错**（vhost 监听仍启动，只是无流量，方便后续动态添加 proxy）。反之，有 HTTP/HTTPS proxy 但未配对应 vhost 端口——启动**报错**（proxy 无法路由）。
 - **dashboard 段校验**（仅服务端，`[dashboard]` 段存在时）：
   - `addr` 可解析为 `SocketAddr`（含端口）。

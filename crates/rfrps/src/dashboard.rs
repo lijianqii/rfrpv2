@@ -1,5 +1,7 @@
 //! Dashboard：Basic Auth + 状态 API + Prometheus 指标。
 
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +24,53 @@ const SESSION_COOKIE: &str = "rfrp_dashboard";
 /// 登录表单请求体上限（防大体积 POST 占用任务与内存）。
 const MAX_LOGIN_BODY: usize = 4096;
 
+/// Dashboard 服务端会话表：Cookie 只保存随机会话 ID，不再保存 base64(user:pass)。
+///
+/// 这样 Cookie 泄露不等于密码泄露，且服务端可真正执行 TTL 与 logout 撤销。
+struct DashboardSessions {
+    inner: Mutex<HashMap<String, Instant>>,
+    ttl: Duration,
+}
+
+impl DashboardSessions {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    fn create(&self) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        let now = Instant::now();
+        let mut sessions = self.inner.lock();
+        sessions.retain(|_, expires| *expires > now);
+        // Dashboard 会话数量很少；超过上限时整体清空，避免异常登录刷爆内存。
+        if sessions.len() >= 1024 {
+            sessions.clear();
+        }
+        sessions.insert(token.clone(), now + self.ttl);
+        token
+    }
+
+    fn is_valid(&self, token: &str) -> bool {
+        let now = Instant::now();
+        let mut sessions = self.inner.lock();
+        match sessions.get(token) {
+            Some(expires) if *expires > now => true,
+            Some(_) => {
+                sessions.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn revoke(&self, token: &str) {
+        self.inner.lock().remove(token);
+    }
+}
+
 /// Dashboard HTTP 服务主循环。
 pub async fn run_dashboard(
     listener: TcpListener,
@@ -30,6 +79,7 @@ pub async fn run_dashboard(
     shutdown: CancellationToken,
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
+    let sessions = Arc::new(DashboardSessions::new(cfg.session_ttl()));
     // accept 出错不得结束循环：Dashboard 是进程级监听，自行退出后只能靠重启恢复。
     let mut retry = AcceptRetry::new();
     loop {
@@ -42,8 +92,17 @@ pub async fn run_dashboard(
                         let cfg = cfg.clone();
                         let state = state.clone();
                         let limiter = limiter.clone();
+                        let sessions = sessions.clone();
                         tokio::spawn(async move {
-                            let _ = handle_request(stream, &cfg, &state, &limiter, peer).await;
+                            let _ = handle_request(
+                                stream,
+                                &cfg,
+                                &state,
+                                &limiter,
+                                &sessions,
+                                peer,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -72,6 +131,7 @@ async fn handle_request(
     cfg: &DashboardSection,
     state: &Arc<ServerState>,
     limiter: &RateLimiter,
+    sessions: &DashboardSessions,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     let head = match read_request_head(
@@ -96,19 +156,31 @@ async fn handle_request(
         return write_response(&mut stream, status, "text/plain", body, None).await;
     }
 
-    let authenticated = authorized(&req, cfg);
+    let authenticated = authorized(&req, cfg, sessions);
 
     // 表单登录：POST /login 校验凭据，成功后下发会话 Cookie 并跳转首页。
     if req.method.eq_ignore_ascii_case("POST") && req.path == "/login" {
         if req.content_length > MAX_LOGIN_BODY {
             return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await;
         }
-        let body = read_body(&mut stream, &head, req.content_length).await?;
+        let body = match tokio::time::timeout(
+            Duration::from_secs(rfrp_common::constants::HTTP_HEAD_TIMEOUT),
+            read_body(&mut stream, &head, req.content_length),
+        )
+        .await
+        {
+            Ok(body) => body?,
+            Err(_) => {
+                return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await
+            }
+        };
         let (user, pass) = parse_login_form(&body);
         if verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass) {
-            let value = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+            // Cookie 只保存随机、可撤销的服务端会话 ID，不保存凭据本身。
+            let value = sessions.create();
             let headers = format!(
-                "Location: /\r\nSet-Cookie: {SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/"
+                "Location: /\r\nSet-Cookie: {}\r\n",
+                session_cookie(&value, cfg)
             );
             return write_response(&mut stream, 302, "text/plain", "", Some(&headers)).await;
         }
@@ -137,8 +209,17 @@ async fn handle_request(
         return write_response(&mut stream, 302, "text/plain", "", Some("Location: /")).await;
     }
     if req.path == "/logout" {
+        // 服务端撤销会话，再清除浏览器的 Cookie。
+        if let Some(cookie) = req.cookie.as_deref() {
+            if let Some(value) = cookie_value(cookie, SESSION_COOKIE) {
+                sessions.revoke(&value);
+            }
+        }
+        // 清除 Cookie：属性与下发时保持一致（`Secure` 尤其重要，
+        // 否则带 `Secure` 的 Cookie 不会被同名的非 Secure Cookie 覆盖）。
         let headers = format!(
-            "Location: /\r\nSet-Cookie: {SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"
+            "Location: /\r\nSet-Cookie: {SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/{}\r\n",
+            if cfg.cookie_secure { "; Secure" } else { "" }
         );
         return write_response(&mut stream, 302, "text/plain", "", Some(&headers)).await;
     }
@@ -169,8 +250,27 @@ fn health_response(state: &Arc<ServerState>) -> (u16, &'static str) {
     }
 }
 
-/// 鉴权：接受 `Authorization: Basic` 头（脚本/兼容）或登录后的会话 Cookie。
-fn authorized(req: &RequestHead, cfg: &DashboardSection) -> bool {
+/// 构造会话 Cookie 头值。
+///
+/// 属性：
+/// - `HttpOnly`：脚本读不到凭据（防 XSS 窃取）；
+/// - `SameSite=Strict`：不随跨站请求发出（防 CSRF）；
+/// - `Max-Age`：明确有效期，限制凭据泄露后的暴露窗口（此前无过期时间）；
+/// - `Secure`：仅在 `cookie_secure = true` 时添加——Dashboard 默认走明文 HTTP，
+///   此时浏览器会拒绝回传带 `Secure` 的 Cookie，登录会直接失效。
+fn session_cookie(value: &str, cfg: &DashboardSection) -> String {
+    let mut cookie = format!(
+        "{SESSION_COOKIE}={value}; Max-Age={}; HttpOnly; SameSite=Strict; Path=/",
+        cfg.session_ttl()
+    );
+    if cfg.cookie_secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// 鉴权：接受 `Authorization: Basic` 头（脚本/兼容）或登录后的服务端会话 Cookie。
+fn authorized(req: &RequestHead, cfg: &DashboardSection, sessions: &DashboardSessions) -> bool {
     if let Some(auth) = req.authorization.as_deref() {
         if let Some(encoded) = auth.strip_prefix("Basic ") {
             if let Some((user, pass)) = decode_basic(encoded.trim()) {
@@ -180,15 +280,13 @@ fn authorized(req: &RequestHead, cfg: &DashboardSection) -> bool {
     }
     if let Some(cookie) = req.cookie.as_deref() {
         if let Some(value) = cookie_value(cookie, SESSION_COOKIE) {
-            if let Some((user, pass)) = decode_basic(&value) {
-                return verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass);
-            }
+            return sessions.is_valid(&value);
         }
     }
     false
 }
 
-/// 解码 `user:password`（Basic 头与会话 Cookie 的值同为 base64(user:pass)）。
+/// 解码 `user:password`（仅 Basic 头使用；会话 Cookie 不再保存凭据）。
 fn decode_basic(encoded: &str) -> Option<(String, String)> {
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
         return None;
@@ -355,6 +453,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
             json!({
                 "run_id": s.run_id,
                 "session_id": s.session_id,
+                "rtt_ms": s.rtt_ms.load(std::sync::atomic::Ordering::Relaxed),
                 "proxies": proxy_list,
             })
         })
@@ -391,7 +490,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         "udp_sessions": g.udp_sessions,
         "proxies": g.proxies,
         "pooled_work_conns": g.pooled_work_conns,
-        "rtt_ms": state.metrics.rtt_ms(),
+        "rtt_ms": state.rtt_ms(),
         "proxy_stats": proxy_stats,
         "metrics": {
             "total_connections": state.metrics.total_connections.load(std::sync::atomic::Ordering::Relaxed),
@@ -434,7 +533,12 @@ mod authorized_tests {
             addr: "127.0.0.1:7500".into(),
             user: "admin".into(),
             password: "secret123".into(),
+            ..Default::default()
         }
+    }
+
+    fn sessions() -> DashboardSessions {
+        DashboardSessions::new(3600)
     }
 
     fn parsed(head: &str) -> RequestHead {
@@ -445,7 +549,7 @@ mod authorized_tests {
     fn authorized_accepts_valid_credentials() {
         let auth = base64::engine::general_purpose::STANDARD.encode("admin:secret123");
         let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
-        assert!(authorized(&parsed(&head), &cfg()));
+        assert!(authorized(&parsed(&head), &cfg(), &sessions()));
     }
 
     #[test]
@@ -453,36 +557,91 @@ mod authorized_tests {
         let cfg = cfg();
         let auth = base64::engine::general_purpose::STANDARD.encode("admin:wrongpass");
         let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
-        assert!(!authorized(&parsed(&head), &cfg));
+        assert!(!authorized(&parsed(&head), &cfg, &sessions()));
     }
 
     #[test]
     fn authorized_rejects_malformed() {
         let cfg = cfg();
         assert!(
-            !authorized(&parsed("GET / HTTP/1.1\r\n\r\n"), &cfg),
+            !authorized(&parsed("GET / HTTP/1.1\r\n\r\n"), &cfg, &sessions()),
             "no auth header"
         );
         let head = "GET / HTTP/1.1\r\nAuthorization: Basic !!!\r\n\r\n";
-        assert!(!authorized(&parsed(head), &cfg), "invalid base64");
+        assert!(
+            !authorized(&parsed(head), &cfg, &sessions()),
+            "invalid base64"
+        );
         // 缺少冒号
         let auth = base64::engine::general_purpose::STANDARD.encode("adminsecret123");
         let head = format!("GET / HTTP/1.1\r\nAuthorization: Basic {auth}\r\n\r\n");
-        assert!(!authorized(&parsed(&head), &cfg));
+        assert!(!authorized(&parsed(&head), &cfg, &sessions()));
     }
 
     #[test]
-    fn authorized_accepts_session_cookie() {
-        // 表单登录后浏览器只带 Cookie（无 Authorization 头）。
+    fn authorized_accepts_server_side_session_cookie() {
+        // 表单登录后浏览器只带随机会话 ID（无 Authorization 头）。
         let cfg = cfg();
-        let value = base64::engine::general_purpose::STANDARD.encode("admin:secret123");
+        let sessions = sessions();
+        let value = sessions.create();
         let head =
             format!("GET / HTTP/1.1\r\nCookie: theme=dark; {SESSION_COOKIE}={value}\r\n\r\n");
-        assert!(authorized(&parsed(&head), &cfg));
-        // 错误 Cookie 必须被拒。
-        let bad = base64::engine::general_purpose::STANDARD.encode("admin:wrong");
-        let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={bad}\r\n\r\n");
-        assert!(!authorized(&parsed(&head), &cfg));
+        assert!(authorized(&parsed(&head), &cfg, &sessions));
+        // 任意伪造/未知 Cookie 必须被拒。
+        let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}=not-a-session\r\n\r\n");
+        assert!(!authorized(&parsed(&head), &cfg, &sessions));
+    }
+
+    #[test]
+    fn expired_or_revoked_session_cookie_rejected() {
+        let cfg = cfg();
+        let expired_sessions = DashboardSessions::new(0);
+        let value = expired_sessions.create();
+        let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={value}\r\n\r\n");
+        assert!(!authorized(&parsed(&head), &cfg, &expired_sessions));
+
+        let sessions = sessions();
+        let value = sessions.create();
+        sessions.revoke(&value);
+        let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={value}\r\n\r\n");
+        assert!(!authorized(&parsed(&head), &cfg, &sessions));
+    }
+
+    #[test]
+    fn session_cookie_has_expiry_and_httponly_samesite() {
+        // 会话 Cookie 必须带明确有效期（此前无过期时间）+ HttpOnly + SameSite。
+        let cookie = session_cookie("abc", &cfg());
+        assert!(cookie.starts_with("rfrp_dashboard=abc; "), "{cookie}");
+        assert!(cookie.contains("Max-Age="), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+        // 默认不标 Secure：Dashboard 默认走明文 HTTP，标了浏览器就不回传。
+        assert!(!cookie.contains("Secure"), "{cookie}");
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_is_opt_in() {
+        // 放在 HTTPS 反向代理后面时需要 Secure。
+        let mut c = cfg();
+        c.cookie_secure = true;
+        let cookie = session_cookie("abc", &c);
+        assert!(cookie.contains("; Secure"), "{cookie}");
+    }
+
+    #[test]
+    fn session_cookie_ttl_uses_configured_value() {
+        let mut c = cfg();
+        c.session_ttl_secs = Some(60);
+        let cookie = session_cookie("abc", &c);
+        assert!(cookie.contains("Max-Age=60;"), "{cookie}");
+        // 缺省时用默认常量。
+        let cookie = session_cookie("abc", &cfg());
+        let default_ttl = rfrp_common::constants::DASHBOARD_SESSION_TTL_SECS;
+        assert!(
+            cookie.contains(&format!("Max-Age={default_ttl};")),
+            "{cookie}"
+        );
     }
 
     #[test]
@@ -588,5 +747,28 @@ mod metrics_tests {
         let by_name = |n: &str| proxies.iter().find(|p| p["name"] == n).unwrap();
         assert_eq!(by_name("ssh")["remote_port"], 6000);
         assert_eq!(by_name("web")["domains"][0], "dev.example.com");
+    }
+
+    #[tokio::test]
+    async fn status_json_exposes_per_session_rtt() {
+        // RTT 逐会话给出（全局值取最差会话），多会话时语义才明确。
+        let state = ServerState::new();
+        let s1 = crate::control::test_session("rttA");
+        let s2 = crate::control::test_session("rttB");
+        s1.rtt_ms.store(15, std::sync::atomic::Ordering::Relaxed);
+        s2.rtt_ms.store(80, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut sessions = state.sessions.lock();
+            sessions.insert("rttA".into(), s1);
+            sessions.insert("rttB".into(), s2);
+        }
+
+        let json = status_json(&state);
+        let sessions = json["sessions"].as_array().unwrap();
+        let by_run = |id: &str| sessions.iter().find(|s| s["run_id"] == id).unwrap();
+        assert_eq!(by_run("rttA")["rtt_ms"], 15);
+        assert_eq!(by_run("rttB")["rtt_ms"], 80);
+        // 顶层为最差会话。
+        assert_eq!(json["rtt_ms"], 80);
     }
 }

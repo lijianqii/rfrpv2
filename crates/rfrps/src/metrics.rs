@@ -11,8 +11,6 @@ use std::fmt::Write as _;
 pub struct Metrics {
     /// 进程启动时刻（用于 uptime 指标）。
     pub started: Instant,
-    /// 最近一次控制链路 RTT（毫秒；0 = 尚未测得）。
-    pub rtt_ms: AtomicU64,
     /// 主监听端口累计接受的 TCP 连接数（含控制/工作连接）。
     pub accepted_total: AtomicU64,
     /// accept 错误累计次数。
@@ -34,6 +32,8 @@ pub struct Metrics {
 /// 单个代理的累计统计（每代理指标与 Dashboard 用）。
 /// 计数用 `Arc<Atomic*>`，便于与全局指标一起共享给 `CountingStream`。
 pub struct ProxyStats {
+    /// 归属会话 ID：同 run_id 重连时区分新旧会话，避免旧 cleanup 误删新统计。
+    pub owner_session_id: String,
     /// 上行字节（外部 → 本地）。
     pub bytes_up: Arc<AtomicU64>,
     /// 下行字节（本地 → 外部）。
@@ -47,6 +47,7 @@ pub struct ProxyStats {
 impl Default for ProxyStats {
     fn default() -> Self {
         Self {
+            owner_session_id: String::new(),
             bytes_up: Arc::new(AtomicU64::new(0)),
             bytes_down: Arc::new(AtomicU64::new(0)),
             connections_total: Arc::new(AtomicU64::new(0)),
@@ -59,7 +60,6 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             started: Instant::now(),
-            rtt_ms: AtomicU64::new(0),
             accepted_total: AtomicU64::new(0),
             accept_errors_total: AtomicU64::new(0),
             udp_dropped_total: AtomicU64::new(0),
@@ -99,23 +99,16 @@ impl Metrics {
         self.accepting.load(Ordering::Relaxed)
     }
 
-    /// 记录控制链路 RTT（毫秒）。
-    pub fn set_rtt_ms(&self, ms: u64) {
-        self.rtt_ms.store(ms, Ordering::Relaxed);
-    }
-
-    /// 最近一次控制链路 RTT（毫秒；0 = 未测得）。
-    pub fn rtt_ms(&self) -> u64 {
-        self.rtt_ms.load(Ordering::Relaxed)
-    }
-
     /// 进程已运行秒数。
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
     }
 
     /// 渲染为 Prometheus 文本格式（仅进程计数器；gauge 由 [`crate::metrics::render_prometheus`] 补充）。
-    pub fn render(&self) -> String {
+    ///
+    /// `rtt_ms` 由调用方传入（逐会话 RTT 的最大值，见 [`crate::state::ServerState::rtt_ms`]）：
+    /// RTT 逐会话维护，不属于进程级计数器。
+    pub fn render(&self, rtt_ms: u64) -> String {
         format!(
             "# HELP rfrp_connections_total Total accepted user connections.\n\
              # TYPE rfrp_connections_total counter\n\
@@ -126,7 +119,7 @@ impl Metrics {
              rfrp_bytes_up_total {}\n\
              # TYPE rfrp_bytes_down_total counter\n\
              rfrp_bytes_down_total {}\n\
-             # HELP rfrp_rtt_ms Control connection round-trip time in milliseconds (0 = unknown).\n\
+             # HELP rfrp_rtt_ms Control connection round-trip time in milliseconds (0 = unknown); max across active sessions.\n\
              # TYPE rfrp_rtt_ms gauge\n\
              rfrp_rtt_ms {}\n\
              # HELP rfrp_accepted_total Accepted TCP connections on the control port.\n\
@@ -145,7 +138,7 @@ impl Metrics {
             self.active_connections.load(Ordering::Relaxed),
             self.bytes_up.load(Ordering::Relaxed),
             self.bytes_down.load(Ordering::Relaxed),
-            self.rtt_ms(),
+            rtt_ms,
             self.accepted_total.load(Ordering::Relaxed),
             self.accept_errors_total.load(Ordering::Relaxed),
             self.udp_dropped_total.load(Ordering::Relaxed),
@@ -157,7 +150,7 @@ impl Metrics {
 /// 渲染完整 Prometheus 文本：进程计数器（[`Metrics::render`]）+ 实时 gauge。
 pub fn render_prometheus(state: &crate::state::ServerState) -> String {
     let g = state.gauges();
-    let mut out = state.metrics.render();
+    let mut out = state.metrics.render(state.rtt_ms());
     out.push_str(&format!(
         "# HELP rfrp_uptime_seconds Process uptime in seconds.\n\
          # TYPE rfrp_uptime_seconds gauge\n\
@@ -269,7 +262,7 @@ mod tests {
     fn render_contains_all_metrics() {
         let m = Metrics::new();
         m.total_connections.fetch_add(3, Ordering::Relaxed);
-        let text = m.render();
+        let text = m.render(0);
         assert!(text.contains("rfrp_connections_total 3"));
         assert!(text.contains("rfrp_active_connections"));
         assert!(text.contains("rfrp_bytes_up_total"));
@@ -302,7 +295,7 @@ mod tests {
         m.active_connections.fetch_add(4, Ordering::Relaxed);
         m.bytes_up.fetch_add(1024, Ordering::Relaxed);
         m.bytes_down.fetch_add(2048, Ordering::Relaxed);
-        let text = m.render();
+        let text = m.render(0);
         assert!(text.contains("rfrp_connections_total 10"));
         assert!(text.contains("rfrp_active_connections 4"));
         assert!(text.contains("rfrp_bytes_up_total 1024"));
@@ -344,7 +337,7 @@ mod proxy_stats_tests {
         );
 
         // 会话清理后指标消失。
-        state.remove_proxy_stats(&["ssh-61".to_string()]);
+        state.remove_proxy_stats(&["ssh-61".to_string()], "");
         let text = render_prometheus(&state);
         assert!(!text.contains("rfrp_proxy_bytes_up_total{"), "{text}");
     }
@@ -353,5 +346,20 @@ mod proxy_stats_tests {
     fn label_escaping() {
         assert_eq!(escape_label("a\"b"), "a\\\"b");
         assert_eq!(escape_label("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn rtt_metric_reports_worst_session() {
+        // `rfrp_rtt_ms` 取所有活跃会话的最大值（最差链路），而不是被最后回包的会话覆盖。
+        let state = crate::state::ServerState::new();
+        let s1 = crate::control::test_session("m1");
+        let s2 = crate::control::test_session("m2");
+        state.sessions.lock().insert("m1".into(), s1.clone());
+        state.sessions.lock().insert("m2".into(), s2.clone());
+        s1.rtt_ms.store(12, Ordering::Relaxed);
+        s2.rtt_ms.store(45, Ordering::Relaxed);
+
+        let text = render_prometheus(&state);
+        assert!(text.contains("rfrp_rtt_ms 45"), "{text}");
     }
 }

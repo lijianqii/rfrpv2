@@ -2,7 +2,7 @@
 //! 断开后按指数退避重连，并复用 run_id 恢复代理（DESIGN §8.1 / §8.3 / §6.6）。
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,9 +10,10 @@ use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
     CONNECT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN, MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT,
-    PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY,
-    PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS, PROXY_REGISTER_RETRY_PERSISTENT_MAX,
-    RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, WORK_ID_POOL_RESERVED,
+    POOL_SIZE_MAX, PROTOCOL_VERSION, PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX,
+    PROXY_REGISTER_RETRY_MAX_DELAY, PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS,
+    PROXY_REGISTER_RETRY_PERSISTENT_MAX, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX,
+    TLS_HANDSHAKE_TIMEOUT, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
@@ -47,6 +48,11 @@ pub struct ClientState {
     pub work_conn_tls: Mutex<bool>,
     /// 工作连接鉴权令牌（来自 LoginResp，随 StartWorkConn 上送）。
     pub work_conn_token: Mutex<Option<String>>,
+    /// 正在建立/使用中的按需工作连接 `(proxy_name, work_id)`。
+    ///
+    /// 服务端在 10s pending 窗口内每 3s 重发 `ReqWorkConn`；客户端必须去重，
+    /// 否则本地服务建立慢时会并发创建多条连接，之后多余工作连接被服务端拒绝。
+    pub inflight_work: Mutex<HashSet<(String, u64)>>,
     /// 进程级运行指标（跨重连累计）。
     pub metrics: Arc<ClientMetrics>,
 }
@@ -235,11 +241,18 @@ impl Client {
         // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
         let stream: BoxedStream = if self.config.client.tls_enable {
             let tls = tls.as_ref().expect("tls built above");
-            match tls.connect(stream).await {
-                Ok(s) => Box::new(s),
+            // 控制链路 TLS 握手必须有超时：服务端/中间设备接受 TCP 但不完成握手时，
+            // 否则客户端会永久挂起、既不重连也没有日志（工作连接 TLS 已有超时）。
+            match tokio::time::timeout(
+                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
+                tls.connect(stream),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Box::new(s),
                 // 证书校验/协议协商失败是配置问题，重试不会自愈：按致命处理并退出，
                 // 避免无限退避重连且不给用户明确信号（连接类错误仍是瞬时问题）。
-                Err(rfrp_common::Error::Auth(msg)) => {
+                Ok(Err(rfrp_common::Error::Auth(msg))) => {
                     tracing::error!(
                         error = %msg,
                         "control TLS handshake failed; not reconnecting \
@@ -247,7 +260,11 @@ impl Client {
                     );
                     return Ok(ConnectOutcome::Fatal(msg));
                 }
-                Err(e) => return Err(anyhow::anyhow!(e)),
+                Ok(Err(e)) => return Err(anyhow::anyhow!(e)),
+                Err(_) => {
+                    tracing::warn!("control TLS handshake timeout");
+                    return Err(anyhow::anyhow!("control TLS handshake timeout"));
+                }
             }
         } else {
             Box::new(stream)
@@ -267,6 +284,7 @@ impl Client {
             tls,
             work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
             work_conn_token: Mutex::new(None),
+            inflight_work: Mutex::new(HashSet::new()),
             metrics: self.metrics.clone(),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
@@ -287,20 +305,46 @@ impl Client {
         match tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT), login_orx).await {
             Ok(Ok(resp)) => {
                 if resp.ok {
-                    *state.work_conn_tls.lock() = resp
-                        .work_conn_tls
-                        .unwrap_or(self.config.client.work_conn_tls);
+                    // 服务端的 work_conn_tls 偏好可以覆盖客户端配置；若服务端要求
+                    // TLS 而客户端没有可用 TLS 配置，必须立即失败并说明原因，
+                    // 否则登录/注册都成功、所有工作连接却静默失败。
+                    let work_tls = match resolve_work_tls(
+                        resp.work_conn_tls,
+                        self.config.client.work_conn_tls,
+                        state.tls.is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(msg) => {
+                            tracing::error!(
+                                error = msg,
+                                "login rejected: unusable TLS configuration"
+                            );
+                            ctrl.abort();
+                            let _ = ctrl.await;
+                            return Ok(ConnectOutcome::Fatal(msg.into()));
+                        }
+                    };
+                    *state.work_conn_tls.lock() = work_tls;
                     *state.work_conn_token.lock() = resp.work_conn_token.clone();
+                    // 协商结果回传（DESIGN §6.4）：旧服务端不填该字段时按“沿用自己声明的版本”处理。
+                    let negotiated = resp.protocol_version.unwrap_or(PROTOCOL_VERSION);
+                    if negotiated != PROTOCOL_VERSION {
+                        // 服务端协商到了不同版本：本次连接仍可用，但语义可能不同，值得留痕。
+                        tracing::warn!(
+                            server_version = negotiated,
+                            client_version = PROTOCOL_VERSION,
+                            "server negotiated a different protocol version"
+                        );
+                    } else {
+                        tracing::debug!(version = negotiated, "protocol version negotiated");
+                    }
                     self.metrics.set_connected(true);
                 }
                 if !resp.ok {
                     let reason = resp.error.clone().unwrap_or_else(|| "auth failed".into());
-                    let lower = reason.to_lowercase();
                     // 服务端对鉴权失败不回显 error（DESIGN §10.2）；此时按致命错误处理，不重连。
-                    if resp.error.is_none()
-                        || lower.contains("version mismatch")
-                        || lower.contains("auth failed")
-                    {
+                    // 限速等临时拒绝必须带 error（如 "rate limited"），走可重连路径。
+                    if login_rejection_is_fatal(&resp) {
                         tracing::error!(error = %reason, "login fatal; not reconnecting");
                         // 中止控制任务：服务端若未主动断开，await 会永久挂住导致进程无法退出。
                         ctrl.abort();
@@ -340,6 +384,10 @@ impl Client {
                 RegisterOutcome::Persistent => persistent.push(p.clone()),
                 RegisterOutcome::Failed => {}
                 RegisterOutcome::ConnLost => {
+                    // 注册阶段控制连接已断：统一收尾，避免状态端点继续显示已连接。
+                    ctrl.abort();
+                    let _ = ctrl.await;
+                    self.metrics.set_connected(false);
                     anyhow::bail!(
                         "control connection closed or congested during proxy registration"
                     )
@@ -379,12 +427,33 @@ impl Client {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::File::create(&path) {
-            Ok(mut f) => {
-                let _ = std::io::Write::write_all(&mut f, rid.as_bytes());
-                set_file_mode_0600(&path);
+        // 先写同目录临时文件，设置 0600 后再原子 rename，避免写到一半留下
+        // 空/截断的 run_id 文件，也避免权限设置在明文写入之后才生效。
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("run_id");
+        let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, rid.as_bytes())
+        })();
+        match written {
+            Ok(()) => {
+                set_file_mode_0600(&tmp);
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    // Windows 上目标已存在时 rename 可能失败；退化为先删后改名。
+                    let _ = std::fs::remove_file(&path);
+                    if let Err(e2) = std::fs::rename(&tmp, &path) {
+                        tracing::warn!(error = %e2, first_error = %e, "failed to persist run_id");
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
             }
-            Err(e) => tracing::warn!(error = %e, "failed to persist run_id"),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write run_id temp file");
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
         rid
     }
@@ -414,6 +483,35 @@ async fn wait_for_reconnect(backoff: Duration, shutdown: &CancellationToken) -> 
 /// 时重置；否则保持退避增长，避免"建立即断开"场景下的 1s 重连风暴。
 fn should_reset_backoff(connected: bool, lived: Duration) -> bool {
     connected && lived >= Duration::from_secs(MIN_STABLE_CONNECTION_SECS)
+}
+
+/// 解析本次会话是否使用工作连接 TLS，并确认客户端具备 TLS 配置。
+///
+/// 服务端偏好优先（DESIGN §6.5）；但“要求 TLS”必须有可用的 `ClientTls`，
+/// 否则登录成功后所有工作连接都会失败，属于配置错误，应快速致命退出。
+fn resolve_work_tls(
+    server_preference: Option<bool>,
+    client_default: bool,
+    tls_configured: bool,
+) -> std::result::Result<bool, &'static str> {
+    let use_tls = server_preference.unwrap_or(client_default);
+    if use_tls && !tls_configured {
+        return Err(
+            "server requires work connection TLS, but client TLS is not configured \
+             (set tls_server_name/tls_ca or enable client TLS)",
+        );
+    }
+    Ok(use_tls)
+}
+
+/// 登录拒绝是否属于不可重试的致命错误。
+fn login_rejection_is_fatal(resp: &LoginResp) -> bool {
+    let lower = resp.error.as_deref().unwrap_or("").to_ascii_lowercase();
+    resp.error.is_none()
+        || lower.contains("version mismatch")
+        || lower.contains("auth failed")
+        // 服务端要求 TLS 而客户端未启用：属于配置错误，重试不会自愈。
+        || lower.contains("tls required")
 }
 
 /// Unix 下将 run_id 文件权限设为 0600；其他平台静默跳过（§6.6）。
@@ -518,7 +616,15 @@ fn registration_hint(code: Option<ProxyError>) -> &'static str {
 
 /// 工作连接池预热（pool_size>0，§8.2）：按池大小预建工作连接，命中后由服务端补充。
 fn spawn_preheat(state: &Arc<ClientState>, p: &ClientProxy) {
-    for _ in 0..p.pool_size {
+    // 服务端当前明确拒绝 UDP 的 work_id=0 池化连接（见 rfrps/src/work.rs）；
+    // 预热 UDP 只会建立一条注定被关闭的连接，因此直接跳过。
+    // DESIGN §8.2/§9.4 若未来决定支持 UDP 池化，再移除此分支。
+    if p.r#type == ProxyType::Udp {
+        return;
+    }
+    // 配置校验已拒绝超过 POOL_SIZE_MAX 的值；这里再兜底，避免绕过校验的调用方
+    // （库使用/测试）触发连接风暴。
+    for _ in 0..p.pool_size.min(POOL_SIZE_MAX) {
         let req = ReqWorkConn {
             proxy_name: p.name.clone(),
             work_id: WORK_ID_POOL_RESERVED,
@@ -597,10 +703,10 @@ async fn retry_loop(
                     state.metrics.inc_proxy_register_retry_success();
                     tracing::info!(proxy = %p.name, round, "proxy registered after retry");
                 }
-                // 本列表里的代理已被判定为"值得重试"：任何失败都留到下一轮。
-                RegisterOutcome::Retryable
-                | RegisterOutcome::Persistent
-                | RegisterOutcome::Failed => still.push(p),
+                // Retryable/Persistent 留到下一轮；Failed 是纯客户端配置错误，
+                // 继续重试只会刷日志和拖延时间，直接放弃。
+                RegisterOutcome::Retryable | RegisterOutcome::Persistent => still.push(p),
+                RegisterOutcome::Failed => {}
                 RegisterOutcome::ConnLost => return,
             }
         }
@@ -644,6 +750,7 @@ pub(crate) fn test_state(
         tls: None,
         work_conn_tls: Mutex::new(work_conn_tls),
         work_conn_token: Mutex::new(None),
+        inflight_work: Mutex::new(HashSet::new()),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     })
 }

@@ -403,6 +403,15 @@ async fn handle_connection(
         .peer_addr()
         .map(|a| a.ip())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    // 首帧握手阶段（peek/TLS/首帧读取）尚未认证，单独限流：
+    // 防止大量半开连接在该阶段长时间占用任务/套接字。
+    let handshake_guard = match state.begin_handshake() {
+        Some(g) => g,
+        None => {
+            tracing::warn!(%peer_ip, "too many pending handshakes; closing");
+            return Ok(());
+        }
+    };
     // peek 也必须有超时：连接后不发任何字节的对端（端口扫描、半开连接）会
     // 永久挂住一个任务与套接字；10s 内无首字节直接关闭。
     let mut first = [0u8; 1];
@@ -456,10 +465,15 @@ async fn handle_connection(
         }
     };
 
+    // 首帧已读完：后续是认证/长连接阶段，不再占用握手许可。
+    drop(handshake_guard);
+
     match frame.msg_type {
         MSG_LOGIN => {
             if config.server.tls_enable && !is_tls {
                 tracing::warn!("plaintext login rejected: tls_enable=true");
+                // 给明文客户端一个明确的可诊断错误，避免它只看到 EOF 后无限退避重连。
+                control::reject_login(stream, Some("tls required")).await?;
                 return Ok(());
             }
             if !config.server.tls_enable && is_tls {

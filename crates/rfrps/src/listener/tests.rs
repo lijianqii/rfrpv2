@@ -29,6 +29,14 @@ use crate::control::{test_entry, test_session};
 
 use rfrp_common::testutil::free_port;
 
+/// 把测试会话登记为当前会话：`register_proxy` 会校验会话仍有效。
+fn register_test_session(state: &Arc<ServerState>, session: &Arc<Session>) {
+    state
+        .sessions
+        .lock()
+        .insert(session.run_id.clone(), session.clone());
+}
+
 #[test]
 fn next_work_id_starts_at_one_and_increments() {
     let state = ServerState::new();
@@ -41,6 +49,7 @@ fn next_work_id_starts_at_one_and_increments() {
 async fn register_udp_port_not_allowed_rejected() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("5000-5001");
     let np = NewProxy {
         proxy_name: "p".into(),
@@ -53,9 +62,50 @@ async fn register_udp_port_not_allowed_rejected() {
 }
 
 #[tokio::test]
+async fn register_rejects_remote_port_zero() {
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+    let np = NewProxy {
+        proxy_name: "p".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(0),
+        custom_domains: None,
+    };
+    assert_eq!(
+        register_proxy(&np, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::InvalidField
+    );
+}
+
+#[tokio::test]
+async fn register_rejects_invalid_domain() {
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+    let np = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["bad_domain".into()]),
+    };
+    assert_eq!(
+        register_proxy(&np, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::InvalidField
+    );
+}
+
+#[tokio::test]
 async fn register_rejects_missing_remote_port() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "p".into(),
@@ -73,6 +123,7 @@ async fn register_rejects_missing_remote_port() {
 async fn register_rejects_port_not_allowed() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     // 仅允许 5000-5001，注册 18080 应被拒。
     let cfg = test_config("5000-5001");
     let np = NewProxy {
@@ -91,6 +142,7 @@ async fn register_rejects_port_not_allowed() {
 async fn register_ok_then_duplicate_name_rejected() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np1 = NewProxy {
         proxy_name: "p".into(),
@@ -113,9 +165,72 @@ async fn register_ok_then_duplicate_name_rejected() {
 }
 
 #[tokio::test]
+async fn register_rejects_same_name_in_another_session() {
+    // DESIGN §6.6：proxy_name 全局唯一，第二个会话不能用同名顶掉第一个。
+    let state = ServerState::new();
+    let a = test_session("ra");
+    let b = test_session("rb");
+    register_test_session(&state, &a);
+    register_test_session(&state, &b);
+    let cfg = test_config("");
+
+    let np_a = NewProxy {
+        proxy_name: "shared".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert!(register_proxy(&np_a, &a, &state, &cfg).await.is_ok());
+
+    let np_b = NewProxy {
+        proxy_name: "shared".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    let err = register_proxy(&np_b, &b, &state, &cfg).await.unwrap_err();
+    assert_eq!(err, ProxyError::NameExists);
+    assert!(state.session_for_proxy("shared").is_some());
+}
+
+#[tokio::test]
+async fn bind_failure_releases_name_and_domain_reservations() {
+    // 预留发生在 bind 之前；bind 失败必须回滚，否则同名/同域名永远无法重试。
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let np = NewProxy {
+        proxy_name: "p".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(occupied_port),
+        custom_domains: None,
+    };
+    assert_eq!(
+        register_proxy(&np, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::PortOccupied
+    );
+
+    // 同名 + 新端口应能成功（说明 proxy_index 已回滚）。
+    let retry = NewProxy {
+        proxy_name: "p".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert!(register_proxy(&retry, &session, &state, &cfg).await.is_ok());
+}
+
+#[tokio::test]
 async fn register_rejects_occupied_port() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     // 先占用一个端口。
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -138,6 +253,7 @@ async fn pooled_work_connection_registered() {
     // work_id=0 的工作连接应归入会话池，供用户连接命中（§8.2）。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     state
         .sessions
         .lock()
@@ -179,6 +295,7 @@ async fn pooled_work_connection_registered() {
 async fn register_udp_missing_remote_port_rejected() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "p".into(),
@@ -193,6 +310,7 @@ async fn register_udp_missing_remote_port_rejected() {
 async fn register_udp_proxy_ok() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "dns".into(),
@@ -211,6 +329,7 @@ async fn register_udp_proxy_ok() {
 async fn register_http_proxy_registers_domains() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "web".into(),
@@ -238,6 +357,7 @@ async fn register_http_proxy_normalizes_domain_case() {
     // 大小写不同的同名域名必须按冲突处理，不能绕过 §6.6 的全局唯一约束。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     state
         .sessions
         .lock()
@@ -284,6 +404,7 @@ async fn register_tcp_with_conflicting_domain_rejected() {
     // 用户只看到 404，且注册方毫无察觉）。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     // 域名查重走全局会话表（生产路径由登录时登记），此处按同样方式登记。
     state
         .sessions
@@ -325,6 +446,7 @@ async fn register_http_duplicate_name_rejected() {
     // 与 TCP/UDP 一致：同名 vhost 代理拒绝，不静默覆盖旧条目（§6.6）。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np1 = NewProxy {
         proxy_name: "web".into(),
@@ -356,6 +478,7 @@ async fn register_http_duplicate_name_rejected() {
 async fn register_https_proxy_registers_domains() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "web".into(),
@@ -403,6 +526,7 @@ async fn register_http_domain_conflict_rejected() {
 async fn register_vhost_without_domains_rejected() {
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     let np = NewProxy {
         proxy_name: "web".into(),
@@ -466,6 +590,7 @@ async fn pooled_work_conn_without_token_rejected() {
     // 未携带 work_conn_token 的工作连接不得进入预热池（防池注入/中间人）。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     state
         .sessions
         .lock()
@@ -510,6 +635,7 @@ async fn pending_work_conn_proxy_name_mismatch_rejected() {
     // 合法 token 但 proxy_name 与 pending 项不一致：不得认领该用户连接。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     state
         .sessions
         .lock()
@@ -563,6 +689,7 @@ async fn register_rejects_beyond_proxy_limit() {
     // 单会话代理数上限：认证客户端也不得无限占用端口/内存。
     let state = ServerState::new();
     let session = test_session("r");
+    register_test_session(&state, &session);
     let cfg = test_config("");
     for i in 0..MAX_PROXIES_PER_SESSION {
         session

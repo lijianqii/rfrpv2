@@ -64,6 +64,46 @@ fn new_fails_fast_when_tls_required_but_unconfigurable() {
 }
 
 #[test]
+fn work_tls_override_requires_client_tls_config() {
+    // 服务端要求工作连接 TLS，但客户端连 ClientTls 都没构建：必须快速失败，
+    // 不能“登录成功、所有工作连接静默失败”。
+    assert!(resolve_work_tls(Some(true), false, false).is_err());
+    assert!(resolve_work_tls(Some(true), false, true).unwrap());
+    assert!(!resolve_work_tls(Some(false), true, true).unwrap());
+    assert!(!resolve_work_tls(None, false, false).unwrap());
+}
+
+#[test]
+fn rate_limited_login_is_not_fatal() {
+    let resp = rfrp_common::protocol::msg::LoginResp {
+        ok: false,
+        error: Some("rate limited".into()),
+        ..Default::default()
+    };
+    assert!(
+        !login_rejection_is_fatal(&resp),
+        "rate limit must trigger reconnect, not process exit"
+    );
+
+    let auth = rfrp_common::protocol::msg::LoginResp {
+        ok: false,
+        error: None,
+        ..Default::default()
+    };
+    assert!(login_rejection_is_fatal(&auth), "auth failure is fatal");
+
+    let tls_required = rfrp_common::protocol::msg::LoginResp {
+        ok: false,
+        error: Some("tls required".into()),
+        ..Default::default()
+    };
+    assert!(
+        login_rejection_is_fatal(&tls_required),
+        "TLS configuration mismatch is fatal"
+    );
+}
+
+#[test]
 fn run_id_empty_file_regenerates() {
     // 文件存在但内容为空/空白：应重新生成非空 run_id（§6.6）。
     let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));

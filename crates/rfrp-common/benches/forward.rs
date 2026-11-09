@@ -33,7 +33,7 @@ fn bench_frame_encode_decode(c: &mut Criterion) {
 /// 真实桥接吞吐：loopback TCP 上 1 MiB 单向穿过 `bridge()`。
 ///
 /// 用真实 socket（而非 duplex）才能反映缓冲大小对 read/write 系统调用
-/// 次数的影响；对比 8 KiB（tokio 默认）与 `BRIDGE_BUF_SIZE`（32 KiB）。
+/// 次数的影响；对比 8 KiB（tokio 默认）与 `BRIDGE_BUF_SIZE`（64 KiB）。
 async fn tcp_pair() -> std::io::Result<(TcpStream, TcpStream)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

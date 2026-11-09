@@ -30,7 +30,7 @@ pub struct Cli {
 pub enum Commands {
     /// 以服务端模式运行（公网监听，接受客户端隧道）
     Server {
-        /// 配置文件路径（必填，或与字段参数组合）
+        /// 配置文件路径（必填；字段参数仅用于覆盖配置）
         #[arg(short, long)]
         config: Option<PathBuf>,
         /// 覆盖 `bind_addr` + `bind_port`
@@ -54,7 +54,7 @@ pub enum Commands {
     },
     /// 以客户端模式运行（主动连接服务端，暴露本地服务）
     Client {
-        /// 配置文件路径（必填，或与字段参数组合）
+        /// 配置文件路径（必填；字段参数仅用于覆盖配置）
         #[arg(short, long)]
         config: Option<PathBuf>,
         /// 覆盖 `server_addr` + `server_port`

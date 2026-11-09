@@ -13,14 +13,17 @@ use crate::protocol::msg::{Close, Message};
 pub const CONTROL_SEND_TIMEOUT: u64 = 5;
 
 /// 发送 Close 帧并关闭底层写端（发 close_notify）。
-pub async fn graceful_close<W>(writer: &mut FramedWrite<W, FrameCodec>, reason: &str)
+///
+/// `version` 是本次会话协商出的协议版本（DESIGN §6.4）：Close 帧必须与会话内
+/// 其余帧用同一版本，否则对端的帧解码器会因版本不符而拒收。
+pub async fn graceful_close<W>(writer: &mut FramedWrite<W, FrameCodec>, reason: &str, version: u8)
 where
     W: AsyncWrite + Unpin,
 {
     if let Ok(frame) = Message::Close(Close {
         reason: Some(reason.into()),
     })
-    .to_frame()
+    .to_frame_with_version(version)
     {
         let _ = writer.send(frame).await;
     }
@@ -43,6 +46,7 @@ pub async fn send_with_timeout(tx: &mpsc::Sender<Message>, msg: Message) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::PROTOCOL_VERSION;
     use crate::protocol::msg::{Heartbeat, Message};
     use tokio::io::duplex;
     use tokio::io::AsyncReadExt;
@@ -88,7 +92,7 @@ mod tests {
         // graceful_close 应写出一帧 Close，随后 shutdown 写端（对端读到 EOF）。
         let (a, b) = duplex(1024);
         let mut framed = FramedWrite::new(a, FrameCodec);
-        graceful_close(&mut framed, "test reason").await;
+        graceful_close(&mut framed, "test reason", PROTOCOL_VERSION).await;
 
         let mut reader = tokio::io::BufReader::new(b);
         let mut buf = Vec::new();

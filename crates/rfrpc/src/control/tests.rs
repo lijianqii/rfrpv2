@@ -42,6 +42,27 @@ fn default_state() -> Arc<ClientState> {
     )
 }
 
+#[test]
+fn inflight_work_requests_are_deduplicated() {
+    let state = default_state();
+    assert!(claim_inflight(&state, "web", 1));
+    assert!(
+        !claim_inflight(&state, "web", 1),
+        "same (proxy, work_id) must be ignored while in flight"
+    );
+    assert!(claim_inflight(&state, "web", 2));
+
+    // work_id=0 是池补充，允许多次。
+    assert!(claim_inflight(&state, "web", 0));
+    assert!(claim_inflight(&state, "web", 0));
+
+    release_inflight(&state, "web", 1);
+    assert!(
+        claim_inflight(&state, "web", 1),
+        "after the first task finishes, a retry must be allowed"
+    );
+}
+
 #[tokio::test]
 async fn dead_write_side_triggers_heartbeat_disconnect() {
     // 回归：写侧已死但读侧静默时，心跳看门狗必须判定连接失效并结束控制循环，让上层重连。
@@ -170,6 +191,46 @@ async fn reqworkconn_keeps_loop_alive() {
 }
 
 #[tokio::test]
+async fn future_heartbeat_resp_does_not_suppress_timeout() {
+    // 客户端侧同理：超前的 HeartbeatResp 不得推进 pong_ts。
+    let (client_end, server_end) = duplex(8192);
+    let (_tx, rx) = mpsc::channel::<Message>(64);
+    let task = tokio::spawn(control_loop(
+        client_end,
+        rx,
+        default_state(),
+        ClientConfig::default(),
+        CancellationToken::new(),
+        Duration::from_millis(30),
+        Duration::from_millis(80),
+    ));
+
+    let (sr, sw) = split(server_end);
+    let mut sr = FramedRead::new(sr, FrameCodec);
+    let mut sw = FramedWrite::new(sw, FrameCodec);
+    let _ = recv_msg(&mut sr).await; // Login
+    let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut sr))
+        .await
+        .expect("heartbeat");
+    if let Message::Heartbeat(h) = hb {
+        send_msg(
+            &mut sw,
+            Message::HeartbeatResp(HeartbeatResp {
+                ts: h.ts.saturating_add(10_000),
+            }),
+        )
+        .await;
+    }
+
+    let res = tokio::time::timeout(Duration::from_secs(3), task).await;
+    assert!(
+        res.is_ok(),
+        "future heartbeat resp must not suppress the client timeout"
+    );
+    res.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn close_exits() {
     let (client_end, server_end) = duplex(8192);
     let (_tx, rx) = mpsc::channel::<Message>(64);
@@ -265,6 +326,7 @@ async fn login_resp_routed_to_state() {
             session_id: None,
             work_conn_tls: None,
             work_conn_token: None,
+            protocol_version: None,
         }),
     )
     .await;

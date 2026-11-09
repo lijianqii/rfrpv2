@@ -79,7 +79,17 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     };
     // 优雅退出宽限期可由 CLI 覆盖（配置文件为 [server].grace_secs，见 §14.4）。
     let server = match args.grace_secs {
-        Some(g) => server.with_grace(Duration::from_secs(g)),
+        Some(g) => {
+            // CLI 覆盖发生在配置校验之后，必须在这里重复上限校验。
+            if g > rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS {
+                eprintln!(
+                    "invalid --grace-secs {g}: max is {}",
+                    rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS
+                );
+                return ExitCode::FAILURE;
+            }
+            server.with_grace(Duration::from_secs(g))
+        }
         None => server,
     };
     tracing::info!(addr = %server.local_addr(), "rfrps listening");
@@ -178,7 +188,19 @@ pub async fn run_status(config: PathBuf, addr: Option<String>) -> ExitCode {
 }
 
 /// 极简 HTTP GET：连接状态端点、读完整响应、校验 200 后返回 body。
+///
+/// 整体加超时：端点无响应时 `client status` 不应永久挂起。
 async fn fetch_status(addr: &str) -> std::io::Result<String> {
+    match tokio::time::timeout(Duration::from_secs(5), fetch_status_inner(addr)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "status request timed out",
+        )),
+    }
+}
+
+async fn fetch_status_inner(addr: &str) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(addr).await?;

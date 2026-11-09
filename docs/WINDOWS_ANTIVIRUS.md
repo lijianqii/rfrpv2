@@ -23,7 +23,7 @@
 - **应用清单**：`rfrp.manifest.xml` 声明 `asInvoker`（不请求管理员权限，避免 UAC 弹窗）、
   Windows 10/11 兼容性与 DPI 感知。
 - **程序图标**：`rfrp.ico`（16/32/48 三尺寸），生成脚本 `scripts/gen-windows-icon.py`。
-- **构建配置**：release 已启用 `strip`、`lto = "fat"`、`panic = "abort"`。
+- **构建配置**：release 已启用 `strip`、`lto = "fat"`；保留 `panic = "unwind"`（默认），使单个连接任务的 panic 不会终止整个进程。
 
 以上元数据能显著降低"无签名 / 无元数据"类启发式误报，但**无法消除**基于功能特征的
 `HackTool` 归类——只要二进制具备隧道/反代能力，杀软就可能按特征库匹配。

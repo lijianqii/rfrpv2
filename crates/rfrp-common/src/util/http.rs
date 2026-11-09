@@ -107,11 +107,16 @@ where
             return Ok(None);
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        // 找到终止符时按“头部实际长度”判断上限：同一次 read 可能已经读入了
+        // body 字节，不能用总缓冲长度误判合法请求头。
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            if pos + 4 > MAX_REQUEST_HEAD {
+                return Ok(None);
+            }
             return Ok(Some(buf));
         }
         if buf.len() > MAX_REQUEST_HEAD {
-            return Ok(Some(buf));
+            return Ok(None);
         }
     }
 }
@@ -182,15 +187,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_head_returned_as_is() {
+    async fn oversized_head_rejected() {
         let (mut client, mut server) = duplex(64 * 1024);
         let payload = vec![b'a'; MAX_REQUEST_HEAD + 100];
         client.write_all(&payload).await.unwrap();
         let head = read_request_head(&mut server, Duration::from_secs(2))
             .await
-            .unwrap()
             .unwrap();
-        assert!(head.len() > MAX_REQUEST_HEAD);
+        assert!(head.is_none(), "oversized request head must be rejected");
     }
 
     #[tokio::test]

@@ -42,6 +42,16 @@ impl RateLimiter {
         } else {
             if m.len() >= MAX_ENTRIES {
                 m.retain(|_, (_, start)| now.duration_since(*start) < self.window);
+                // 若仍满（窗口内活跃 IP 过多），淘汰最早条目；否则表会无界增长。
+                if m.len() >= MAX_ENTRIES {
+                    if let Some(oldest) = m
+                        .iter()
+                        .min_by_key(|(_, (_, start))| *start)
+                        .map(|(ip, _)| *ip)
+                    {
+                        m.remove(&oldest);
+                    }
+                }
             }
             m.insert(ip, (1, now));
             true
@@ -52,6 +62,7 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn blocks_after_limit_and_resets_after_window() {
@@ -68,6 +79,18 @@ mod tests {
 
         // 不同 IP 不受影响。
         assert!(limiter.allow("127.0.0.2".parse().unwrap(), now));
+    }
+
+    #[test]
+    fn evicts_oldest_when_all_entries_are_active() {
+        // 窗口内活跃 IP 达到上限时，新 IP 仍可插入，但表大小不得继续增长。
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        for i in 0..=MAX_ENTRIES {
+            let ip = IpAddr::from(Ipv4Addr::from(i as u32 + 1));
+            assert!(limiter.allow(ip, now));
+        }
+        assert!(limiter.inner.lock().len() <= MAX_ENTRIES);
     }
 
     #[test]

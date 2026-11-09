@@ -171,3 +171,26 @@ async fn dashboard_form_login_grants_cookie_session() {
 
     srv.abort();
 }
+
+#[tokio::test]
+async fn dashboard_session_cookie_has_expiry_and_flags() {
+    // 登录下发的会话 Cookie 必须带 Max-Age / HttpOnly / SameSite=Strict，
+    // 且默认不标 Secure（Dashboard 走明文 HTTP 时标了浏览器就不回传）。
+    let port = free_port();
+    let (srv, _addr) = start_server(dashboard_config(port)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (status, resp) = http_post_form(port, "/login", "user=admin&password=secret123").await;
+    assert_eq!(status, 302, "successful login should redirect: {resp}");
+
+    let set_cookie = resp
+        .lines()
+        .find(|l| l.starts_with("Set-Cookie: "))
+        .expect("Set-Cookie header present");
+    assert!(set_cookie.contains("Max-Age="), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+    assert!(!set_cookie.contains("Secure"), "{set_cookie}");
+
+    srv.abort();
+}

@@ -238,6 +238,7 @@ fn dashboard_port_conflict_rejected() {
             addr: "127.0.0.1:7000".into(),
             user: "admin".into(),
             password: "secret123".into(),
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -256,6 +257,7 @@ fn dashboard_nonloopback_valid_but_warns() {
             addr: "0.0.0.0:7500".into(),
             user: "admin".into(),
             password: "secret123".into(),
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -279,6 +281,7 @@ fn dashboard_validate_rules() {
         addr: "0.0.0.0:7500".into(),
         user: "admin".into(),
         password: "secret".into(),
+        ..Default::default()
     };
     assert!(d.validate().is_ok());
 
@@ -286,6 +289,7 @@ fn dashboard_validate_rules() {
         addr: "0.0.0.0:7500".into(),
         user: "admin".into(),
         password: "123".into(),
+        ..Default::default()
     };
     assert!(weak.validate().is_err());
 
@@ -293,8 +297,40 @@ fn dashboard_validate_rules() {
         addr: "not-an-addr".into(),
         user: "a".into(),
         password: "secret".into(),
+        ..Default::default()
     };
     assert!(bad_addr.validate().is_err());
+}
+
+#[test]
+fn dashboard_session_ttl_bounds_enforced() {
+    // 会话有效期必须在合理区间内（防止 0 = 立即过期、或配置成天文数字）。
+    let base = || DashboardSection {
+        addr: "127.0.0.1:7500".into(),
+        user: "admin".into(),
+        password: "secret123".into(),
+        ..Default::default()
+    };
+    let mut d = base();
+    d.session_ttl_secs = Some(3600);
+    assert!(d.validate().is_ok());
+
+    let mut too_small = base();
+    too_small.session_ttl_secs = Some(0);
+    assert!(too_small.validate().is_err());
+
+    let mut too_large = base();
+    too_large.session_ttl_secs = Some(u64::MAX);
+    assert!(too_large.validate().is_err());
+
+    // 缺省（None）时使用默认常量，校验通过。
+    let mut unset = base();
+    unset.session_ttl_secs = None;
+    assert!(unset.validate().is_ok());
+    assert_eq!(
+        unset.session_ttl(),
+        crate::constants::DASHBOARD_SESSION_TTL_SECS
+    );
 }
 
 /// 契约测试：完整服务端配置（含各段）能解析且内容正确。

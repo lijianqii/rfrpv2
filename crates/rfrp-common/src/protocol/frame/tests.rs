@@ -1,6 +1,9 @@
 //! 帧编解码单元测试。
 
 use super::*;
+use crate::constants::{
+    CONTROL_FRAME_MAX_PAYLOAD, FRAME_MAX_PAYLOAD, PROTOCOL_MIN_VERSION, PROTOCOL_VERSION,
+};
 use crate::protocol::msg::{Login, Message, MSG_LOGIN};
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,6 +52,18 @@ fn version_mismatch_rejected() {
 }
 
 #[test]
+fn version_in_supported_range_accepted() {
+    // 帧解码器接受支持区间内的版本（协商可能把会话降到较低版本）。
+    let mut buf = BytesMut::new();
+    buf.put_slice(&[PROTOCOL_MIN_VERSION, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    let frame = FrameCodec
+        .decode(&mut buf)
+        .unwrap()
+        .expect("in-range version accepted");
+    assert_eq!(frame.version, PROTOCOL_MIN_VERSION);
+}
+
+#[test]
 fn oversize_payload_rejected() {
     let f = Frame::new(
         PROTOCOL_VERSION,
@@ -58,6 +73,31 @@ fn oversize_payload_rejected() {
     let mut buf = BytesMut::new();
     let err = FrameCodec.encode(f, &mut buf).unwrap_err();
     assert!(matches!(err, Error::Protocol(_)));
+}
+
+#[test]
+fn control_frame_limit_rejects_oversize_header_early() {
+    // 控制帧上限低于绝对上限：只发头、声明超过控制上限时也必须立即拒绝，
+    // 避免未认证连接按声明长度预分配大缓冲。
+    let mut buf = BytesMut::new();
+    buf.put_u8(PROTOCOL_VERSION);
+    buf.put_u8(MSG_LOGIN);
+    buf.put_u32(CONTROL_FRAME_MAX_PAYLOAD + 1);
+    assert!(matches!(
+        FrameCodec.decode(&mut buf).unwrap_err(),
+        Error::Protocol(_)
+    ));
+}
+
+#[tokio::test]
+async fn read_one_frame_rejects_control_oversize_header_early() {
+    let (mut client, server) = duplex(64);
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header[0] = PROTOCOL_VERSION;
+    header[1] = MSG_LOGIN;
+    header[2..].copy_from_slice(&(CONTROL_FRAME_MAX_PAYLOAD + 1).to_be_bytes());
+    client.write_all(&header).await.unwrap();
+    assert!(read_one_frame(server).await.is_err());
 }
 
 #[test]

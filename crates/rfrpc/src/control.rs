@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use rfrp_common::config::ClientConfig;
-use rfrp_common::constants::PROTOCOL_VERSION;
+use rfrp_common::constants::{PROTOCOL_VERSION, WORK_ID_POOL_RESERVED};
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
@@ -50,7 +50,7 @@ where
                     let Some(msg) = msg else {
                         // 通道关闭且处于退出流程：补发 Close 再 close_notify。
                         if shutdown_writer.is_cancelled() {
-                            graceful_close(&mut writer, "client shutdown").await;
+                            graceful_close(&mut writer, "client shutdown", PROTOCOL_VERSION).await;
                         }
                         break;
                     };
@@ -79,7 +79,7 @@ where
                 }
                 _ = shutdown_writer.cancelled() => {
                     // 优雅退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
-                    graceful_close(&mut writer, "client shutdown").await;
+                    graceful_close(&mut writer, "client shutdown", PROTOCOL_VERSION).await;
                     break;
                 }
             }
@@ -109,9 +109,13 @@ where
     let pong = Arc::new(Notify::new());
     // 记录对端回传的最近心跳 ts：以"本轮是否被回应"判定超时，避免 Notify 许可残留漏检。
     let pong_ts = Arc::new(AtomicU64::new(0));
+    // 与服务端对称：只接受不超前于最近一次发送 ts 的 HeartbeatResp，
+    // 防止异常/恶意对端用未来时间戳永久绕过心跳超时。
+    let last_sent_ts = Arc::new(AtomicU64::new(0));
     let hb_tx = out_tx.clone();
     let hb_pong = pong.clone();
     let hb_pong_ts = pong_ts.clone();
+    let hb_last_sent = last_sent_ts.clone();
     let hb_disconnect = disconnect.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut iv = interval(heartbeat_interval);
@@ -119,6 +123,7 @@ where
         loop {
             iv.tick().await;
             let ts = now_ms();
+            hb_last_sent.store(ts, Ordering::Relaxed);
             // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
             // 说明控制写路径已不可用：此时等不到 pong，必须判定连接失效并重连。
             // 旧实现此处 `continue` 跳过本轮，会让看门狗在写侧已死时永不触发——
@@ -174,9 +179,23 @@ where
                                 }
                             }
                             Message::ReqWorkConn(r) => {
+                                // 服务端在 pending 窗口内会每 3s 重发同一 work_id。
+                                // 客户端按 (proxy_name, work_id) 去重：第一次连接还在
+                                // 建立/桥接时忽略重复请求，避免对本地服务产生额外连接。
+                                // work_id=0 是池补充语义，允许多次请求，不能去重。
+                                if !claim_inflight(&state, &r.proxy_name, r.work_id) {
+                                    tracing::debug!(
+                                        proxy = %r.proxy_name, work_id = r.work_id,
+                                        "duplicate work connection request ignored"
+                                    );
+                                    continue;
+                                }
                                 let st = state.clone();
+                                let pname = r.proxy_name.clone();
+                                let work_id = r.work_id;
                                 tokio::spawn(async move {
-                                    let _ = workconn::handle_work_conn(r, st).await;
+                                    let _ = workconn::handle_work_conn(r, st.clone()).await;
+                                    release_inflight(&st, &pname, work_id);
                                 });
                             }
                             Message::Heartbeat(h) => {
@@ -184,13 +203,21 @@ where
                                 try_send(&out_tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
                             }
                             Message::HeartbeatResp(h) => {
-                                // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
-                                let rtt = now_ms().saturating_sub(h.ts);
-                                state.metrics.set_rtt_ms(rtt);
-                                pong_ts.store(h.ts, Ordering::Relaxed);
-                                tracing::debug!(rtt_ms = rtt, "heartbeat response received");
-                                // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
-                                pong.notify_one();
+                                let sent = last_sent_ts.load(Ordering::Relaxed);
+                                if sent == 0 || h.ts > sent {
+                                    tracing::debug!(
+                                        ts = h.ts, sent,
+                                        "ignoring heartbeat response with invalid ts"
+                                    );
+                                } else {
+                                    // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
+                                    let rtt = now_ms().saturating_sub(h.ts);
+                                    state.metrics.set_rtt_ms(rtt);
+                                    pong_ts.store(h.ts, Ordering::Relaxed);
+                                    tracing::debug!(rtt_ms = rtt, "heartbeat response received");
+                                    // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
+                                    pong.notify_one();
+                                }
                             }
                             Message::LoginResp(r) => {
                                 // 路由到连接阶段，供 run() 区分致命 / 可恢复失败（§8.1）。
@@ -252,6 +279,29 @@ where
         writer_task.abort();
     }
     Ok(())
+}
+
+/// 标记一个按需工作连接请求正在处理；重复请求返回 false。
+///
+/// `work_id=0` 是池补充语义，允许多次请求，不做去重。
+fn claim_inflight(state: &Arc<ClientState>, proxy_name: &str, work_id: u64) -> bool {
+    if work_id == WORK_ID_POOL_RESERVED {
+        return true;
+    }
+    state
+        .inflight_work
+        .lock()
+        .insert((proxy_name.to_string(), work_id))
+}
+
+/// 工作连接任务结束后释放去重标记。
+fn release_inflight(state: &Arc<ClientState>, proxy_name: &str, work_id: u64) {
+    if work_id != WORK_ID_POOL_RESERVED {
+        state
+            .inflight_work
+            .lock()
+            .remove(&(proxy_name.to_string(), work_id));
+    }
 }
 
 #[cfg(test)]

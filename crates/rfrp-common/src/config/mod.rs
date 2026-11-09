@@ -28,11 +28,28 @@ pub use client::{ClientConfig, ClientProxy, ClientSection};
 pub use server::{DashboardSection, ProxySection, ServerConfig, ServerSection};
 
 use crate::constants::{
-    HEARTBEAT_INTERVAL, HEARTBEAT_MAX_SECS, HEARTBEAT_MIN_SECS, HEARTBEAT_TIMEOUT,
+    HEARTBEAT_INTERVAL, HEARTBEAT_MAX_SECS, HEARTBEAT_MIN_SECS, HEARTBEAT_TIMEOUT, MAX_DOMAIN_LEN,
 };
 use crate::error::{config, describe_io_error, Result};
 use serde::Deserialize;
 use std::path::Path;
+
+/// 域名格式校验（小写化后使用）：ASCII 字母/数字/连字符，标签 1-63 字节。
+///
+/// 服务端与客户端共用同一规则，避免客户端校验通过、服务端却接受畸形域名
+/// （或反之）。IDN/下划线域名当前不支持。
+pub fn is_valid_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
 
 /// 加载并校验服务端配置。
 pub fn load_server_config(path: &Path) -> Result<ServerConfig> {

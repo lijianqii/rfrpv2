@@ -25,6 +25,54 @@ fn tcp_proxy_parses() {
 }
 
 #[test]
+fn token_longer_than_protocol_limit_rejected() {
+    let token = "x".repeat(crate::constants::MAX_TOKEN_LEN + 1);
+    let toml = format!(
+        r#"
+        [client]
+        server_addr = "127.0.0.1"
+        server_port = 7000
+        token = "{token}"
+        work_conn_tls = false
+        "#
+    );
+    let cfg: ClientConfig = toml::from_str(&toml).unwrap();
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn tcp_proxy_rejects_remote_port_zero() {
+    let p = ClientProxy {
+        name: "ssh".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: 22,
+        remote_port: Some(0),
+        custom_domains: None,
+        pool_size: 1,
+    };
+    assert!(p.validate().is_err(), "remote_port=0 must be rejected");
+}
+
+#[test]
+fn pool_size_above_hard_max_is_rejected() {
+    let p = proxy(
+        r#"
+        name = "ssh"
+        type = "tcp"
+        local_ip = "127.0.0.1"
+        local_port = 22
+        remote_port = 6000
+        pool_size = 33
+    "#,
+    );
+    let err = p
+        .validate()
+        .expect_err("pool_size above hard max must fail");
+    assert!(err.to_string().contains("pool_size"), "{err}");
+}
+
+#[test]
 fn http_proxy_requires_domains() {
     let p = proxy(
         r#"

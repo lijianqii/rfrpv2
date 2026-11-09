@@ -318,8 +318,8 @@ mod tests {
             sessions.insert("r2".into(), s2.clone());
         }
         // 域名索引由注册路径维护；这里按同样方式登记（避免测试绕过真实路径的语义）。
-        state.index_domain("dev.example.com", "r1", "web");
-        state.index_domain("other.example.com", "r2", "web");
+        state.index_domain("dev.example.com", &s1, "web");
+        state.index_domain("other.example.com", &s2, "web");
 
         let (session, proxy) = state
             .session_for_domain("dev.example.com")
@@ -333,7 +333,7 @@ mod tests {
         assert!(state.session_for_domain("missing.example.com").is_none());
 
         // 会话清理后索引必须失效（否则会命中已注销的会话）。
-        state.unindex_domains(vec!["dev.example.com".to_string()]);
+        state.unindex_domains(vec!["dev.example.com".to_string()], &s1);
         assert!(state.session_for_domain("dev.example.com").is_none());
         assert!(state.session_for_domain("other.example.com").is_some());
     }
@@ -379,9 +379,9 @@ mod head_tests {
             .insert("web".into(), test_entry(ProxyType::Tcp));
         {
             let mut sessions = state.sessions.lock();
-            sessions.insert("r".into(), session);
+            sessions.insert("r".into(), session.clone());
         }
-        state.index_domain("dev.example.com", "r", "web");
+        state.index_domain("dev.example.com", &session, "web");
 
         let (mut a, b) = duplex(1024);
         a.write_all(b"x").await.unwrap();

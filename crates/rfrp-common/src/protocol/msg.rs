@@ -39,7 +39,10 @@ pub struct Login {
 }
 
 /// 登录结果（S→C）。`ok=false` 时 `session_id`/`work_conn_tls` 省略。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// 派生 `Default` 便于构造点只写关心的字段（新增可选字段时不必逐处修改）。
+/// 注意：默认值 `ok = false`，即“默认构造出来是一次拒绝”。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LoginResp {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +55,12 @@ pub struct LoginResp {
     /// `StartWorkConn` 必须携带，服务端据此校验工作连接归属（DESIGN §6.2.1/§8.2）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_conn_token: Option<String>,
+    /// 协商后的协议版本（DESIGN §6.4）。
+    ///
+    /// 服务端回传本次会话实际使用的版本，客户端据此确认双方语义一致。
+    /// 旧版服务端不填该字段时，客户端按“沿用自己声明的版本”处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u8>,
 }
 
 /// 注册单个代理（C→S）。DESIGN §6.2。
@@ -218,6 +227,14 @@ impl Message {
 
     /// 序列化为 `Frame`（填版本、MsgType，JSON 序列化 Payload）。
     pub fn to_frame(&self) -> Result<Frame> {
+        self.to_frame_with_version(PROTOCOL_VERSION)
+    }
+
+    /// 按指定协议版本编码为帧（版本协商用，DESIGN §6.4）。
+    ///
+    /// 服务端回给客户端的帧必须用**协商结果**编码：客户端的帧解码器只接受自己
+    /// 声明的版本区间，若服务端用更高的版本编码，低版本客户端会直接拒绝这些帧。
+    pub fn to_frame_with_version(&self, version: u8) -> Result<Frame> {
         let payload = match self {
             Message::Login(m) => serde_json::to_vec(m)?,
             Message::LoginResp(m) => serde_json::to_vec(m)?,
@@ -229,7 +246,7 @@ impl Message {
             Message::StartWorkConn(m) => serde_json::to_vec(m)?,
             Message::Close(m) => serde_json::to_vec(m)?,
         };
-        Ok(Frame::new(PROTOCOL_VERSION, self.msg_type(), payload))
+        Ok(Frame::new(version, self.msg_type(), payload))
     }
 
     /// 从 `Frame` 反序列化为 `Message`，按 `msg_type` 分发。
@@ -255,6 +272,7 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::PROTOCOL_MIN_VERSION;
 
     fn roundtrip(m: Message) {
         let frame = m.to_frame().unwrap();
@@ -281,6 +299,7 @@ mod tests {
             session_id: None,
             work_conn_tls: None,
             work_conn_token: None,
+            protocol_version: None,
         });
         let json = String::from_utf8(m.to_frame().unwrap().payload).unwrap();
         assert!(!json.contains("session_id"));
@@ -296,6 +315,7 @@ mod tests {
             session_id: None,
             work_conn_tls: None,
             work_conn_token: None,
+            protocol_version: None,
         });
         let json = String::from_utf8(m.to_frame().unwrap().payload).unwrap();
         assert!(json.contains("version mismatch"));
@@ -345,6 +365,17 @@ mod tests {
             reason: Some("shutdown".into()),
         }));
         roundtrip(Message::Close(Close { reason: None }));
+    }
+
+    #[test]
+    fn to_frame_with_version_sets_header() {
+        // 服务端回帧必须用协商结果编码（DESIGN §6.4）：低版本客户端只接受自己的版本。
+        let m = Message::Heartbeat(Heartbeat { ts: 7 });
+        let f = m.to_frame_with_version(PROTOCOL_MIN_VERSION).unwrap();
+        assert_eq!(f.version, PROTOCOL_MIN_VERSION);
+        // 默认编码用当前版本。
+        let f = m.to_frame().unwrap();
+        assert_eq!(f.version, PROTOCOL_VERSION);
     }
 
     #[test]

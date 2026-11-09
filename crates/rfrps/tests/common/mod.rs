@@ -38,6 +38,7 @@ pub fn dashboard_config(dashboard_port: u16) -> ServerConfig {
         addr: format!("127.0.0.1:{dashboard_port}"),
         user: "admin".into(),
         password: "secret123".into(),
+        ..Default::default()
     });
     cfg
 }

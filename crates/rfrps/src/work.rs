@@ -64,6 +64,15 @@ where
             return Ok(());
         }
         if let Some(proxy) = crate::udp::get_udp_proxy(&state, &proxy_name) {
+            // token 只证明“属于某个会话”，不能证明“这个 UDP 运行态属于该会话”。
+            // 全局 proxy_name 已唯一，这里再做一次 owner 校验作为纵深防御。
+            if proxy.owner_session_id != session.session_id {
+                tracing::warn!(
+                    %proxy_name, work_id,
+                    "udp work connection does not belong to this session"
+                );
+                return Ok(());
+            }
             return crate::udp::handle_udp_work_conn(proxy, work_id, Box::new(stream)).await;
         }
         return Ok(());
@@ -146,7 +155,7 @@ mod tests {
         let state = ServerState::new();
         let session = crate::control::test_session_with_token("r1", token).0;
         state.sessions.lock().insert("r1".into(), session.clone());
-        state.index_proxy("ssh", "r1");
+        assert!(state.reserve_proxy("ssh", &session));
         (state, session)
     }
 

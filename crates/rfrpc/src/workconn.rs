@@ -19,10 +19,22 @@ use rfrp_common::util::tcp::configure_tcp_stream;
 use rfrp_common::util::udp::{append_udp_frame, enlarge_recv_buffer, UdpFrameBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout_at, Duration};
 use tokio_util::codec::Framed;
 
 use crate::client::ClientState;
+
+/// 根据 local_ip 选择 UDP socket 的绑定地址。
+///
+/// 只识别 IP 字面量；域名仍由 `UdpSocket::connect` 解析，若域名解析到 IPv6
+/// 则仍可能失败（当前配置校验允许域名，但 UDP 本地 socket 未做多地址回退）。
+fn udp_bind_addr(local_ip: &str) -> &'static str {
+    let bare = local_ip.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => "[::]:0",
+        _ => "0.0.0.0:0",
+    }
+}
 
 pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Result<()> {
     let proxy = match state.proxies.get(&req.proxy_name) {
@@ -35,16 +47,14 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     };
 
     // 工作连接到服务端；根据 LoginResp 下发的偏好决定是否 TLS（DESIGN §6.5）。
-    // 本地总截止时间由 WORK_CONN_TIMEOUT_RFRPC 控制，避免悬挂。
-    let work = timeout(
-        Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
-        TcpStream::connect(state.server_addr),
-    )
-    .await
-    .map_err(|_| {
-        state.metrics.inc_work_conn_failure();
-        Error::Other("work connection connect timeout".into())
-    })??;
+    // 整个建连流程共用一个总截止时间，避免“每段都 8s”累计超过服务端 10s pending 窗口。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC);
+    let work = timeout_at(deadline, TcpStream::connect(state.server_addr))
+        .await
+        .map_err(|_| {
+            state.metrics.inc_work_conn_failure();
+            Error::Other("work connection connect timeout".into())
+        })??;
     if let Err(e) = configure_tcp_stream(&work) {
         tracing::warn!(proxy = %req.proxy_name, error = %e, "failed to configure work TCP stream");
     }
@@ -54,15 +64,12 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             state.metrics.inc_work_conn_failure();
             Error::Other("work_conn_tls enabled but client TLS not initialized".into())
         })?;
-        let tls_work = timeout(
-            Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
-            tls.connect(work),
-        )
-        .await
-        .map_err(|_| {
-            state.metrics.inc_work_conn_failure();
-            Error::Other("work connection TLS handshake timeout".into())
-        })??;
+        let tls_work = timeout_at(deadline, tls.connect(work))
+            .await
+            .map_err(|_| {
+                state.metrics.inc_work_conn_failure();
+                Error::Other("work connection TLS handshake timeout".into())
+            })??;
         Box::new(tls_work)
     } else {
         Box::new(work)
@@ -71,34 +78,58 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
 
     if proxy.r#type == ProxyType::Udp {
         // UDP：本地用 UDP socket，工作连接上按长度前缀分帧（DESIGN §8.6）。
-        let local = UdpSocket::bind("0.0.0.0:0").await?;
+        // 按 local_ip 的地址族选择绑定：IPv4 用 0.0.0.0，IPv6 字面量用 [::]，
+        // 否则 IPv6 本地服务会因地址族不匹配而 connect 失败。
+        let local = UdpSocket::bind(udp_bind_addr(&proxy.local_ip)).await?;
         // 用 `(host, port)` 元组形式：允许域名，且 IPv6 字面量无需手工加方括号。
-        if let Err(e) = local
-            .connect((proxy.local_ip.as_str(), proxy.local_port))
-            .await
+        match timeout_at(
+            deadline,
+            local.connect((proxy.local_ip.as_str(), proxy.local_port)),
+        )
+        .await
         {
-            state.metrics.inc_work_conn_failure();
-            tracing::warn!(
-                proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port, error = %e,
-                "local udp connect failed; closing work connection"
-            );
-            return Ok(());
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                state.metrics.inc_work_conn_failure();
+                tracing::warn!(
+                    proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port, error = %e,
+                    "local udp connect failed; closing work connection"
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                state.metrics.inc_work_conn_failure();
+                tracing::warn!(
+                    proxy = %req.proxy_name, local_ip = %proxy.local_ip, local_port = proxy.local_port,
+                    "local udp connect timeout; closing work connection"
+                );
+                return Ok(());
+            }
         }
         let work_conn_token = state.work_conn_token.lock().clone();
         // 本地服务回包（RDP 服务端 → 用户方向）也走这个 socket：突发时先由内核缓冲吸收。
         if let Err(e) = enlarge_recv_buffer(&local) {
             tracing::debug!(proxy = %req.proxy_name, error = %e, "failed to enlarge local udp recv buffer");
         }
-        framed
-            .send(
-                Message::StartWorkConn(StartWorkConn {
-                    proxy_name: req.proxy_name.clone(),
-                    work_id: req.work_id,
-                    work_conn_token,
-                })
-                .to_frame()?,
-            )
-            .await?;
+        let frame = Message::StartWorkConn(StartWorkConn {
+            proxy_name: req.proxy_name.clone(),
+            work_id: req.work_id,
+            work_conn_token,
+        })
+        .to_frame()?;
+        match timeout_at(deadline, framed.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                state.metrics.inc_work_conn_failure();
+                tracing::warn!(proxy = %req.proxy_name, error = %e, "udp start frame send failed");
+                return Ok(());
+            }
+            Err(_) => {
+                state.metrics.inc_work_conn_failure();
+                tracing::warn!(proxy = %req.proxy_name, "udp start frame send timeout");
+                return Ok(());
+            }
+        }
         let work_stream = framed.into_inner();
         state.metrics.inc_work_conn();
         tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "udp work connection established");
@@ -107,8 +138,8 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
 
     // 先回连本地服务，成功后再发 StartWorkConn。这样本地连接失败时不会让服务端把
     // 这条工作连接放入预热池，避免池中出现“死连接”（DESIGN §8.2 预建场景）。
-    let local = match timeout(
-        Duration::from_secs(WORK_CONN_TIMEOUT_RFRPC),
+    let local = match timeout_at(
+        deadline,
         TcpStream::connect((proxy.local_ip.as_str(), proxy.local_port)),
     )
     .await
@@ -139,16 +170,25 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     };
 
     let work_conn_token = state.work_conn_token.lock().clone();
-    framed
-        .send(
-            Message::StartWorkConn(StartWorkConn {
-                proxy_name: req.proxy_name.clone(),
-                work_id: req.work_id,
-                work_conn_token,
-            })
-            .to_frame()?,
-        )
-        .await?;
+    let frame = Message::StartWorkConn(StartWorkConn {
+        proxy_name: req.proxy_name.clone(),
+        work_id: req.work_id,
+        work_conn_token,
+    })
+    .to_frame()?;
+    match timeout_at(deadline, framed.send(frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            state.metrics.inc_work_conn_failure();
+            tracing::warn!(proxy = %req.proxy_name, error = %e, "start frame send failed");
+            return Ok(());
+        }
+        Err(_) => {
+            state.metrics.inc_work_conn_failure();
+            tracing::warn!(proxy = %req.proxy_name, "start frame send timeout");
+            return Ok(());
+        }
+    }
     // 首帧之后为透传字节，取回原始流（明文或 TLS）。
     let work_stream = framed.into_inner();
 
@@ -172,15 +212,27 @@ async fn udp_bridge(
     // 下行：一次 read 解析多帧（突发时内核里通常已排好多个完整帧）。
     let mut reader = UdpFrameBuf::new();
     let mut down: Vec<Bytes> = Vec::with_capacity(UDP_READ_BATCH);
+    let mut send_error_logged = false;
     loop {
         tokio::select! {
             r = reader.read_batch(&mut work_stream, &mut down, UDP_READ_BATCH) => {
                 match r {
                     Ok(n) if n > 0 => {
                         for d in &down {
-                            if let Err(e) = local.send(d).await {
-                                tracing::warn!(proxy = %req.proxy_name, error = %e, "udp send to local failed");
-                                break;
+                            // 与服务端 forward_to_client 的策略一致：单个数据报发送失败
+                            // 不应丢掉同批其余数据报（UDP 本身允许逐包丢失）。
+                            // 连续失败只记一条日志，避免刷屏。
+                            match local.send(d).await {
+                                Ok(_) => send_error_logged = false,
+                                Err(e) => {
+                                    if !send_error_logged {
+                                        tracing::warn!(
+                                            proxy = %req.proxy_name, error = %e,
+                                            "udp send to local failed"
+                                        );
+                                        send_error_logged = true;
+                                    }
+                                }
                             }
                         }
                     }

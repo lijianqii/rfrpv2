@@ -8,6 +8,18 @@
 
 ### Added
 
+- **Dashboard 会话 Cookie 有效期与 `Secure` 开关**：`[dashboard].session_ttl_secs`
+  （默认 8 小时，范围 1 分钟~30 天）给会话 Cookie 加上明确 `Max-Age`——此前 Cookie
+  没有过期时间，浏览器会话结束前一直可用；`[dashboard].cookie_secure = true` 给 Cookie
+  加 `Secure` 属性（把 Dashboard 放在 HTTPS 反向代理后面时用；默认关闭，因为明文 HTTP
+  下浏览器会拒绝回传带 `Secure` 的 Cookie）。
+- **逐会话 RTT**：`/api/status` 的每个会话现在各自给出 `rtt_ms`，看板的会话表也新增
+  "RTT" 列。此前只有一个全局 `rfrp_rtt_ms`，多会话时被"最后一个回包的会话"覆盖。
+- **协议版本协商机制**：服务端按支持区间 `[PROTOCOL_MIN_VERSION, PROTOCOL_VERSION]`
+  协商版本并经 `LoginResp.protocol_version` 回传；版本不符时错误信息带出客户端声明版本
+  与服务端支持列表，便于直接排障。错误前缀 `version mismatch` 保持不变。
+- **`make bench-gate`**：把 release-only 的 UDP 突发回归闸门做成独立目标
+  （`cargo test --release -p rfrpc --test udp_burst -- --ignored --nocapture`）。
 - **`--check` 配置校验模式**：`rfrp server -c x.toml --check` / `rfrp client -c x.toml --check`
   只加载、覆盖、校验配置并打印生效摘要（token 只显示"已设置 + 长度"，不打印明文），
   不监听端口、不建立连接，便于部署前与 CI 校验。
@@ -72,6 +84,14 @@
 
 ### Fixed
 
+- **控制连接断开后服务端资源延迟约 1 秒才释放**：`Session` 结构里持有一份出站通道的
+  `tx` 克隆，`drop(tx)` 并不会关闭通道，写任务的 `rx.recv()` 永远挂起——旧实现把会话
+  清理放在写任务 await **之后**，导致写任务只能等 1 秒硬超时被 abort，公网端口、代理监听
+  与预热池也随之多占用约 1 秒（客户端以不同 `run_id` 重连时会撞上 `port occupied`）。
+  现改为先注销会话并清理资源、再等写任务收尾，端口释放从 ~1020 ms 降到 ~20 ms。
+- **会话停止信号的 lost-wakeup**：服务端控制循环与写任务原先用 `Notify::notify_waiters()`
+  接收停止信号——该 API **不存储许可**，任务若未恰好处于等待状态就会永久丢失信号。
+  现改用 `CancellationToken`（`cancelled()` 每次 poll 都重新检查取消标志，天然免疫）。
 - **UDP 监听遇一次 `recv_from` 瞬时错误就永久停止**：Windows 上若此前的 `send_to` 引来
   ICMP port unreachable（例如客户端 UDP 端口已关闭），`recv_from` 会返回一次
   `WSAECONNRESET`，而 socket 之后仍可用；旧实现直接 `break`，导致该 UDP 代理静默失效

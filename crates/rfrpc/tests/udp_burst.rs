@@ -38,6 +38,7 @@ async fn udp_burst_drops_stay_bounded() {
         addr: format!("127.0.0.1:{dash_port}"),
         user: "admin".into(),
         password: "secret123".into(),
+        ..Default::default()
     });
     let (srv, addr) = start_server(server_cfg).await;
     let remote = free_port();

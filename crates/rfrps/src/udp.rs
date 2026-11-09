@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use rfrp_common::constants::{
-    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, UDP_READ_BATCH, UDP_RECV_BATCH,
-    UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
+    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, MAX_UDP_SESSIONS_PER_PROXY, UDP_READ_BATCH,
+    UDP_RECV_BATCH, UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
@@ -28,7 +28,10 @@ use crate::state::ServerState;
 /// 每个 UDP 代理保留的最大空闲包缓冲数。
 const UDP_PACKET_POOL_MAX: usize = 256;
 
-/// 服务端上行队列中的 UDP 数据报：持有从池中借出的缓冲，Drop 时归还。
+/// 服务端上行队列中的 UDP 数据报：持有从池中借出的缓冲。
+///
+/// 成功批量写入后由 [`recycle_packets`] 归还；通道满/写失败等丢弃路径随
+/// `UdpPacket` 一起释放，不进入池（避免为了归还而给 Drop 加锁）。
 pub struct UdpPacket {
     data: BytesMut,
 }
@@ -92,8 +95,13 @@ pub struct PendingUdp {
 
 /// 已配对的 UDP 会话。
 pub struct UdpSession {
+    /// 建立该会话的工作连接 ID：用于 handler 退出时判断条目是否仍属于自己，
+    /// 避免旧 handler 误删同一 client 的新会话（ABA）。
+    pub work_id: u64,
     pub tx: mpsc::Sender<UdpPacket>,
     pub last_active: Instant,
+    /// 会话级取消：sweep 超时/被新会话替换时中断可能阻塞的工作连接写/下行发送。
+    pub cancel: CancellationToken,
 }
 
 /// 单个 UDP 代理的运行状态（监听 socket + 会话表）。
@@ -106,6 +114,10 @@ pub struct UdpProxy {
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
     pub session_timeout: Duration,
     pub pending_timeout: Duration,
+    /// 归属会话 ID：工作连接/清理时校验，防止同名/旧会话操作误伤。
+    pub owner_session_id: String,
+    /// 已配对会话上限。
+    pub max_sessions: usize,
     /// 会话级停止信号：控制会话被清理时触发，用于结束仍在途的 UDP 工作连接，
     /// 释放其持有的 `Arc<UdpProxy>`（进而释放 UDP socket / 端口）。
     pub stop: CancellationToken,
@@ -146,6 +158,8 @@ pub async fn register_udp_proxy(
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
+        owner_session_id: session.session_id.clone(),
+        max_sessions: MAX_UDP_SESSIONS_PER_PROXY,
         stop: CancellationToken::new(),
     });
     state.udp.lock().insert(proxy_name.clone(), proxy.clone());
@@ -166,9 +180,11 @@ async fn run_udp_listener(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
-    // 清理周期取超时的 1/4：使会话/待配对项的实际存活时间接近配置超时
-    // （周期等于超时时，最坏会存活 2× 超时）。
-    let sweep_period = Duration::from_secs((proxy.session_timeout.as_secs() / 4).max(1));
+    // 清理周期取两个超时中较小者的 1/4：pending 超时（默认 10s）远小于会话超时
+    // （默认 300s），若只按后者计算，过期的 pending 会占用上限数十秒。
+    let sweep_period = Duration::from_secs(
+        (proxy.session_timeout.min(proxy.pending_timeout).as_secs() / 4).max(1),
+    );
     let mut sweep_iv = tokio::time::interval(sweep_period);
     sweep_iv.tick().await; // 消耗首次立即 tick
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
@@ -205,6 +221,16 @@ async fn run_udp_listener(
                 tracing::info!(proxy = %proxy_name, "udp listener shutting down");
                 break;
             }
+            // 会话清理/重连替换：即使 cleanup 在注册竞态中漏掉了该任务，也必须
+            // 退出，否则监听任务持有的 Arc<Session> 会让端口永久存活。
+            _ = proxy.stop.cancelled() => {
+                tracing::info!(proxy = %proxy_name, "udp proxy stopped, closing listener");
+                break;
+            }
+            _ = session.stop.cancelled() => {
+                tracing::info!(proxy = %proxy_name, "udp session stopped, closing listener");
+                break;
+            }
         }
     }
 }
@@ -235,6 +261,15 @@ async fn handle_datagram(
             .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // 背压保护：所有客户端共用同一个收包循环，工作连接消费慢时不得在这里
         // await（否则整代理数据报被阻塞）。通道满即丢包并计数——UDP 语义允许丢失。
+        // 先看容量再分配：满队列时不必先拷贝一个包再丢弃。
+        if tx.capacity() == 0 {
+            proxy.metrics.inc_udp_dropped();
+            tracing::debug!(
+                proxy = %proxy_name, %peer,
+                "udp session backpressure; dropping datagram"
+            );
+            return;
+        }
         if tx
             .try_send(alloc_udp_packet(&proxy.packet_pool, data))
             .is_err()
@@ -254,6 +289,14 @@ async fn handle_datagram(
         let tx = { proxy.pending_by_id.lock().get(&id).map(|p| p.tx.clone()) };
         if let Some(tx) = tx {
             // 同会话背压：待配对窗口期也不得阻塞收包循环。
+            if tx.capacity() == 0 {
+                proxy.metrics.inc_udp_dropped();
+                tracing::debug!(
+                    proxy = %proxy_name, %peer,
+                    "udp pending backpressure; dropping datagram"
+                );
+                return;
+            }
             if tx
                 .try_send(alloc_udp_packet(&proxy.packet_pool, data))
                 .is_err()
@@ -270,6 +313,10 @@ async fn handle_datagram(
 
     // 待配对会话上限：伪造源地址可制造大量 pending，并把每个包放大为一次
     // 工作连接请求（客户端 → 服务端 + 本地服务），超限直接丢弃。
+    // 达到上限时先清理过期项，避免一次突发把上限长期占满、饿死后续合法会话。
+    if proxy.pending_by_id.lock().len() >= MAX_PENDING_UDP_SESSIONS {
+        purge_expired_pending(proxy, Instant::now());
+    }
     if proxy.pending_by_id.lock().len() >= MAX_PENDING_UDP_SESSIONS {
         proxy.metrics.inc_udp_dropped();
         tracing::debug!(
@@ -324,9 +371,25 @@ async fn handle_datagram(
 fn sweep(proxy: &Arc<UdpProxy>) {
     let now = Instant::now();
     let mut sessions = proxy.sessions.lock();
-    sessions.retain(|_, s| now.duration_since(s.last_active) < proxy.session_timeout);
+    sessions.retain(|_, s| {
+        if now.duration_since(s.last_active) >= proxy.session_timeout {
+            // 先取消再删除：即使 handler 正阻塞在工作连接写/下行发送上，
+            // 也会在 select! 的取消分支中退出，而不是等对端主动关闭。
+            s.cancel.cancel();
+            false
+        } else {
+            true
+        }
+    });
     drop(sessions);
 
+    // 删除 `UdpSession` 会 drop 其唯一的 sender（handler 不再保留 `pending.tx`），
+    // 对应 `rx.recv_many` 随即可见 0 并退出，不需要额外的停止信号。
+    purge_expired_pending(proxy, now);
+}
+
+/// 移除已超过 `pending_timeout` 的待配对项，返回清理条数。
+fn purge_expired_pending(proxy: &Arc<UdpProxy>, now: Instant) -> usize {
     let expired: Vec<u64> = proxy
         .pending_by_id
         .lock()
@@ -334,9 +397,11 @@ fn sweep(proxy: &Arc<UdpProxy>) {
         .filter(|(_, p)| now.duration_since(p.created) >= proxy.pending_timeout)
         .map(|(id, _)| *id)
         .collect();
+    let n = expired.len();
     for id in expired {
         remove_pending(proxy, id);
     }
+    n
 }
 
 /// 摘除一个待配对项（同时清理 `pending_client` 反查表）。
@@ -380,18 +445,28 @@ pub async fn handle_udp_work_conn(
     work_id: u64,
     stream: rfrp_common::util::stream::BoxedStream,
 ) -> Result<()> {
-    let pending = match remove_pending(&proxy, work_id) {
+    let PendingUdp { client, tx, rx, .. } = match remove_pending(&proxy, work_id) {
         Some(p) => p,
         None => {
             tracing::warn!(work_id, "no pending udp session for work_id");
             return Ok(());
         }
     };
-    let client = pending.client;
-    register_session(&proxy, client, pending.tx.clone());
+    // sender 只存放在 sessions 表中（handler 不再保留 `pending.tx`）：sweep 删除
+    // 会话时 sender 被 drop，下面的 `rx.recv_many` 返回 0，handler 自然退出。
+    // 另加会话级取消令牌，用于中断可能阻塞的写操作。
+    let cancel = CancellationToken::new();
+    if !register_session(&proxy, client, tx, work_id, cancel.clone()) {
+        tracing::warn!(
+            client = %client, work_id,
+            limit = proxy.max_sessions,
+            "udp session limit reached; closing work connection"
+        );
+        return Ok(());
+    }
 
     tracing::info!(client = %client, work_id, "udp work connection established");
-    let mut rx = pending.rx;
+    let mut rx = rx;
     let mut stream = stream;
     // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
     let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
@@ -406,8 +481,13 @@ pub async fn handle_udp_work_conn(
                 if n == 0 {
                     break; // 通道关闭（会话结束）
                 }
-                touch_session(&proxy, client);
-                if let Err(e) = write_udp_frames_buffered(&mut stream, &mut write_buf, &batch).await {
+                touch_session(&proxy, client, work_id);
+                let write = tokio::select! {
+                    r = write_udp_frames_buffered(&mut stream, &mut write_buf, &batch) => r,
+                    _ = cancel.cancelled() => break,
+                    _ = proxy.stop.cancelled() => break,
+                };
+                if let Err(e) = write {
                     tracing::warn!(work_id, error = %e, "udp write frames error");
                     break;
                 }
@@ -416,8 +496,12 @@ pub async fn handle_udp_work_conn(
             r = reader.read_batch(&mut stream, &mut down, UDP_READ_BATCH) => {
                 match r {
                     Ok(n) if n > 0 => {
-                        touch_session(&proxy, client);
-                        forward_to_client(&proxy, client, &down, work_id).await;
+                        touch_session(&proxy, client, work_id);
+                        tokio::select! {
+                            _ = forward_to_client(&proxy, client, &down, work_id) => {}
+                            _ = cancel.cancelled() => break,
+                            _ = proxy.stop.cancelled() => break,
+                        }
                     }
                     Ok(_) => break, // EOF
                     Err(e) => {
@@ -432,12 +516,24 @@ pub async fn handle_udp_work_conn(
                 tracing::debug!(work_id, "udp work connection stopped by session cleanup");
                 break;
             }
+            _ = cancel.cancelled() => {
+                tracing::debug!(work_id, "udp session cancelled");
+                break;
+            }
         }
     }
 
-    proxy.sessions.lock().remove(&client);
+    remove_session_if_owner(&proxy, client, work_id);
     tracing::debug!(client = %client, work_id, "udp work connection closed");
     Ok(())
+}
+
+/// 只删除仍属于本次 handler 的会话条目（防同一 client 新会话被旧 handler 误删）。
+fn remove_session_if_owner(proxy: &Arc<UdpProxy>, client: SocketAddr, work_id: u64) {
+    let mut sessions = proxy.sessions.lock();
+    if sessions.get(&client).is_some_and(|s| s.work_id == work_id) {
+        sessions.remove(&client);
+    }
 }
 
 /// 把一批下行数据报回发给用户侧（统计下行字节；单个 send 失败不影响其余包）。
@@ -447,6 +543,20 @@ async fn forward_to_client(
     frames: &[Bytes],
     work_id: u64,
 ) {
+    // 旧 handler 可能已经读到下行数据，但此时会话已被新 work_id 取代；
+    // 不能再把旧响应发给同一 client，否则会造成新旧会话串流。
+    if !proxy
+        .sessions
+        .lock()
+        .get(&client)
+        .is_some_and(|s| s.work_id == work_id)
+    {
+        tracing::debug!(
+            work_id,
+            "udp session no longer current; dropping downstream batch"
+        );
+        return;
+    }
     for d in frames {
         proxy
             .metrics
@@ -458,21 +568,40 @@ async fn forward_to_client(
     }
 }
 
-/// 登记已配对的 UDP 会话（工作连接就绪后调用）。
-fn register_session(proxy: &Arc<UdpProxy>, client: SocketAddr, tx: mpsc::Sender<UdpPacket>) {
-    proxy.sessions.lock().insert(
+/// 登记已配对的 UDP 会话（工作连接就绪后调用）；超过上限返回 false。
+fn register_session(
+    proxy: &Arc<UdpProxy>,
+    client: SocketAddr,
+    tx: mpsc::Sender<UdpPacket>,
+    work_id: u64,
+    cancel: CancellationToken,
+) -> bool {
+    let mut sessions = proxy.sessions.lock();
+    if !sessions.contains_key(&client) && sessions.len() >= proxy.max_sessions {
+        return false;
+    }
+    // 同一 client 已有旧会话：先取消它，确保旧 handler 即使阻塞在写操作也能退出。
+    if let Some(old) = sessions.get(&client) {
+        old.cancel.cancel();
+    }
+    sessions.insert(
         client,
         UdpSession {
+            work_id,
             tx,
             last_active: Instant::now(),
+            cancel,
         },
     );
+    true
 }
 
-/// 更新 UDP 会话的最后活跃时间（双向流量都算活跃）。
-fn touch_session(proxy: &Arc<UdpProxy>, client: SocketAddr) {
+/// 更新 UDP 会话的最后活跃时间（仅当条目仍属于本次工作连接）。
+fn touch_session(proxy: &Arc<UdpProxy>, client: SocketAddr, work_id: u64) {
     if let Some(s) = proxy.sessions.lock().get_mut(&client) {
-        s.last_active = Instant::now();
+        if s.work_id == work_id {
+            s.last_active = Instant::now();
+        }
     }
 }
 

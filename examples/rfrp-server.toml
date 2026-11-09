@@ -5,7 +5,7 @@
 bind_addr = "0.0.0.0"           # 控制监听地址，默认 0.0.0.0
 bind_port = 7000                # 控制端口，默认 7000
 token = "shared-secret"          # 鉴权 token
-tls_enable = true                 # 控制链路 TLS 总开关（M3 起默认开启）
+tls_enable = true                 # 控制链路 TLS 总开关（代码默认 false，示例显式开启）
 tls_cert = "./cert.pem"          # 控制链路证书（相对配置文件目录解析，已随示例提供）
 tls_key  = "./key.pem"
 work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
@@ -24,6 +24,8 @@ grace_secs = 30                  # 优雅退出宽限期（秒，默认 30；停
 addr = "0.0.0.0:7500"           # 独立 HTTP 服务，不走控制协议，与 bind_port 无关
 user = "admin"
 password = "changeme"            # 最小长度 6（见 §9.4 校验），生产环境务必更换强密码
+session_ttl_secs = 28800         # 会话 Cookie 有效期（默认 8 小时；范围 60~2592000）
+cookie_secure = false            # 置于 HTTPS 反向代理之后时置 true（明文 HTTP 下不能开）
 
 [proxy]
 # 允许客户端使用的公网端口范围

@@ -24,6 +24,7 @@ async fn fatal_login_exits_without_reconnect() {
                 session_id: None,
                 work_conn_tls: None,
                 work_conn_token: None,
+                protocol_version: None,
             })
             .to_frame()
             .unwrap(),
@@ -126,6 +127,7 @@ async fn fatal_login_version_mismatch_exits_without_reconnect() {
                 session_id: None,
                 work_conn_tls: None,
                 work_conn_token: None,
+                protocol_version: None,
             })
             .to_frame()
             .unwrap(),

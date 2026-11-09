@@ -124,12 +124,18 @@ rfrp client -c examples/rfrp-client.toml --check
 addr = "127.0.0.1:7500"     # 建议绑回环，或置于反向代理/防火墙之后
 user = "admin"
 password = "change-me"      # 至少 6 位
+session_ttl_secs = 28800    # 会话 Cookie 有效期（默认 8 小时；范围 60~2592000）
+cookie_secure = false       # 置于 HTTPS 反向代理之后时置 true（见下）
 ```
 
 浏览器直接访问 `http://<addr>/` 会看到登录页，输入 `user`/`password` 后以
-会话 Cookie（`HttpOnly` + `SameSite=Strict`）保持登录，页面顶部可退出登录。
+会话 Cookie（`HttpOnly` + `SameSite=Strict` + `Max-Age`）保持登录，页面顶部可退出登录。
 `curl` 等脚本客户端仍可用 `Authorization: Basic` 头访问（未带凭据时返回
 `401` + `WWW-Authenticate: Basic`）。
+
+> **`cookie_secure` 何时打开**：该选项给会话 Cookie 加 `Secure` 属性（浏览器只经 HTTPS
+> 回传）。Dashboard 默认走明文 HTTP，此时浏览器会**拒绝**回传带 `Secure` 的 Cookie，
+> 登录会直接失效——因此默认关闭。只有把 Dashboard 放在 HTTPS 反向代理之后时才置 `true`。
 
 | 端点 | 内容 |
 |---|---|
@@ -140,8 +146,10 @@ password = "change-me"      # 至少 6 位
 | `GET /metrics` | Prometheus 文本 |
 | `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
 
-> 会话 Cookie 存的是 base64 编码的 `user:password`（与 Basic Auth 同级的凭据载体）。
-> 在不可信网络暴露 Dashboard 时请启用 HTTPS 反向代理，或只绑回环地址。
+> 会话 Cookie 存的是 base64 编码的 `user:password`（与 Basic Auth 同级的凭据载体，
+> base64 不是加密——拿到 Cookie 即等于拿到明文密码）。因此 Cookie 有明确的
+> `Max-Age`（`session_ttl_secs`，默认 8 小时）限制暴露窗口。
+> 在不可信网络暴露 Dashboard 时请启用 HTTPS 反向代理（并置 `cookie_secure = true`），或只绑回环地址。
 >
 > 看板页面需要启用 JavaScript（首屏用内嵌状态渲染，随后每 5s 轮询 `/api/status`）。
 
@@ -353,8 +361,11 @@ Get-NetIPAddress | Select-Object IPAddress,InterfaceAlias
   ```
 
 - **高带宽时延积链路**：若跨洲/卫星链路跑不满带宽，可考虑启用 BBR
-  （`net.ipv4.tcp_congestion_control=bbr`，需内核支持）并适当增大 socket 缓冲；
-  这是系统级调优，与 rfrp 本身无关。
+  （`net.ipv4.tcp_congestion_control=bbr`，需内核支持）。rfrp 自身已把数据面 socket
+  收发缓冲申请到 512 KiB，但**内核会按 `net.core.rmem_max`/`wmem_max` 截断**
+  （系统默认 208 KiB 时实际只生效 416 KiB）——想真正拿到 512 KiB 需
+  `sysctl -w net.core.rmem_max=1048576 net.core.wmem_max=1048576`。
+  详见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md#socket-缓冲)。
 
 ## License
 

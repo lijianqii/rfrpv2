@@ -3,6 +3,24 @@
 # 产物输出到 dist/，并生成 SHA256SUMS。
 set -euo pipefail
 
+# 跳过质量门（仅用于本地反复打包；正式发布不应带 SKIP_QUALITY_GATES=1）。
+if [ "${SKIP_QUALITY_GATES:-0}" = "1" ]; then
+  echo "==> WARNING: quality gates skipped (SKIP_QUALITY_GATES=1)"
+else
+  # 质量门：格式化检查 + Clippy 严格 + 构建 + 测试。
+  # 放在交叉编译之前：坏掉的提交不必浪费几分钟去产出产物。
+  echo "==> Quality gates: fmt-check / clippy / build / test"
+  cargo fmt --all --check
+  cargo clippy --all-targets -- -D warnings
+  cargo build --all
+  cargo test --all
+
+  # UDP 突发回收率闸门：release-only 用例（debug 构建下新旧代码都会丢包，
+  # 测不出差异），因此必须显式带 --ignored 跑。
+  echo "==> Quality gates: udp burst regression (release)"
+  cargo test --release -p rfrpc --test udp_burst -- --ignored --nocapture
+fi
+
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["packages"][0]["version"])')"
 DIST="dist"
 rm -rf "$DIST"

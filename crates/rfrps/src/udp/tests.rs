@@ -18,6 +18,8 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout,
+        owner_session_id: "test-session".into(),
+        max_sessions: MAX_UDP_SESSIONS_PER_PROXY,
         stop: CancellationToken::new(),
     })
 }
@@ -31,8 +33,10 @@ async fn sweep_removes_expired_session_and_pending() {
     proxy.sessions.lock().insert(
         "127.0.0.1:1".parse().unwrap(),
         UdpSession {
+            work_id: 1,
             tx: tx.clone(),
             last_active: old,
+            cancel: CancellationToken::new(),
         },
     );
     proxy.pending_by_id.lock().insert(
@@ -52,8 +56,10 @@ async fn sweep_removes_expired_session_and_pending() {
     proxy.sessions.lock().insert(
         "127.0.0.1:3".parse().unwrap(),
         UdpSession {
+            work_id: 3,
             tx: tx.clone(),
             last_active: Instant::now(),
+            cancel: CancellationToken::new(),
         },
     );
 
@@ -133,8 +139,10 @@ async fn datagram_forwarded_to_paired_session() {
     proxy.sessions.lock().insert(
         peer,
         UdpSession {
+            work_id: 1,
             tx,
             last_active: Instant::now(),
+            cancel: CancellationToken::new(),
         },
     );
 
@@ -186,8 +194,10 @@ async fn datagram_dropped_when_session_channel_full() {
     proxy.sessions.lock().insert(
         peer,
         UdpSession {
+            work_id: 1,
             tx,
             last_active: Instant::now(),
+            cancel: CancellationToken::new(),
         },
     );
 
@@ -284,6 +294,111 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
         .expect("first datagram queued")
         .expect("channel alive");
     assert_eq!(&first[..], b"first");
+}
+
+#[tokio::test]
+async fn session_limit_rejects_new_client() {
+    let mut proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    Arc::get_mut(&mut proxy).unwrap().max_sessions = 1;
+
+    let (tx1, _rx1) = mpsc::channel(4);
+    assert!(register_session(
+        &proxy,
+        "127.0.0.1:1".parse().unwrap(),
+        tx1,
+        1,
+        CancellationToken::new()
+    ));
+    let (tx2, _rx2) = mpsc::channel(4);
+    assert!(
+        !register_session(
+            &proxy,
+            "127.0.0.1:2".parse().unwrap(),
+            tx2,
+            2,
+            CancellationToken::new()
+        ),
+        "second client must be rejected at the session cap"
+    );
+}
+
+#[tokio::test]
+async fn sweep_closes_session_sender_so_handler_can_exit() {
+    // sweep 删除 UdpSession 后，sender 被 drop，handler 的 rx.recv_many 应返回 0。
+    let proxy = test_proxy(Duration::from_millis(10), Duration::from_secs(60)).await;
+    let client: SocketAddr = "127.0.0.1:3".parse().unwrap();
+    let (tx, mut rx) = mpsc::channel::<UdpPacket>(4);
+    let session_cancel = CancellationToken::new();
+    proxy.sessions.lock().insert(
+        client,
+        UdpSession {
+            work_id: 7,
+            tx,
+            last_active: Instant::now() - Duration::from_secs(1),
+            cancel: session_cancel.clone(),
+        },
+    );
+
+    sweep(&proxy);
+
+    assert!(!proxy.sessions.lock().contains_key(&client));
+    assert!(
+        session_cancel.is_cancelled(),
+        "sweep must cancel the session token so a blocked handler can exit"
+    );
+    assert!(
+        rx.recv().await.is_none(),
+        "dropping the session must close the handler channel"
+    );
+}
+
+#[tokio::test]
+async fn old_handler_exit_does_not_remove_new_session() {
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let client: SocketAddr = "127.0.0.1:4".parse().unwrap();
+    let (tx, _rx) = mpsc::channel::<UdpPacket>(4);
+    proxy.sessions.lock().insert(
+        client,
+        UdpSession {
+            work_id: 2,
+            tx,
+            last_active: Instant::now(),
+            cancel: CancellationToken::new(),
+        },
+    );
+
+    // 旧 handler（work_id=1）退出时不得删除新会话。
+    remove_session_if_owner(&proxy, client, 1);
+    assert!(proxy.sessions.lock().contains_key(&client));
+    remove_session_if_owner(&proxy, client, 2);
+    assert!(!proxy.sessions.lock().contains_key(&client));
+}
+
+#[tokio::test]
+async fn purge_expired_pending_frees_limit_slots() {
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_millis(10)).await;
+    let old = Instant::now() - Duration::from_secs(1);
+    for i in 0..MAX_PENDING_UDP_SESSIONS {
+        let client: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 21000 + i as u16));
+        let (tx, rx) = mpsc::channel::<UdpPacket>(1);
+        proxy.pending_by_id.lock().insert(
+            i as u64 + 1,
+            PendingUdp {
+                client,
+                tx,
+                rx,
+                created: old,
+            },
+        );
+        proxy.pending_client.lock().insert(client, i as u64 + 1);
+    }
+
+    assert_eq!(
+        purge_expired_pending(&proxy, Instant::now()),
+        MAX_PENDING_UDP_SESSIONS
+    );
+    assert!(proxy.pending_by_id.lock().is_empty());
+    assert!(proxy.pending_client.lock().is_empty());
 }
 
 #[tokio::test]

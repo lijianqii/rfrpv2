@@ -10,7 +10,9 @@
 //! +----------+----------+----------+----------------+
 //! ```
 
-use crate::constants::{FRAME_HEADER_LEN, FRAME_MAX_PAYLOAD, PROTOCOL_VERSION};
+use crate::constants::{
+    is_supported_protocol_version, CONTROL_FRAME_MAX_PAYLOAD, FRAME_HEADER_LEN,
+};
 use crate::error::{protocol, Error, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -55,12 +57,17 @@ impl Decoder for FrameCodec {
 
         // 先校验版本与长度上限，再等待 payload：否则恶意头声称超大 length 时
         // 解码器会一直等数据，缓冲区随读取无界增长（DoS）。
-        if version != PROTOCOL_VERSION {
+        //
+        // 版本检查用**区间**而非精确相等：协商可能把客户端降到服务端支持的较低版本
+        // （见 constants::negotiate_protocol_version），帧头版本必须落在支持区间内。
+        if !is_supported_protocol_version(version) {
             return Err(protocol(format!(
-                "unsupported protocol version {version}, expected {PROTOCOL_VERSION}"
+                "unsupported protocol version {version}, expected {}..={}",
+                crate::constants::PROTOCOL_MIN_VERSION,
+                crate::constants::PROTOCOL_VERSION
             )));
         }
-        if length > FRAME_MAX_PAYLOAD as usize {
+        if length > CONTROL_FRAME_MAX_PAYLOAD as usize {
             return Err(protocol(format!("frame payload too large: {length} bytes")));
         }
 
@@ -84,7 +91,7 @@ impl Encoder<Frame> for FrameCodec {
     type Error = Error;
 
     fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> Result<()> {
-        if frame.payload.len() > FRAME_MAX_PAYLOAD as usize {
+        if frame.payload.len() > CONTROL_FRAME_MAX_PAYLOAD as usize {
             return Err(protocol(format!(
                 "frame payload too large: {} bytes",
                 frame.payload.len()
@@ -111,12 +118,14 @@ where
     let version = header[0];
     let msg_type = header[1];
     let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
-    if version != PROTOCOL_VERSION {
+    if !is_supported_protocol_version(version) {
         return Err(protocol(format!(
-            "unsupported protocol version {version}, expected {PROTOCOL_VERSION}"
+            "unsupported protocol version {version}, expected {}..={}",
+            crate::constants::PROTOCOL_MIN_VERSION,
+            crate::constants::PROTOCOL_VERSION
         )));
     }
-    if length > FRAME_MAX_PAYLOAD as usize {
+    if length > CONTROL_FRAME_MAX_PAYLOAD as usize {
         return Err(protocol(format!("frame payload too large: {length} bytes")));
     }
     let mut payload = vec![0u8; length];

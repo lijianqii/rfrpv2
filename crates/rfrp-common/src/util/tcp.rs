@@ -18,7 +18,9 @@ use std::time::Duration;
 use socket2::SockRef;
 use tokio::net::TcpStream;
 
-use crate::constants::{TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_PROBE_INTERVAL};
+use crate::constants::{
+    TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_PROBE_INTERVAL, TCP_SOCKET_BUF_BYTES,
+};
 
 /// 进程级 keepalive 参数。
 #[derive(Clone, Copy, Debug)]
@@ -68,9 +70,11 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
     if !cfg.idle.is_zero() {
         set_tcp_keepalive(&sock, &cfg)?;
     }
-    // P1 优化：增大 socket 缓冲区，减少 RDP 大流量突发时的窗口溢出
-    let _ = sock.set_recv_buffer_size(512 * 1024);
-    let _ = sock.set_send_buffer_size(512 * 1024);
+    // 增大 socket 缓冲区，减少大流量突发时的窗口溢出（loopback RDP 实测 14.8 → 206.6 MB/s）。
+    // best-effort：内核按 rmem_max/wmem_max 截断，失败也不影响功能；
+    // 实际生效值与系统调参方式见 `constants::TCP_SOCKET_BUF_BYTES` 的说明。
+    let _ = sock.set_recv_buffer_size(TCP_SOCKET_BUF_BYTES);
+    let _ = sock.set_send_buffer_size(TCP_SOCKET_BUF_BYTES);
     Ok(())
 }
 

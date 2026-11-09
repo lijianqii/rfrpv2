@@ -57,6 +57,8 @@ async fn cleanup_clears_proxy_domains() {
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout: std::time::Duration::from_secs(60),
         pending_timeout: std::time::Duration::from_secs(10),
+        owner_session_id: session.session_id.clone(),
+        max_sessions: rfrp_common::constants::MAX_UDP_SESSIONS_PER_PROXY,
         stop: tokio_util::sync::CancellationToken::new(),
     });
     state.udp.lock().insert("udp".into(), udp_proxy.clone());
@@ -152,6 +154,45 @@ async fn heartbeat_timeout_disconnects() {
     // 控制任务应在数秒内因心跳超时而结束。
     let res = tokio::time::timeout(Duration::from_secs(3), task).await;
     assert!(res.is_ok(), "control task must end on heartbeat timeout");
+    res.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn future_heartbeat_ts_does_not_suppress_timeout() {
+    // 回归：ts 超前于本端发送值的 HeartbeatResp 不得推进 pong_ts，否则可用
+    // u64::MAX 让后续每轮心跳立即通过，永久绕过超时检测。
+    let (server_end, client_end) = duplex(8192);
+    let task = tokio::spawn(handle_control_login(
+        login_frame("futureHb"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        ServerState::new(),
+        ServerConfig::default(),
+        Duration::from_millis(30),
+        Duration::from_millis(80),
+    ));
+    let (cr, cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    let mut cw = FramedWrite::new(cw, FrameCodec);
+    let _ = recv_msg(&mut cr).await; // LoginResp
+    let hb = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut cr))
+        .await
+        .expect("heartbeat");
+    if let Message::Heartbeat(h) = hb {
+        send_msg(
+            &mut cw,
+            Message::HeartbeatResp(HeartbeatResp {
+                ts: h.ts.saturating_add(10_000),
+            }),
+        )
+        .await;
+    }
+
+    let res = tokio::time::timeout(Duration::from_secs(3), task).await;
+    assert!(
+        res.is_ok(),
+        "future heartbeat ts must not suppress the timeout"
+    );
     res.unwrap().unwrap().unwrap();
 }
 
@@ -411,12 +452,51 @@ async fn login_version_mismatch_rejected() {
     match recv_msg(&mut cr).await {
         Message::LoginResp(r) => {
             assert!(!r.ok);
-            assert_eq!(r.error.as_deref(), Some("version mismatch"));
+            let err = r.error.expect("version mismatch must be reported");
+            assert!(
+                err.starts_with("version mismatch"),
+                "error must keep the stable prefix, got {err:?}"
+            );
+            // 错误详情应带出客户端声明版本与服务端支持列表（便于直接排障）。
+            assert!(err.contains("client=3"), "{err}");
+            assert!(err.contains("server supports"), "{err}");
         }
         other => panic!("expected LoginResp, got {other:?}"),
     }
     // 控制任务应直接结束（未建立会话）。
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn login_echoes_negotiated_protocol_version() {
+    // 协商成功后，服务端在 LoginResp 里回传本次会话使用的协议版本（DESIGN §6.4），
+    // 客户端据此确认双方语义一致。
+    let (server_end, client_end) = duplex(8192);
+    let state = ServerState::new();
+    let config = ServerConfig::default();
+    let task = tokio::spawn(handle_control_login(
+        login_frame("rVer"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        state,
+        config,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, _cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    match recv_msg(&mut cr).await {
+        Message::LoginResp(r) => {
+            assert!(r.ok);
+            assert_eq!(
+                r.protocol_version,
+                Some(PROTOCOL_VERSION),
+                "server must echo the negotiated protocol version"
+            );
+        }
+        other => panic!("expected LoginResp, got {other:?}"),
+    }
+    task.abort();
 }
 
 #[tokio::test]
@@ -659,6 +739,52 @@ async fn eof_closes_control_loop() {
 }
 
 #[tokio::test]
+async fn teardown_after_peer_eof_is_prompt() {
+    // 回归：客户端断开后，控制任务必须**立即**结束（远快于写任务的 1 秒硬超时）。
+    //
+    // 旧实现：`Session` 结构里持有一份 `tx` 克隆，`drop(tx)` 并不会关闭通道，
+    // 写任务的 `rx.recv()` 永远挂起 -> 只能等 1 秒超时被 abort。
+    // 这 1 秒里会话资源（公网端口、代理监听、预热池）都还占着。
+    let (server_end, client_end) = duplex(8192);
+    let state = ServerState::new();
+    let config = ServerConfig::default();
+    let task = tokio::spawn(handle_control_login(
+        login_frame("rPrompt"),
+        server_end,
+        "127.0.0.1".parse().unwrap(),
+        state.clone(),
+        config,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    ));
+    let (cr, cw) = split(client_end);
+    let mut cr = FramedRead::new(cr, FrameCodec);
+    let cw = FramedWrite::new(cw, FrameCodec);
+    assert!(matches!(recv_msg(&mut cr).await, Message::LoginResp(_)));
+
+    // 客户端断开 -> 服务端读到 EOF。
+    drop(cr);
+    drop(cw);
+
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_millis(500), task).await;
+    assert!(
+        r.is_ok(),
+        "control task must end promptly after peer EOF (regression: 1s writer timeout)"
+    );
+    r.unwrap().unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "teardown took {:?}, must be well below the 1s writer timeout",
+        started.elapsed()
+    );
+    assert!(
+        state.sessions.lock().is_empty(),
+        "session must be unregistered immediately after disconnect"
+    );
+}
+
+#[tokio::test]
 async fn login_invalid_run_id_rejected() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
@@ -802,7 +928,7 @@ async fn heartbeat_resp_updates_rtt_metric() {
 
     let mut seen = 0;
     for _ in 0..50 {
-        seen = state.metrics.rtt_ms();
+        seen = state.rtt_ms();
         if seen >= 50 {
             break;
         }
@@ -810,6 +936,28 @@ async fn heartbeat_resp_updates_rtt_metric() {
     }
     assert!(seen >= 50, "rtt_ms should be >= 50, got {seen}");
     task.abort();
+}
+
+#[tokio::test]
+async fn rtt_is_tracked_per_session() {
+    // RTT 逐会话维护：全局 `rfrp_rtt_ms` 取各会话最大值（最差链路），
+    // 而不是一个被“最后回包会话”覆盖的单值。
+    let state = ServerState::new();
+    let s1 = test_session("rtt1");
+    let s2 = test_session("rtt2");
+    state.sessions.lock().insert("rtt1".into(), s1.clone());
+    state.sessions.lock().insert("rtt2".into(), s2.clone());
+
+    // 无会话时为 0（= 未测得）。
+    assert_eq!(state.rtt_ms(), 0);
+
+    s1.rtt_ms.store(30, std::sync::atomic::Ordering::Relaxed);
+    s2.rtt_ms.store(90, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(state.rtt_ms(), 90, "global rtt must be the worst session");
+
+    // 最差会话断开后，聚合值应回落到剩余会话。
+    state.sessions.lock().remove("rtt2");
+    assert_eq!(state.rtt_ms(), 30);
 }
 
 #[tokio::test]
@@ -844,7 +992,7 @@ async fn login_rate_limited_after_repeated_failures() {
         let _ = task.await;
     }
 
-    // 达到上限后：即使携带正确 token 也应被限速拒绝（不回显原因）。
+    // 达到上限后：即使携带正确 token 也应被限速拒绝，并返回可重试错误。
     let mut login = Message::from_frame(&login_frame("rl")).unwrap();
     if let Message::Login(l) = &mut login {
         l.token = "right-token".into();
@@ -864,7 +1012,11 @@ async fn login_rate_limited_after_repeated_failures() {
     match recv_msg(&mut cr).await {
         Message::LoginResp(r) => {
             assert!(!r.ok, "rate-limited login must be rejected");
-            assert!(r.error.is_none(), "rate limit must not reveal the reason");
+            assert_eq!(
+                r.error.as_deref(),
+                Some("rate limited"),
+                "rate limit must be a retryable error, not a fatal auth failure"
+            );
         }
         other => panic!("expected LoginResp, got {other:?}"),
     }

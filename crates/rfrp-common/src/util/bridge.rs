@@ -21,7 +21,7 @@ use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite};
 
 /// 将 `a` 与 `b` 双向桥接，直到任一侧关闭。
 ///
-/// 使用 `BRIDGE_BUF_SIZE` 缓冲（默认 32 KiB），比 tokio 默认 8 KiB 减少
+/// 使用 `BRIDGE_BUF_SIZE` 缓冲（默认 64 KiB），比 tokio 默认 8 KiB 减少
 /// 大流量下的系统调用次数；小包交互不受影响（读到多少转发多少）。
 pub async fn bridge<A, B>(a: A, b: B) -> Result<()>
 where

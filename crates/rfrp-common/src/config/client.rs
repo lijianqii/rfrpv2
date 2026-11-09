@@ -1,8 +1,8 @@
 //! 客户端配置结构（DESIGN §9.2）。
 
-use crate::config::LogSection;
+use crate::config::{is_valid_domain, LogSection};
 use crate::constants::{
-    MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, POOL_SIZE_DEFAULT, POOL_SIZE_WARN_THRESHOLD,
+    MAX_CUSTOM_DOMAINS, POOL_SIZE_DEFAULT, POOL_SIZE_MAX, POOL_SIZE_WARN_THRESHOLD,
 };
 use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
@@ -17,20 +17,6 @@ fn default_true() -> bool {
 }
 fn default_pool_size() -> u32 {
     POOL_SIZE_DEFAULT
-}
-
-/// 简单的域名格式校验（字母/数字/连字符，标签长度限制）。
-fn is_valid_domain(domain: &str) -> bool {
-    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
-        return false;
-    }
-    domain.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
 }
 
 /// `[client]` 连接服务端与鉴权。
@@ -142,14 +128,21 @@ impl ClientProxy {
             )));
         }
         match self.r#type {
-            ProxyType::Tcp | ProxyType::Udp => {
-                if self.remote_port.is_none() {
+            ProxyType::Tcp | ProxyType::Udp => match self.remote_port {
+                None => {
                     return Err(config(format!(
                         "proxy {} (type {:?}) requires remote_port",
                         self.name, self.r#type
-                    )));
+                    )))
                 }
-            }
+                Some(0) => {
+                    return Err(config(format!(
+                        "proxy {} (type {:?}) remote_port must be 1-65535",
+                        self.name, self.r#type
+                    )))
+                }
+                Some(_) => {}
+            },
             ProxyType::Http | ProxyType::Https => {
                 let d = self.custom_domains.as_ref().ok_or_else(|| {
                     config(format!(
@@ -177,8 +170,14 @@ impl ClientProxy {
                 }
             }
         }
+        if self.pool_size > POOL_SIZE_MAX {
+            return Err(config(format!(
+                "proxy {} pool_size {} exceeds max {POOL_SIZE_MAX}",
+                self.name, self.pool_size
+            )));
+        }
         if self.pool_size > POOL_SIZE_WARN_THRESHOLD {
-            // 超出告警阈值但不拒绝（DESIGN §9.4）。
+            // 超过推荐值但仍在硬上限内：只告警（DESIGN §9.4）。
             tracing::warn!(
                 proxy = %self.name,
                 pool_size = self.pool_size,
@@ -232,6 +231,13 @@ impl ClientConfig {
         }
         if self.client.token.is_empty() {
             return Err(config("client token must not be empty"));
+        }
+        if self.client.token.len() > crate::constants::MAX_TOKEN_LEN {
+            return Err(config(format!(
+                "client token length {} exceeds max {}",
+                self.client.token.len(),
+                crate::constants::MAX_TOKEN_LEN
+            )));
         }
         if let Some(secs) = self.client.tcp_keepalive_secs {
             if secs > 3600 {

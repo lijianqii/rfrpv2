@@ -2,12 +2,16 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+// 仅测试辅助构造器需要 `Arc`（生产代码不直接构造 Session）。
+#[cfg(test)]
 use std::sync::Arc;
 
 use rfrp_common::protocol::msg::ProxyType;
 use rfrp_common::util::stream::BoxedStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::Message;
 
@@ -39,10 +43,20 @@ pub struct Session {
     /// vhost 域名 -> proxy_name（HTTP/HTTPS 路由用）。
     pub proxy_domains: Mutex<HashMap<String, String>>,
     /// 断开 / 重连通知（§8.3）：清理旧会话或正常断开时唤醒控制循环退出。
-    pub stop: Arc<Notify>,
+    ///
+    /// 用 `CancellationToken` 而非 `Notify`：`Notify::notify_waiters()` **不存储许可**，
+    /// 任务若未恰好处于 `notified()` 等待状态就会永久丢失该信号（lost wakeup）。
+    /// `CancellationToken::cancelled()` 每次 poll 都重新检查取消标志，天然免疫此问题。
+    pub stop: CancellationToken,
     /// 预热工作连接池（proxy_name -> 空闲服务端侧工作流），按 §8.2 命中用户连接。
     /// 使用类型擦除以同时支持明文与 TLS 工作连接。
     pub pools: Mutex<HashMap<String, Vec<BoxedStream>>>,
+    /// 控制链路 RTT（毫秒；0 = 尚未测得）。
+    ///
+    /// **按会话维护**：服务端可能同时接多个客户端，汇总成单一全局值时
+    /// 会被“最后一个回包的会话”覆盖，语义不明。逐会话值在 Dashboard
+    /// `/api/status` 里给出；全局 `rfrp_rtt_ms` 取所有会话的最大值（最差链路）。
+    pub rtt_ms: AtomicU64,
 }
 
 /// 测试用会话构造器：所有测试共用一份，避免 `Session` 增字段时逐个构造点修改。
@@ -88,8 +102,9 @@ pub(crate) fn test_session_with_token(
         tx,
         proxies: Mutex::new(HashMap::new()),
         proxy_domains: Mutex::new(HashMap::new()),
-        stop: Arc::new(Notify::new()),
+        stop: CancellationToken::new(),
         pools: Mutex::new(HashMap::new()),
+        rtt_ms: AtomicU64::new(0),
     });
     (session, rx)
 }

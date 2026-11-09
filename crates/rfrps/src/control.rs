@@ -6,6 +6,10 @@
 //!
 //! 心跳（§8.3）：本端周期性发送 `Heartbeat`，若 `HEARTBEAT_TIMEOUT` 内未收到对端
 //! `HeartbeatResp`，经 `Notify` 通知控制循环断开并清理 Session。
+//!
+//! 会话停止信号用 `CancellationToken`（见 [`Session::stop`]）：`Notify::notify_waiters()`
+//! 不存储许可，任务未恰好在等待时会丢信号；`CancellationToken::cancelled()` 每次 poll
+//! 都重新检查标志位，不会漏掉取消。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -17,8 +21,8 @@ use futures::{SinkExt, StreamExt};
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
-    MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, MAX_PROXY_NAME_LEN, MAX_RUN_ID_LEN, MAX_TOKEN_LEN,
-    PROTOCOL_VERSION,
+    negotiate_protocol_version, MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, MAX_PROXY_NAME_LEN,
+    MAX_RUN_ID_LEN, MAX_TOKEN_LEN, PROTOCOL_VERSIONS_SUPPORTED,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
@@ -29,6 +33,7 @@ use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 use crate::listener;
 use crate::state::ServerState;
@@ -39,7 +44,7 @@ pub(crate) use session::{test_entry, test_entry_with, test_session, test_session
 pub use session::{ProxyEntry, Session};
 
 /// 拒绝登录并下发失败 LoginResp（`error=None` 表示鉴权失败，不回显原因，§10.2）。
-async fn reject_login<S>(stream: S, error: Option<&str>) -> Result<()>
+pub(crate) async fn reject_login<S>(stream: S, error: Option<&str>) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -54,6 +59,7 @@ where
                 session_id: None,
                 work_conn_tls: None,
                 work_conn_token: None,
+                protocol_version: None,
             })
             .to_frame()?,
         ),
@@ -75,10 +81,17 @@ pub async fn handle_control_login<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // 同一 IP 的“检查限速 → 校验 token → 记录失败/清除”必须串行；
+    // 否则并发尝试可以同时通过检查，再一起记录失败，突破失败次数上限。
+    let login_guard = state.login_lock(peer_ip).lock().await;
+
     // 登录失败限速（防 token 穷举）：超限直接拒绝，且不区分失败原因。
     if !state.login_allowed(peer_ip) {
+        drop(login_guard);
+        // 限速是临时状态，必须回一个可重试错误；不能用 `error=None`（客户端将其
+        // 视为鉴权失败并永久退出，导致合法客户端被同 IP 的其他失败尝试连累）。
         tracing::warn!(%peer_ip, "login rate limited; rejecting attempt");
-        reject_login(stream, None).await?;
+        reject_login(stream, Some("rate limited")).await?;
         return Ok(());
     }
 
@@ -91,17 +104,23 @@ where
             ))
         }
     };
-    // 协议版本校验：不匹配直接拒绝，且不建立会话（客户端据此判定致命、不重连，§6.6）。
-    if version != PROTOCOL_VERSION {
-        tracing::warn!(version, "login rejected: protocol version mismatch");
-        reject_login(stream, Some("version mismatch")).await?;
-        return Ok(());
-    }
+    // 协议版本协商（DESIGN §6.4）：在支持区间 `[PROTOCOL_MIN_VERSION, PROTOCOL_VERSION]`
+    // 内选定版本；区间外直接拒绝（不建立会话，客户端据此判定致命、不重连）。
+    let negotiated_version = match negotiate_protocol_version(version) {
+        Some(v) => v,
+        None => {
+            drop(login_guard);
+            tracing::warn!(version, "login rejected: protocol version mismatch");
+            reject_login(stream, Some(&version_mismatch_detail(version))).await?;
+            return Ok(());
+        }
+    };
     // 字段上限校验（DESIGN §6.2.3）：run_id 必须是 UUID，token 长度受限。
     if uuid::Uuid::parse_str(&run_id).is_err()
         || run_id.len() > MAX_RUN_ID_LEN
         || token.len() > MAX_TOKEN_LEN
     {
+        drop(login_guard);
         tracing::warn!(run_id = %run_id, "login rejected: invalid fields");
         reject_login(stream, None).await?;
         return Ok(());
@@ -110,34 +129,13 @@ where
     // token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
         state.record_login_failure(peer_ip);
+        drop(login_guard);
         tracing::warn!(run_id = %run_id, %peer_ip, "login rejected: token mismatch");
         reject_login(stream, None).await?;
         return Ok(());
     }
     state.clear_login_failures(peer_ip);
-
-    // 并发会话上限（全局 + 每来源 IP）：同一 run_id 的重连替换不计新增。
-    // 登录限速只统计失败次数，若无此上限，持有效 token 的客户端可用随机 run_id
-    // 无限建立控制会话（每个都会注册代理、占用 fd 与内存）。
-    let over_limit = {
-        let reg = state.sessions.lock();
-        if reg.contains_key(&run_id) {
-            None
-        } else if reg.len() >= state.max_sessions.load(Ordering::Relaxed) {
-            Some(format!("global limit reached ({})", reg.len()))
-        } else if reg.values().filter(|s| s.peer_ip == peer_ip).count()
-            >= state.max_sessions_per_ip.load(Ordering::Relaxed)
-        {
-            Some("per-ip limit reached".to_string())
-        } else {
-            None
-        }
-    };
-    if let Some(reason) = over_limit {
-        tracing::warn!(%peer_ip, %run_id, %reason, "login rejected: session limit reached");
-        reject_login(stream, Some("too many sessions")).await?;
-        return Ok(());
-    }
+    drop(login_guard);
 
     let session_id = uuid::Uuid::new_v4().to_string();
     // 工作连接鉴权令牌：per-session 随机值，不写日志、不经 Dashboard 暴露。
@@ -151,18 +149,39 @@ where
         tx: tx.clone(),
         proxies: Mutex::new(HashMap::new()),
         proxy_domains: Mutex::new(HashMap::new()),
-        stop: Arc::new(Notify::new()),
+        stop: CancellationToken::new(),
         pools: Mutex::new(HashMap::new()),
+        rtt_ms: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // 并发会话上限（全局 + 每来源 IP）：同一 run_id 的重连替换不计新增。
+    // 检查与插入在同一把锁内完成，避免并发登录同时通过检查后一起插入。
+    let slot = {
+        let mut reg = state.sessions.lock();
+        if reg.contains_key(&session.run_id) {
+            Ok(reg.insert(session.run_id.clone(), session.clone()))
+        } else if reg.len() >= state.max_sessions.load(Ordering::Relaxed) {
+            Err("global limit reached")
+        } else if reg.values().filter(|s| s.peer_ip == peer_ip).count()
+            >= state.max_sessions_per_ip.load(Ordering::Relaxed)
+        {
+            Err("per-ip limit reached")
+        } else {
+            reg.insert(session.run_id.clone(), session.clone());
+            Ok(None)
+        }
+    };
+    let old = match slot {
+        Ok(old) => old,
+        Err(reason) => {
+            tracing::warn!(%peer_ip, run_id = %session.run_id, %reason, "login rejected: session limit reached");
+            reject_login(stream, Some("too many sessions")).await?;
+            return Ok(());
+        }
+    };
 
     // 重连去重（§8.3）：同一 run_id 的旧会话先清理再接受新登录。
     // 注意：cleanup 在锁外执行，避免 sessions→proxy_index 锁序嵌套。
-    let old = {
-        let mut reg = state.sessions.lock();
-        let old = reg.remove(&session.run_id);
-        reg.insert(session.run_id.clone(), session.clone());
-        old
-    };
     if let Some(old) = old {
         cleanup(&old, &state);
     }
@@ -174,6 +193,9 @@ where
     // 写任务：消费出站控制消息；服务端退出或会话被替换时尽量发送 TLS close_notify。
     let shutdown_writer = state.shutdown.clone();
     let stop_writer = session.stop.clone();
+    // 回给客户端的帧用**协商结果**编码（DESIGN §6.4）：客户端的解码器只接受
+    // 自己声明的版本区间，用更高版本编码会让低版本客户端直接拒收。
+    let frame_version = negotiated_version;
     let mut writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -181,11 +203,11 @@ where
                     let Some(msg) = msg else {
                         // 通道关闭且处于退出流程：补发 Close 再 close_notify。
                         if shutdown_writer.is_cancelled() {
-                            graceful_close(&mut writer, "server shutdown").await;
+                            graceful_close(&mut writer, "server shutdown", frame_version).await;
                         }
                         break;
                     };
-                    match msg.to_frame() {
+                    match msg.to_frame_with_version(frame_version) {
                         Ok(frame) => {
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(rfrp_common::util::control::CONTROL_SEND_TIMEOUT),
@@ -210,11 +232,18 @@ where
                 }
                 _ = shutdown_writer.cancelled() => {
                     // 服务端退出：先发 Close 帧再 TLS close_notify（DESIGN §6.2.2）。
-                    graceful_close(&mut writer, "server shutdown").await;
+                    graceful_close(&mut writer, "server shutdown", frame_version).await;
                     break;
                 }
-                _ = stop_writer.notified() => {
-                    graceful_close(&mut writer, "session replaced").await;
+                _ = stop_writer.cancelled() => {
+                    // 会话被停止（正常断开 / 被重连替换）：尽量发 Close 帧再 close_notify。
+                    // 关闭原因按服务端退出令牌区分，便于对端排障。
+                    let reason = if shutdown_writer.is_cancelled() {
+                        "server shutdown"
+                    } else {
+                        "session closed"
+                    };
+                    graceful_close(&mut writer, reason, frame_version).await;
                     break;
                 }
             }
@@ -230,6 +259,7 @@ where
             session_id: Some(session_id.clone()),
             work_conn_tls: Some(config.server.work_conn_tls),
             work_conn_token: Some(work_conn_token),
+            protocol_version: Some(negotiated_version),
         }),
     )
     .await
@@ -250,9 +280,13 @@ where
     // 记录对端回传的最近心跳 ts：以"本轮是否被回应"判定超时，
     // 避免 Notify 许可残留（无等待者时 notify_one 会存许可）导致漏检一轮。
     let pong_ts = Arc::new(AtomicU64::new(0));
+    // 最近一次发出的心跳 ts：HeartbeatResp 的 ts 不得超前于它，否则恶意/异常
+    // 客户端可用 u64::MAX 让后续每轮心跳都“立即通过”，永久绕过超时检测。
+    let last_sent_ts = Arc::new(AtomicU64::new(0));
     let hb_tx = tx.clone();
     let hb_pong = pong.clone();
     let hb_pong_ts = pong_ts.clone();
+    let hb_last_sent = last_sent_ts.clone();
     let hb_disconnect = disconnect.clone();
     let session_id_hb = session_id.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -261,6 +295,7 @@ where
         loop {
             iv.tick().await;
             let ts = now_ms();
+            hb_last_sent.store(ts, Ordering::Relaxed);
             tracing::debug!(session = %session_id_hb, ts, "heartbeat sent");
             // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
             // 说明控制写路径已不可用：此时等不到 pong，必须直接判定连接失效。
@@ -363,13 +398,23 @@ where
                                 try_send(&tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
                             }
                             Message::HeartbeatResp(h) => {
-                                // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
-                                let rtt = now_ms().saturating_sub(h.ts);
-                                state.metrics.set_rtt_ms(rtt);
-                                pong_ts.store(h.ts, Ordering::Relaxed);
-                                tracing::debug!(session = %session_id, rtt_ms = rtt, "heartbeat response received");
-                                // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
-                                pong.notify_one();
+                                let sent = last_sent_ts.load(Ordering::Relaxed);
+                                if sent == 0 || h.ts > sent {
+                                    // 未来时间戳（或未请求的响应）不得推进 pong_ts。
+                                    tracing::debug!(
+                                        session = %session_id, ts = h.ts, sent,
+                                        "ignoring heartbeat response with invalid ts"
+                                    );
+                                } else {
+                                    // 回传的 ts 即本端发出时间 → RTT = now - ts（§8.3）。
+                                    let rtt = now_ms().saturating_sub(h.ts);
+                                    // 逐会话记录：多会话时单一全局值语义不明（见 Session::rtt_ms）。
+                                    session.rtt_ms.store(rtt, Ordering::Relaxed);
+                                    pong_ts.store(h.ts, Ordering::Relaxed);
+                                    tracing::debug!(session = %session_id, rtt_ms = rtt, "heartbeat response received");
+                                    // 通知心跳任务已收到对端回应（§8.3 ping/pong）。
+                                    pong.notify_one();
+                                }
                             }
                             Message::Close(c) => {
                                 tracing::info!(session = %session_id, reason = ?c.reason, "control connection closed by client");
@@ -389,7 +434,7 @@ where
                 tracing::info!(session = %session_id, "control connection closed by heartbeat timeout");
                 break;
             }
-            _ = session.stop.notified() => {
+            _ = session.stop.cancelled() => {
                 tracing::info!(session = %session_id, "control connection stopped (replaced or shutdown)");
                 break;
             }
@@ -401,14 +446,23 @@ where
     }
 
     heartbeat_task.abort();
+    // 先注销会话并清理资源，**再**等写任务收尾：
+    //
+    // 1) 立即释放公网端口与代理监听（用户连接不必多等 1 秒才能连上）；
+    // 2) `cleanup` 会取消 `session.stop`，写任务随即被唤醒退出——否则写任务
+    //    只能等下面的 1 秒硬超时被强杀。
+    //
+    // 旧实现把这两步放在写任务 await 之后：`Session` 结构里持有一份 `tx` 克隆，
+    // `drop(tx)` 并不会关闭通道，写任务的 `rx.recv()` 永远挂起 → 每次控制连接
+    // 拆解都要多花 1 秒（端口被占用的窗口期也相应拉长）。
+    unregister_session(&state, &session);
+    cleanup(&session, &state);
     // 给写任务机会刷出 Close 帧，超时再强杀。
     drop(tx);
     let done = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task).await;
     if done.is_err() {
         writer_task.abort();
     }
-    unregister_session(&state, &session);
-    cleanup(&session, &state);
     Ok(())
 }
 
@@ -422,6 +476,19 @@ fn unregister_session(state: &ServerState, session: &Session) {
     }
 }
 
+/// 版本不匹配时的错误描述。
+///
+/// 前缀固定为 `version mismatch`（客户端据此判定致命错误并停止重连），
+/// 后面附带客户端声明版本与服务端支持列表，便于直接排障。
+fn version_mismatch_detail(client_version: u8) -> String {
+    let supported = PROTOCOL_VERSIONS_SUPPORTED
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("version mismatch: client={client_version}, server supports [{supported}]")
+}
+
 /// NewProxy 字段校验（DESIGN §6.2.3），返回错误标识或 None。
 fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
     if np.proxy_name.is_empty()
@@ -431,12 +498,16 @@ fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
     {
         return Some("invalid field");
     }
+    if matches!(np.r#type, ProxyType::Tcp | ProxyType::Udp) && np.remote_port == Some(0) {
+        return Some("invalid field");
+    }
     if let Some(doms) = &np.custom_domains {
         if doms.len() > MAX_CUSTOM_DOMAINS {
             return Some("invalid field");
         }
         for d in doms {
-            if d.is_empty() || d.len() > MAX_DOMAIN_LEN {
+            if d.is_empty() || d.len() > MAX_DOMAIN_LEN || !rfrp_common::config::is_valid_domain(d)
+            {
                 return Some("invalid field");
             }
         }
@@ -446,7 +517,10 @@ fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
 
 /// 断开时中止所有代理监听任务，并清理本会话的待处理工作连接。
 fn cleanup(session: &Session, state: &ServerState) {
-    session.stop.notify_waiters();
+    // 取消会话停止信号：唤醒控制循环与写任务，使其尽快退出。
+    // `CancellationToken` 的取消是**粘性**的，即使此刻没有等待者，
+    // 之后的 `cancelled()` 也会立即返回就绪（`Notify` 不具备该语义）。
+    session.stop.cancel();
     // 一次加锁收集需要清理的代理名（全部 + UDP）与域名，随后在锁外操作全局索引。
     let (proxy_names, udp_names, domain_names) = {
         let proxies = session.proxies.lock();
@@ -459,17 +533,24 @@ fn cleanup(session: &Session, state: &ServerState) {
         let domain_names: Vec<String> = session.proxy_domains.lock().keys().cloned().collect();
         (proxy_names, udp_names, domain_names)
     };
-    state.remove_proxy_stats(&proxy_names);
-    state.unindex_proxies(proxy_names);
-    state.unindex_domains(domain_names);
+    state.remove_proxy_stats(&proxy_names, &session.session_id);
+    state.unindex_proxies(proxy_names, session);
+    state.unindex_domains(domain_names, session);
     for (_, entry) in session.proxies.lock().drain() {
         entry.handle.abort();
     }
     let mut udp = state.udp.lock();
     for n in udp_names {
-        // 取消会话级停止信号：结束仍在途的 UDP 工作连接，释放 UDP 端口。
-        if let Some(p) = udp.remove(&n) {
-            p.stop.cancel();
+        // 仅移除本会话持有的 UDP 运行态：同一 run_id 的新会话可能已注册同名
+        // 代理（旧 cleanup 不能按名误删/误停新条目）。
+        if udp
+            .get(&n)
+            .is_some_and(|p| p.owner_session_id == session.session_id)
+        {
+            // 取消会话级停止信号：结束仍在途的 UDP 工作连接，释放 UDP 端口。
+            if let Some(p) = udp.remove(&n) {
+                p.stop.cancel();
+            }
         }
     }
     session.proxy_domains.lock().clear();
