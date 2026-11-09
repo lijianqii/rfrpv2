@@ -482,24 +482,42 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
         })
         .collect();
 
+    let active_connections = state
+        .metrics
+        .active_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let total_connections = state
+        .metrics
+        .total_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let udp_sessions_total = state
+        .metrics
+        .udp_sessions_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let active_sessions = active_connections + g.udp_sessions as i64;
+    let total_sessions = total_connections + udp_sessions_total;
+
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.metrics.uptime_secs(),
         "sessions": session_list,
         "pending_work": g.pending_work,
         "udp_sessions": g.udp_sessions,
+        "active_sessions": active_sessions,
+        "total_sessions": total_sessions,
         "proxies": g.proxies,
         "pooled_work_conns": g.pooled_work_conns,
         "rtt_ms": state.rtt_ms(),
         "proxy_stats": proxy_stats,
         "metrics": {
-            "total_connections": state.metrics.total_connections.load(std::sync::atomic::Ordering::Relaxed),
-            "active_connections": state.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+            "total_connections": total_connections,
+            "active_connections": active_connections,
             "bytes_up": state.metrics.bytes_up.load(std::sync::atomic::Ordering::Relaxed),
             "bytes_down": state.metrics.bytes_down.load(std::sync::atomic::Ordering::Relaxed),
             "accepted_total": state.metrics.accepted_total.load(std::sync::atomic::Ordering::Relaxed),
             "accept_errors_total": state.metrics.accept_errors_total.load(std::sync::atomic::Ordering::Relaxed),
             "udp_dropped_total": state.metrics.udp_dropped_total.load(std::sync::atomic::Ordering::Relaxed),
+            "udp_sessions_total": udp_sessions_total,
             "accepting": state.metrics.is_accepting(),
         },
     })
@@ -747,6 +765,42 @@ mod metrics_tests {
         let by_name = |n: &str| proxies.iter().find(|p| p["name"] == n).unwrap();
         assert_eq!(by_name("ssh")["remote_port"], 6000);
         assert_eq!(by_name("web")["domains"][0], "dev.example.com");
+
+        // UDP 代理也必须出现在每代理统计中（此前只更新全局 Metrics，Dashboard 显示 0B）。
+        let udp_stats = state.proxy_stats_for_owner("rdp-udp", "s");
+        udp_stats
+            .bytes_up
+            .store(123, std::sync::atomic::Ordering::Relaxed);
+        udp_stats
+            .bytes_down
+            .store(456, std::sync::atomic::Ordering::Relaxed);
+        udp_stats
+            .active_connections
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .active_connections
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .total_connections
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .udp_sessions_total
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let json = status_json(&state);
+        assert_eq!(json["active_sessions"], 2, "TCP active 2 + active UDP 0");
+        assert_eq!(json["total_sessions"], 8, "TCP total 5 + UDP total 3");
+        assert_eq!(json["metrics"]["udp_sessions_total"], 3);
+        let stats = json["proxy_stats"].as_array().unwrap();
+        let udp = stats
+            .iter()
+            .find(|s| s["name"] == "rdp-udp")
+            .expect("udp proxy stats must be exposed");
+        assert_eq!(udp["bytes_up"], 123);
+        assert_eq!(udp["bytes_down"], 456);
+        assert_eq!(udp["active_connections"], 1);
     }
 
     #[tokio::test]

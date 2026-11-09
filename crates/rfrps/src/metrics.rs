@@ -17,11 +17,13 @@ pub struct Metrics {
     pub accept_errors_total: AtomicU64,
     /// UDP 因待配对会话达到上限而丢弃的包数。
     pub udp_dropped_total: AtomicU64,
+    /// 累计建立的 UDP 会话数（跨代理、跨会话清理保留）。
+    pub udp_sessions_total: AtomicU64,
     /// accept 循环当前是否正常（连续失败后置 false，恢复后置 true）。
     pub accepting: AtomicBool,
-    /// 累计接受的用户连接数。
+    /// 累计接受的 TCP/vhost 用户连接数（不含 UDP 会话）。
     pub total_connections: Arc<AtomicU64>,
-    /// 当前活跃用户连接数。
+    /// 当前活跃的 TCP/vhost 用户连接数（不含 UDP 会话）。
     pub active_connections: Arc<AtomicI64>,
     /// 累计上行字节（外部 -> 本地）。
     pub bytes_up: Arc<AtomicU64>,
@@ -63,6 +65,7 @@ impl Default for Metrics {
             accepted_total: AtomicU64::new(0),
             accept_errors_total: AtomicU64::new(0),
             udp_dropped_total: AtomicU64::new(0),
+            udp_sessions_total: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             total_connections: Arc::new(AtomicU64::new(0)),
             active_connections: Arc::new(AtomicI64::new(0)),
@@ -110,9 +113,10 @@ impl Metrics {
     /// RTT 逐会话维护，不属于进程级计数器。
     pub fn render(&self, rtt_ms: u64) -> String {
         format!(
-            "# HELP rfrp_connections_total Total accepted user connections.\n\
+            "# HELP rfrp_connections_total Total accepted TCP/vhost user connections (UDP sessions: rfrp_udp_sessions).\n\
              # TYPE rfrp_connections_total counter\n\
              rfrp_connections_total {}\n\
+             # HELP rfrp_active_connections Active TCP/vhost user connections (UDP sessions: rfrp_udp_sessions).\n\
              # TYPE rfrp_active_connections gauge\n\
              rfrp_active_connections {}\n\
              # TYPE rfrp_bytes_up_total counter\n\
@@ -131,6 +135,9 @@ impl Metrics {
              # HELP rfrp_udp_dropped_total UDP datagrams dropped (pending session limit or session backpressure).\n\
              # TYPE rfrp_udp_dropped_total counter\n\
              rfrp_udp_dropped_total {}\n\
+             # HELP rfrp_udp_sessions_total Total established UDP sessions.\n\
+             # TYPE rfrp_udp_sessions_total counter\n\
+             rfrp_udp_sessions_total {}\n\
              # HELP rfrp_accepting Whether the accept loop is healthy (1/0).\n\
              # TYPE rfrp_accepting gauge\n\
              rfrp_accepting {}\n",
@@ -142,6 +149,7 @@ impl Metrics {
             self.accepted_total.load(Ordering::Relaxed),
             self.accept_errors_total.load(Ordering::Relaxed),
             self.udp_dropped_total.load(Ordering::Relaxed),
+            self.udp_sessions_total.load(Ordering::Relaxed),
             u8::from(self.is_accepting()),
         )
     }
@@ -151,6 +159,10 @@ impl Metrics {
 pub fn render_prometheus(state: &crate::state::ServerState) -> String {
     let g = state.gauges();
     let mut out = state.metrics.render(state.rtt_ms());
+    let active_sessions =
+        state.metrics.active_connections.load(Ordering::Relaxed) + g.udp_sessions as i64;
+    let data_sessions_total = state.metrics.total_connections.load(Ordering::Relaxed)
+        + state.metrics.udp_sessions_total.load(Ordering::Relaxed);
     out.push_str(&format!(
         "# HELP rfrp_uptime_seconds Process uptime in seconds.\n\
          # TYPE rfrp_uptime_seconds gauge\n\
@@ -167,6 +179,12 @@ pub fn render_prometheus(state: &crate::state::ServerState) -> String {
          # HELP rfrp_udp_sessions Active UDP sessions.\n\
          # TYPE rfrp_udp_sessions gauge\n\
          rfrp_udp_sessions {}\n\
+         # HELP rfrp_active_sessions Active data-plane user sessions (TCP/vhost connections + UDP sessions).\n\
+         # TYPE rfrp_active_sessions gauge\n\
+         rfrp_active_sessions {}\n\
+         # HELP rfrp_data_sessions_total Total accepted data-plane user sessions (TCP/vhost connections + established UDP sessions).\n\
+         # TYPE rfrp_data_sessions_total counter\n\
+         rfrp_data_sessions_total {}\n\
          # HELP rfrp_pooled_work_conns Idle pooled work connections.\n\
          # TYPE rfrp_pooled_work_conns gauge\n\
          rfrp_pooled_work_conns {}\n",
@@ -175,6 +193,8 @@ pub fn render_prometheus(state: &crate::state::ServerState) -> String {
         g.proxies,
         g.pending_work,
         g.udp_sessions,
+        active_sessions,
+        data_sessions_total,
         g.pooled_work_conns,
     ));
     // 每代理指标（标签为代理名；名字已在注册时校验，无空白/斜杠）。
@@ -267,6 +287,7 @@ mod tests {
         assert!(text.contains("rfrp_active_connections"));
         assert!(text.contains("rfrp_bytes_up_total"));
         assert!(text.contains("rfrp_bytes_down_total"));
+        assert!(text.contains("rfrp_udp_sessions_total"));
     }
 
     #[test]
@@ -279,6 +300,9 @@ mod tests {
             "rfrp_proxies 0",
             "rfrp_pending_work 0",
             "rfrp_udp_sessions 0",
+            "rfrp_udp_sessions_total 0",
+            "rfrp_active_sessions 0",
+            "rfrp_data_sessions_total 0",
             "rfrp_pooled_work_conns 0",
             "rfrp_connections_total",
             "rfrp_bytes_up_total",
@@ -295,13 +319,32 @@ mod tests {
         m.active_connections.fetch_add(4, Ordering::Relaxed);
         m.bytes_up.fetch_add(1024, Ordering::Relaxed);
         m.bytes_down.fetch_add(2048, Ordering::Relaxed);
+        m.udp_sessions_total.fetch_add(7, Ordering::Relaxed);
         let text = m.render(0);
         assert!(text.contains("rfrp_connections_total 10"));
         assert!(text.contains("rfrp_active_connections 4"));
         assert!(text.contains("rfrp_bytes_up_total 1024"));
         assert!(text.contains("rfrp_bytes_down_total 2048"));
+        assert!(text.contains("rfrp_udp_sessions_total 7"));
         assert!(text.contains("# TYPE rfrp_connections_total counter"));
         assert!(text.contains("# TYPE rfrp_active_connections gauge"));
+    }
+
+    #[test]
+    fn aggregates_tcp_connections_and_udp_sessions() {
+        let state = crate::state::ServerState::new();
+        state.metrics.active_connections.store(2, Ordering::Relaxed);
+        state.metrics.total_connections.store(5, Ordering::Relaxed);
+        state.metrics.udp_sessions_total.store(3, Ordering::Relaxed);
+        let text = render_prometheus(&state);
+        assert!(
+            text.contains("rfrp_active_sessions 2"),
+            "active TCP (2) + active UDP (0) expected:\n{text}"
+        );
+        assert!(
+            text.contains("rfrp_data_sessions_total 8"),
+            "total TCP (5) + total UDP (3) expected:\n{text}"
+        );
     }
 }
 

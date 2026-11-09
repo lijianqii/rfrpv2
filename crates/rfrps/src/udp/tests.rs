@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::metrics::Metrics;
+use bytes::Bytes;
 
 fn test_session() -> (Arc<Session>, mpsc::Receiver<Message>) {
     crate::control::test_session_with_token("r", "tok")
@@ -15,6 +16,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
         metrics: Arc::new(Metrics::new()),
+        stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout,
@@ -297,6 +299,129 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
 }
 
 #[tokio::test]
+async fn register_udp_proxy_wires_per_proxy_stats() {
+    let state = ServerState::new();
+    let (session, _ctl_rx) = test_session();
+    let handle = register_udp_proxy(
+        "udp-stats".into(),
+        0,
+        &session,
+        &state,
+        "127.0.0.1",
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("bind ephemeral UDP port");
+
+    let proxy = state
+        .udp
+        .lock()
+        .get("udp-stats")
+        .cloned()
+        .expect("udp proxy registered");
+    let stats = state.proxy_stats_for_owner("udp-stats", &session.session_id);
+    assert!(
+        Arc::ptr_eq(&proxy.stats, &stats),
+        "UDP proxy must use the per-proxy stats entry exposed by Dashboard"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn udp_metrics_track_pending_paired_and_downstream_bytes() {
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let (session, _ctl_rx) = test_session();
+    let state = ServerState::new();
+    let peer: SocketAddr = "127.0.0.1:1006".parse().unwrap();
+
+    // 首包 + pending 窗口期的后续包都要计入上行。
+    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"first").await;
+    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"second").await;
+    let up = proxy
+        .stats
+        .bytes_up
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(up, 11, "first + pending datagrams must be counted");
+    assert_eq!(
+        proxy
+            .metrics
+            .bytes_up
+            .load(std::sync::atomic::Ordering::Relaxed),
+        up,
+        "global and per-proxy upstream counters must agree"
+    );
+
+    // 建立已配对会话：累计/活跃连接数各 +1。
+    let (tx, _rx) = mpsc::channel(4);
+    assert!(register_session(
+        &proxy,
+        peer,
+        tx,
+        7,
+        CancellationToken::new()
+    ));
+    assert_eq!(
+        proxy
+            .stats
+            .connections_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        proxy
+            .stats
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_sessions_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "global UDP established-session counter must include this session"
+    );
+
+    // 已配对会话的上行。
+    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"paired").await;
+    assert_eq!(
+        proxy
+            .stats
+            .bytes_up
+            .load(std::sync::atomic::Ordering::Relaxed),
+        17
+    );
+
+    // 下行字节。
+    forward_to_client(&proxy, peer, &[Bytes::from_static(b"response")], 7).await;
+    assert_eq!(
+        proxy
+            .stats
+            .bytes_down
+            .load(std::sync::atomic::Ordering::Relaxed),
+        8
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .bytes_down
+            .load(std::sync::atomic::Ordering::Relaxed),
+        8
+    );
+
+    // 会话退出后活跃数回到 0。
+    remove_session_if_owner(&proxy, peer, 7);
+    assert_eq!(
+        proxy
+            .stats
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
 async fn session_limit_rejects_new_client() {
     let mut proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
     Arc::get_mut(&mut proxy).unwrap().max_sessions = 1;
@@ -349,6 +474,72 @@ async fn sweep_closes_session_sender_so_handler_can_exit() {
     assert!(
         rx.recv().await.is_none(),
         "dropping the session must close the handler channel"
+    );
+}
+
+#[tokio::test]
+async fn session_replacement_keeps_active_count_and_increments_total() {
+    let proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    let client: SocketAddr = "127.0.0.1:5".parse().unwrap();
+
+    let (tx1, _rx1) = mpsc::channel(4);
+    assert!(register_session(
+        &proxy,
+        client,
+        tx1,
+        1,
+        CancellationToken::new()
+    ));
+    let (tx2, _rx2) = mpsc::channel(4);
+    assert!(register_session(
+        &proxy,
+        client,
+        tx2,
+        2,
+        CancellationToken::new()
+    ));
+
+    assert_eq!(
+        proxy
+            .stats
+            .connections_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "replacement is a new established session"
+    );
+    assert_eq!(
+        proxy
+            .stats
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "same client must still count as one active session"
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_sessions_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "replacement must add to the global established-session counter"
+    );
+
+    // 旧 handler 退出不能把新会话的活跃数减掉。
+    remove_session_if_owner(&proxy, client, 1);
+    assert_eq!(
+        proxy
+            .stats
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    remove_session_if_owner(&proxy, client, 2);
+    assert_eq!(
+        proxy
+            .stats
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
 }
 

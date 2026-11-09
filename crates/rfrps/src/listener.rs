@@ -243,6 +243,8 @@ fn remove_udp_proxy_if_owner(state: &ServerState, session: &Session, proxy_name:
         if let Some(proxy) = udp.remove(proxy_name) {
             proxy.stop.cancel();
         }
+        // 注册回滚时同步移除刚创建的每代理统计，避免 Dashboard 出现孤儿条目。
+        state.remove_proxy_stats(&[proxy_name.to_string()], &session.session_id);
     }
 }
 

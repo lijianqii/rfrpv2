@@ -95,8 +95,10 @@ tr:last-child td{border-bottom:0}
   <section class="kpis">
     <div class="kpi"><div class="k-label">控制会话</div><div class="k-value" id="k-sessions">-</div></div>
     <div class="kpi"><div class="k-label">已注册代理</div><div class="k-value" id="k-proxies">-</div></div>
-    <div class="kpi"><div class="k-label">活跃连接</div><div class="k-value" id="k-active">-</div></div>
-    <div class="kpi"><div class="k-label">累计连接</div><div class="k-value" id="k-total">-</div></div>
+    <div class="kpi"><div class="k-label">TCP 活跃连接</div><div class="k-value" id="k-active">-</div></div>
+    <div class="kpi"><div class="k-label">TCP 累计连接</div><div class="k-value" id="k-total">-</div></div>
+    <div class="kpi"><div class="k-label">总活跃会话</div><div class="k-value" id="k-active-sessions">-</div></div>
+    <div class="kpi"><div class="k-label">总会话累计</div><div class="k-value" id="k-total-sessions">-</div></div>
     <div class="kpi"><div class="k-label">待配对连接</div><div class="k-value" id="k-pending">-</div></div>
     <div class="kpi"><div class="k-label">UDP 会话</div><div class="k-value" id="k-udp">-</div></div>
     <div class="kpi"><div class="k-label">池中空闲</div><div class="k-value" id="k-pooled">-</div></div>
@@ -330,6 +332,8 @@ tr:last-child td{border-bottom:0}
     text("k-proxies", s.proxies);
     text("k-active", m.active_connections);
     text("k-total", m.total_connections);
+    text("k-active-sessions", s.active_sessions);
+    text("k-total-sessions", s.total_sessions);
     text("k-pending", s.pending_work);
     text("k-udp", s.udp_sessions);
     text("k-pooled", s.pooled_work_conns);

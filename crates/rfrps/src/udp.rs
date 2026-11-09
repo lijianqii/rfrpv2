@@ -85,6 +85,70 @@ fn recycle_packets(pool: &Arc<Mutex<Vec<BytesMut>>>, packets: &mut Vec<UdpPacket
     }
 }
 
+/// 记录 UDP 上行字节：全局总量 + 每代理统计。
+fn record_up(proxy: &UdpProxy, n: usize) {
+    let n = n as u64;
+    proxy
+        .metrics
+        .bytes_up
+        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    proxy
+        .stats
+        .bytes_up
+        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 记录 UDP 下行字节：全局总量 + 每代理统计。
+fn record_down(proxy: &UdpProxy, n: usize) {
+    let n = n as u64;
+    proxy
+        .metrics
+        .bytes_down
+        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    proxy
+        .stats
+        .bytes_down
+        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// UDP 会话建立：累计连接数 +1，活跃会话数 +1。
+fn record_session_open(proxy: &UdpProxy) {
+    proxy
+        .metrics
+        .udp_sessions_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    proxy
+        .stats
+        .connections_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    proxy
+        .stats
+        .active_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// UDP 会话关闭：活跃会话数 -1（饱和到 0，避免异常路径把计数减成负数）。
+fn record_session_close(proxy: &UdpProxy, count: i64) {
+    let count = count.max(0);
+    if count == 0 {
+        return;
+    }
+    let active = &proxy.stats.active_connections;
+    let mut cur = active.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = (cur - count).max(0);
+        match active.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// 等待工作连接配对的 UDP 会话（首个数据包触发 ReqWorkConn 后暂存）。
 pub struct PendingUdp {
     pub client: SocketAddr,
@@ -111,6 +175,8 @@ pub struct UdpProxy {
     pub pending_by_id: Mutex<HashMap<u64, PendingUdp>>,
     pub pending_client: Mutex<HashMap<SocketAddr, u64>>,
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// 每代理统计（Dashboard / Prometheus）；不能复用全局 `Metrics`。
+    pub stats: Arc<crate::metrics::ProxyStats>,
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
     pub session_timeout: Duration,
     pub pending_timeout: Duration,
@@ -149,12 +215,14 @@ pub async fn register_udp_proxy(
         Ok(bytes) => tracing::debug!(%proxy_name, bytes, "udp recv buffer enlarged"),
         Err(e) => tracing::debug!(%proxy_name, error = %e, "failed to enlarge udp recv buffer"),
     }
+    let stats = state.proxy_stats_for_owner(&proxy_name, &session.session_id);
     let proxy = Arc::new(UdpProxy {
         socket: Arc::new(socket),
         sessions: Mutex::new(HashMap::new()),
         pending_by_id: Mutex::new(HashMap::new()),
         pending_client: Mutex::new(HashMap::new()),
         metrics: state.metrics.clone(),
+        stats,
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
@@ -255,10 +323,7 @@ async fn handle_datagram(
         }
     };
     if let Some(tx) = tx {
-        proxy
-            .metrics
-            .bytes_up
-            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        record_up(proxy, data.len());
         // 背压保护：所有客户端共用同一个收包循环，工作连接消费慢时不得在这里
         // await（否则整代理数据报被阻塞）。通道满即丢包并计数——UDP 语义允许丢失。
         // 先看容量再分配：满队列时不必先拷贝一个包再丢弃。
@@ -288,6 +353,8 @@ async fn handle_datagram(
     if let Some(id) = id {
         let tx = { proxy.pending_by_id.lock().get(&id).map(|p| p.tx.clone()) };
         if let Some(tx) = tx {
+            // 待配对窗口期的包同样属于上行流量，之前漏计了这里的字节数。
+            record_up(proxy, data.len());
             // 同会话背压：待配对窗口期也不得阻塞收包循环。
             if tx.capacity() == 0 {
                 proxy.metrics.inc_udp_dropped();
@@ -330,10 +397,7 @@ async fn handle_datagram(
     // 避免工作连接建立期间丢包（DESIGN §8.6）。
     let (tx, rx) = mpsc::channel::<UdpPacket>(UDP_SESSION_QUEUE_DEPTH);
     let work_id = state.next_work_id();
-    proxy
-        .metrics
-        .bytes_up
-        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    record_up(proxy, data.len());
     let _ = tx.send(alloc_udp_packet(&proxy.packet_pool, data)).await;
     proxy.pending_by_id.lock().insert(
         work_id,
@@ -376,6 +440,8 @@ fn sweep(proxy: &Arc<UdpProxy>) {
             // 先取消再删除：即使 handler 正阻塞在工作连接写/下行发送上，
             // 也会在 select! 的取消分支中退出，而不是等对端主动关闭。
             s.cancel.cancel();
+            // 计数与删除在同一把锁内更新，避免与 Dashboard 采样产生不一致。
+            record_session_close(proxy, 1);
             false
         } else {
             true
@@ -533,6 +599,7 @@ fn remove_session_if_owner(proxy: &Arc<UdpProxy>, client: SocketAddr, work_id: u
     let mut sessions = proxy.sessions.lock();
     if sessions.get(&client).is_some_and(|s| s.work_id == work_id) {
         sessions.remove(&client);
+        record_session_close(proxy, 1);
     }
 }
 
@@ -558,10 +625,7 @@ async fn forward_to_client(
         return;
     }
     for d in frames {
-        proxy
-            .metrics
-            .bytes_down
-            .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        record_down(proxy, d.len());
         if let Err(e) = proxy.socket.send_to(d, client).await {
             tracing::warn!(work_id, error = %e, "udp send_to client error");
         }
@@ -577,7 +641,8 @@ fn register_session(
     cancel: CancellationToken,
 ) -> bool {
     let mut sessions = proxy.sessions.lock();
-    if !sessions.contains_key(&client) && sessions.len() >= proxy.max_sessions {
+    let replacing = sessions.contains_key(&client);
+    if !replacing && sessions.len() >= proxy.max_sessions {
         return false;
     }
     // 同一 client 已有旧会话：先取消它，确保旧 handler 即使阻塞在写操作也能退出。
@@ -593,6 +658,21 @@ fn register_session(
             cancel,
         },
     );
+
+    // 新工作连接对应一次新的 UDP 会话；替换同一 client 时活跃数不变。
+    // 在持有 sessions 锁时更新计数，避免与 sweep 删除并发导致计数漂移。
+    if replacing {
+        proxy
+            .metrics
+            .udp_sessions_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        proxy
+            .stats
+            .connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        record_session_open(proxy);
+    }
     true
 }
 

@@ -146,9 +146,8 @@ cookie_secure = false       # 置于 HTTPS 反向代理之后时置 true（见�
 | `GET /metrics` | Prometheus 文本 |
 | `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
 
-> 会话 Cookie 存的是 base64 编码的 `user:password`（与 Basic Auth 同级的凭据载体，
-> base64 不是加密——拿到 Cookie 即等于拿到明文密码）。因此 Cookie 有明确的
-> `Max-Age`（`session_ttl_secs`，默认 8 小时）限制暴露窗口。
+> 会话 Cookie 只保存随机的服务端会话 ID（不再保存凭据），服务端可撤销并执行
+> `session_ttl_secs`（默认 8 小时）的 TTL；退出登录会同时撤销服务端会话。
 > 在不可信网络暴露 Dashboard 时请启用 HTTPS 反向代理（并置 `cookie_secure = true`），或只绑回环地址。
 >
 > 看板页面需要启用 JavaScript（首屏用内嵌状态渲染，随后每 5s 轮询 `/api/status`）。
@@ -156,21 +155,24 @@ cookie_secure = false       # 置于 HTTPS 反向代理之后时置 true（见�
 `/metrics` 指标：
 
 ```
-rfrp_connections_total      累计接受的用户连接
-rfrp_active_connections     当前活跃用户连接
-rfrp_bytes_up_total         上行字节（外部 → 本地）
-rfrp_bytes_down_total       下行字节（本地 → 外部）
+rfrp_connections_total      累计接受的 TCP/vhost 用户连接
+rfrp_active_connections     当前活跃的 TCP/vhost 用户连接
+rfrp_active_sessions        总活跃会话（TCP/vhost 连接 + UDP 会话）
+rfrp_data_sessions_total    累计总会话（TCP/vhost 连接 + 累计建立的 UDP 会话）
+rfrp_bytes_up_total         上行字节（外部 → 本地，含 UDP）
+rfrp_bytes_down_total       下行字节（本地 → 外部，含 UDP）
 rfrp_sessions               活跃控制会话
 rfrp_proxies                已注册代理
 rfrp_pending_work           等待工作连接的用户连接
 rfrp_udp_sessions           活跃 UDP 会话
+rfrp_udp_sessions_total     累计建立的 UDP 会话
 rfrp_pooled_work_conns      池中空闲工作连接
 rfrp_uptime_seconds         进程运行时长
 rfrp_rtt_ms                 控制链路 RTT（毫秒，0=未测得）
 rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/工作连接）
 rfrp_accept_errors_total    accept 错误累计
 rfrp_accepting              accept 循环是否正常（1/0）
-rfrp_udp_dropped_total      UDP 因待配对会话达上限或会话背压（通道满）而丢弃的包数
+rfrp_udp_dropped_total      UDP 应用层丢弃的包数（待配对达上限/会话背压；不含内核缓冲溢出）
 rfrp_proxy_bytes_up_total{proxy="…"}     每代理上行字节
 rfrp_proxy_bytes_down_total{proxy="…"}   每代理下行字节
 rfrp_proxy_connections_total{proxy="…"}  每代理累计连接数
