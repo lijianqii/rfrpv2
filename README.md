@@ -257,6 +257,44 @@ crates/
 cargo test --all
 ```
 
+真实进程级 E2E（仅依赖 Python 3 标准库）覆盖：
+
+- 功能：TCP 并发/大流量、HTTP vhost 域名路由、RDP TCP+UDP 同端口与 Dashboard 统计、
+  UDP 多客户端/大包、UDP 会话超时重建、TLS 控制/工作连接、rfrps 重启后重连、UDP 突发后可用性；
+- 性能冒烟：TCP 16 MiB 吞吐、短连接 p50/p95 延迟；
+- 稳定性：300 次 TCP 连接后的 fd/RSS 回落、20 个 UDP 会话反复创建/清理、
+  5 秒 TCP+UDP 混合负载、连续 3 次 rfrps 重启。
+
+```bash
+make e2e
+# 或指定任意 rfrp 二进制
+RFRP_BIN=target/release/rfrp python3 scripts/e2e_env.py -v
+```
+
+`make e2e` 会先构建并显式使用 `target/debug/rfrp`。性能指标以 `[perf]` 标记输出，
+只用于冒烟和人工对比，不是正式基准（正式基准见 `make bench` / `make bench-gate`）。
+稳定性指标以 `[stab]` 标记，断言使用宽松上限（如 fd 增长 < 64、RSS 增长 < 256 MiB），
+用于发现明显泄漏而不是精确容量评估。脚本每个测试启动独立的 rfrps/rfrpc 进程和临时配置，
+结束时清理；断言失败时会输出服务端/客户端日志尾部便于排查。
+
+长时间稳定性测试（soak）：
+
+```bash
+make soak                              # 10 分钟冒烟
+make soak-long                         # 1 小时 release 标准
+make soak-long SOAK_LONG_SECS=28800    # 8 小时
+```
+
+soak 持续运行 TCP/UDP 混合负载，周期性注入 rfrps/rfrpc 重启、客户端
+`SIGSTOP`/`SIGCONT` 冻结和静默回落检查，每 10 秒采样服务端 Dashboard、客户端
+`status_addr`、`/proc` fd/RSS 和日志大小。
+
+- 报告保留在 `target/soak-<时间戳>.jsonl`、`-summary.json`、`-summary.md`；
+- 日志临时目录默认保留（`E2E_SOAK_KEEP_LOGS=0` 可在成功时清理）；
+- 默认 `E2E_SOAK_STRICT=0` 只采集基线；确认阈值后设 `1` 启用成功率/fd/RSS/静默判定；
+- 负载强度、采样间隔、故障注入间隔均可通过 `E2E_SOAK_*` 环境变量调整；
+- 全程不需要 root，不修改系统网络配置。
+
 Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`
 验证优雅退出（服务端信号 watcher 同时监听 Ctrl-C/Ctrl-Break）；无控制台环境
 （服务/CI）会自动跳过该用例，强制终止用例不依赖控制台、始终运行。
