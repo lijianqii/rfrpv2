@@ -10,7 +10,7 @@ use rfrp_common::config::{
     DashboardSection, LogSection, ProxySection, ServerConfig, ServerSection,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 fn server_config(dashboard_port: u16) -> ServerConfig {
     ServerConfig {
@@ -85,6 +85,99 @@ async fn dashboard_lists_live_session() {
     assert!(
         body.contains("sessions"),
         "status should include sessions: {body}"
+    );
+
+    srv.abort();
+    cli.abort();
+}
+
+/// 真实 UDP 代理链路：Dashboard /api/status 必须能看到每代理字节和会话数。
+#[tokio::test]
+async fn dashboard_exposes_udp_proxy_stats() {
+    let echo_port = spawn_udp_echo().await;
+    let dashboard_port = free_port();
+    let (srv, addr) = start_server(server_config(dashboard_port)).await;
+    let remote = free_port();
+    let cli = start_client(client_config(
+        addr,
+        vec![udp_proxy("udp", echo_port, remote)],
+        None,
+    ))
+    .await;
+    wait_udp_ready(addr, remote).await;
+
+    // 用同一个源端口建立已配对会话，避免把多个新会话的首次建连延迟混进统计。
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect((addr.ip(), remote)).await.unwrap();
+    let payload = b"udp-stats";
+    for _ in 0..3 {
+        sock.send(payload).await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
+            .await
+            .expect("udp echo timeout")
+            .expect("udp echo recv");
+        assert_eq!(&buf[..n], payload, "unexpected UDP echo");
+    }
+
+    let mut body = String::new();
+    let mut status: Option<serde_json::Value> = None;
+    for _ in 0..30 {
+        body = http_get(dashboard_port, "/api/status").await;
+        let payload_body = body.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload_body) {
+            let bytes_up = json["proxy_stats"]
+                .as_array()
+                .and_then(|stats| stats.iter().find(|s| s["name"] == "udp"))
+                .and_then(|s| s["bytes_up"].as_u64())
+                .unwrap_or(0);
+            if json["udp_sessions"].as_u64().unwrap_or(0) >= 1
+                && bytes_up >= payload.len() as u64 * 3
+            {
+                status = Some(json);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let json = status.unwrap_or_else(|| panic!("UDP stats did not appear in dashboard: {body}"));
+    let stats = json["proxy_stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "udp")
+        .expect("UDP proxy stats missing");
+    assert!(
+        stats["bytes_up"].as_u64().unwrap_or(0) >= payload.len() as u64 * 3,
+        "per-proxy UDP up bytes missing: {json}"
+    );
+    assert!(
+        stats["bytes_down"].as_u64().unwrap_or(0) >= payload.len() as u64 * 3,
+        "per-proxy UDP down bytes missing: {json}"
+    );
+    assert!(
+        stats["connections_total"].as_u64().unwrap_or(0) >= 1,
+        "per-proxy UDP connections missing: {json}"
+    );
+    assert!(
+        stats["active_connections"].as_u64().unwrap_or(0) >= 1,
+        "per-proxy UDP active sessions missing: {json}"
+    );
+
+    let udp_sessions = json["udp_sessions"].as_u64().unwrap_or(0);
+    assert!(udp_sessions >= 1, "global UDP sessions missing: {json}");
+    assert!(
+        json["active_sessions"].as_u64().unwrap_or(0) >= udp_sessions,
+        "active_sessions must include UDP sessions: {json}"
+    );
+    assert!(
+        json["metrics"]["udp_sessions_total"].as_u64().unwrap_or(0) >= 1,
+        "global established UDP counter missing: {json}"
+    );
+    assert!(
+        json["total_sessions"].as_u64().unwrap_or(0) >= 1,
+        "total_sessions must include UDP sessions: {json}"
     );
 
     srv.abort();

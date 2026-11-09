@@ -179,6 +179,35 @@ rfrp_proxy_connections_total{proxy="…"}  每代理累计连接数
 rfrp_proxy_active_connections{proxy="…"} 每代理活跃连接数
 ```
 
+### UDP 指标观测说明
+
+UDP 没有 TCP 那样的连接状态和送达确认，Dashboard/指标需要按下面语义理解：
+
+- `rfrp_bytes_up_total`：从外部用户侧**收到**的 UDP 字节，包含因待配对上限或会话队列背压而丢弃的包。
+- `rfrp_bytes_down_total`：尝试发回用户侧的 UDP 字节，在 `send_to` 之前累加；不代表已送达。
+- `rfrp_udp_dropped_total`：只统计**应用层**丢包（pending 上限、队列满/背压），**不包含内核 UDP 接收缓冲溢出**。
+- `rfrp_udp_sessions`：当前活跃的已配对 UDP 会话数。
+- `rfrp_udp_sessions_total`：进程启动以来累计建立的 UDP 会话数（含同一 client 的工作连接替换）。
+- `rfrp_active_sessions` / `rfrp_data_sessions_total`：TCP/vhost 连接 + UDP 会话的聚合展示值，不参与 `MAX_ACTIVE_CONNECTIONS` 容量限制。
+
+怀疑内核丢包时，需要在 frps 主机上额外观测：
+
+```bash
+# 查看 UDP 监听与 socket 队列/丢弃计数
+ss -lunp
+ss -u -a -m 'sport = :<remote_port>'
+
+# Linux 全局 UDP 错误计数（rmem 溢出等）
+nstat -az UdpInErrors UdpRcvbufErrors
+# 老系统可用：
+netstat -su | grep -i -E 'receive buffer|packet receive errors'
+
+# 直接确认包是否到达 frps
+sudo tcpdump -ni any udp port <remote_port> -vv
+```
+
+如果 `tcpdump` 能看到大量 UDP 包，但应用层 `rfrp_udp_dropped_total` 增长不多、会话吞吐仍差，应优先检查内核 UDP 接收缓冲和 `net.core.rmem_max`，而不是只怀疑 frp 队列。
+
 ### 客户端状态端点（可选）
 
 `[client] status_addr` 启用后提供只读状态端点（默认关闭）：
