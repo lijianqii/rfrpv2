@@ -9,6 +9,8 @@ mod cli;
 mod commands;
 mod logging;
 mod summary;
+mod supervisor;
+mod watch;
 
 /// 可选的高性能分配器（构建时加 `--features mimalloc` 启用）。
 ///
@@ -22,7 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
-use cli::{Cli, ClientAction, Commands};
+use cli::{Cli, ClientAction, Commands, WatchMode};
 use commands::{run_client, run_server, run_status, ClientArgs, ServerArgs};
 use summary::LogOverrides;
 
@@ -33,7 +35,14 @@ async fn main() -> ExitCode {
         log_level,
         log_output,
         log_format,
+        watch_config,
     } = Cli::parse();
+    // supervisor 子进程/校验子进程继承相同 argv，但不得再次进入 supervisor。
+    let watch_config = if std::env::var_os("RFRP_WATCH_CHILD").is_some() {
+        None
+    } else {
+        watch_config
+    };
     let log = LogOverrides {
         level: log_level,
         output: log_output,
@@ -50,6 +59,9 @@ async fn main() -> ExitCode {
             grace_secs,
             check,
         } => {
+            if watch_config == Some(WatchMode::Restart) && !check {
+                return supervisor::run(config, std::env::args_os().collect()).await;
+            }
             let args = ServerArgs {
                 config,
                 bind,
@@ -58,6 +70,7 @@ async fn main() -> ExitCode {
                 work_conn_tls,
                 grace_secs,
                 check,
+                watch_exit: watch_config == Some(WatchMode::Exit) && !check,
             };
             run_server(args, log).await
         }
@@ -81,6 +94,9 @@ async fn main() -> ExitCode {
             check,
             ..
         } => {
+            if watch_config == Some(WatchMode::Restart) && !check {
+                return supervisor::run(config, std::env::args_os().collect()).await;
+            }
             let args = ClientArgs {
                 config,
                 server,
@@ -88,6 +104,7 @@ async fn main() -> ExitCode {
                 tls_enable,
                 work_conn_tls,
                 check,
+                watch_exit: watch_config == Some(WatchMode::Exit) && !check,
             };
             run_client(args, log).await
         }

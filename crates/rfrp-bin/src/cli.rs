@@ -3,7 +3,7 @@
 //! 单一二进制 `rfrp`，通过子命令 `server` / `client` 切换角色。CLI 参数可覆盖
 //! 配置文件同名字段；`-c` 与字段参数可组合。
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// rfrp — Rust Fast Reverse Proxy
@@ -24,6 +24,27 @@ pub struct Cli {
     /// 覆盖 `[log].format`
     #[arg(long, global = true)]
     pub log_format: Option<String>,
+
+    /// 配置文件变化后的处理方式：restart=内置 supervisor 重启子进程；
+    /// exit=校验后优雅退出（退出码 75），由服务管理器拉起。
+    /// 不写值等价于 restart。
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "restart"
+    )]
+    pub watch_config: Option<WatchMode>,
+}
+
+/// 配置变化后的处理策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WatchMode {
+    /// 父进程监督子进程，配置变化时优雅重启子进程。
+    Restart,
+    /// 校验通过后优雅退出（75），由外部服务管理器重启。
+    Exit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -214,6 +235,17 @@ mod tests {
             Commands::Client { check, .. } => assert!(check),
             other => panic!("expected client command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn watch_config_parses_modes_and_default() {
+        let cli =
+            Cli::try_parse_from(["rfrp", "server", "-c", "x.toml", "--watch-config"]).unwrap();
+        assert_eq!(cli.watch_config, Some(WatchMode::Restart));
+
+        let cli =
+            Cli::try_parse_from(["rfrp", "client", "-c", "x.toml", "--watch-config=exit"]).unwrap();
+        assert_eq!(cli.watch_config, Some(WatchMode::Exit));
     }
 
     #[test]
