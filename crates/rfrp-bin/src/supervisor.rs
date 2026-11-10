@@ -142,13 +142,16 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             continue;
         }
         eprintln!("rfrp supervisor: config valid; restarting child");
+        // 在停止旧子进程前快照本次要启动的配置；启动窗口内用户可能再次保存，
+        // 不能让“最后正常配置”被后写入的未验证内容污染。
+        let new_config_bytes = std::fs::read(&config).ok();
         stop_child(&mut child).await;
 
         match spawn_and_check(&exe, &child_args).await {
             Ok(new_child) => {
                 child = new_child;
                 active_args = child_args.clone();
-                last_good = std::fs::read(&config).ok().or(last_good);
+                last_good = new_config_bytes.or(last_good);
                 let _ = std::fs::remove_file(&rollback_path);
                 eprintln!(
                     "rfrp supervisor: started child pid={}",

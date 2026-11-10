@@ -297,8 +297,9 @@ cargo test --all
 - 性能冒烟：TCP 16 MiB 吞吐、短连接 p50/p95 延迟；
 - 稳定性：300 次 TCP 连接后的 fd/RSS 回落、20 个 UDP 会话反复创建/清理、
   5 秒 TCP+UDP 混合负载、连续 3 次 rfrps 重启；
-- 配置变更重启：服务端/客户端 supervisor 子进程替换、非法配置保留旧进程、
-  新子进程启动失败回退旧配置、父进程 SIGKILL 后子进程清理、`exit` 退出码 75、
+- 配置变更重启：服务端/客户端 supervisor 子进程替换、子进程崩溃自动重启、
+  非法配置保留旧进程、快速保存防抖、配置删除/重建、CLI 覆盖在 restart/rollback
+  后保持、新子进程启动失败回退旧配置、父进程 SIGKILL 后子进程清理、`exit` 退出码 75、
   `--check` 不进入 supervisor。
 
 ```bash

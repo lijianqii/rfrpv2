@@ -1072,6 +1072,254 @@ class E2E(unittest.TestCase):
             "client supervisor left an orphan child",
         )
 
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_restart_child_crash(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0)
+        )
+        old_child = server_child_pids(parent.pid)[0]
+        os.kill(old_child, signal.SIGKILL)
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                10.0,
+            ),
+            "supervisor did not restart a crashed child",
+        )
+        self.assertIsNone(parent.poll())
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"after-child-crash", timeout=1.0
+                ),
+                15.0,
+            ),
+            "proxy did not recover after child crash",
+        )
+
+    def test_watch_config_rapid_saves(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        log_path = self.temp / "server.log"
+        before = (
+            log_path.read_text(encoding="utf-8", errors="replace").count(
+                "config valid; restarting child"
+            )
+            if log_path.is_file()
+            else 0
+        )
+        stack.server_config.write_text(
+            original.replace(
+                'password = "secret123"', 'password = "rapid-first"'
+            ),
+            encoding="utf-8",
+        )
+        stack.server_config.write_text(
+            original.replace(
+                'password = "secret123"', 'password = "rapid-final"'
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(
+                    stack.dashboard_port,
+                    "/api/status",
+                    password="rapid-final",
+                )[0]
+                == 200,
+                15.0,
+            ),
+            "final rapid-save config was not applied",
+        )
+        after = (
+            log_path.read_text(encoding="utf-8", errors="replace").count(
+                "config valid; restarting child"
+            )
+            if log_path.is_file()
+            else 0
+        )
+        self.assertEqual(
+            after - before,
+            1,
+            "rapid saves should coalesce into one supervisor restart",
+        )
+        self.assertIsNone(parent.poll())
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"after-rapid-saves", timeout=1.0
+                ),
+                15.0,
+            ),
+            "proxy did not recover after rapid saves",
+        )
+
+    def test_watch_config_delete_and_recreate(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0)
+        )
+        old_child = server_child_pids(parent.pid)[0]
+        stack.server_config.unlink()
+        time.sleep(2)
+        self.assertIsNone(parent.poll())
+        self.assertEqual(
+            server_child_pids(parent.pid),
+            [old_child],
+            "deleting config must not replace the child",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-config-delete"),
+            "proxy broke after config deletion",
+        )
+        stack.server_config.write_text(
+            original.replace(
+                'password = "secret123"', 'password = "recreated-config"'
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                15.0,
+            ),
+            "recreated config did not trigger a restart",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(
+                    stack.dashboard_port,
+                    "/api/status",
+                    password="recreated-config",
+                )[0]
+                == 200,
+                15.0,
+            ),
+            "recreated config was not applied",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_cli_overrides_survive_restart_and_rollback(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=[
+                "--watch-config=restart",
+                "--token",
+                "cli-token",
+            ],
+            client_extra_args=["--token", "cli-token"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0)
+        )
+        old_child = server_child_pids(parent.pid)[0]
+
+        # 合法配置重启：--token 覆盖必须继续生效，客户端才能重连。
+        changed = original.replace(
+            'password = "secret123"', 'password = "cli-override-pass"'
+        )
+        stack.server_config.write_text(changed, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                15.0,
+            ),
+            "CLI override test did not restart child",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(
+                    stack.dashboard_port,
+                    "/api/status",
+                    password="cli-override-pass",
+                )[0]
+                == 200,
+                15.0,
+            ),
+            "config with CLI override was not applied",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"cli-override-restart", timeout=1.0
+                ),
+                15.0,
+            ),
+            "CLI token override was lost after restart",
+        )
+
+        # 启动失败回滚：仍有 --token 覆盖，回滚子进程也应继续服务。
+        current = stack.server_config.read_text(encoding="utf-8")
+        old_child = server_child_pids(parent.pid)[0]
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        blocked = blocker.getsockname()[1]
+        stack.server_config.write_text(
+            current.replace(
+                f"bind_port = {stack.control_port}",
+                f"bind_port = {blocked}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                20.0,
+            ),
+            "CLI override rollback did not start a child",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"cli-override-rollback", timeout=1.0
+                ),
+                15.0,
+            ),
+            "CLI token override was lost after rollback",
+        )
+        self.assertTrue(
+            http_get(
+                stack.dashboard_port,
+                "/api/status",
+                password="cli-override-pass",
+            )[0]
+            == 200,
+            "rollback config was not the last good config",
+        )
+        blocker.close()
+
     def test_tcp_proxy_concurrent_and_large_transfer(self) -> None:
         echo = self.tcp_echo()
         stack = self.make_stack(tcp_local=echo.port)
