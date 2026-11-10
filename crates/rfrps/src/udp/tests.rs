@@ -18,7 +18,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         metrics: Arc::new(Metrics::new()),
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
-        session_timeout,
+        session_timeout_ms: AtomicU64::new(session_timeout.as_millis() as u64),
         pending_timeout,
         owner_session_id: "test-session".into(),
         max_sessions: MAX_UDP_SESSIONS_PER_PROXY,

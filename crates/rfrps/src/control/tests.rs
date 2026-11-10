@@ -56,7 +56,7 @@ async fn cleanup_clears_proxy_domains() {
         metrics: Arc::new(crate::metrics::Metrics::new()),
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
-        session_timeout: std::time::Duration::from_secs(60),
+        session_timeout_ms: std::sync::atomic::AtomicU64::new(60_000),
         pending_timeout: std::time::Duration::from_secs(10),
         owner_session_id: session.session_id.clone(),
         max_sessions: rfrp_common::constants::MAX_UDP_SESSIONS_PER_PROXY,

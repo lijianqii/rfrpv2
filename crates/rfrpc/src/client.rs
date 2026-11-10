@@ -23,8 +23,9 @@ use rfrp_common::util::platform::default_run_id_path;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -124,26 +125,19 @@ impl Client {
         let sig = spawn_signal_watcher(shutdown.clone());
         // 可选状态端点（[client] status_addr）：绑定失败只告警，不影响隧道功能。
         let initial = self.config.read().clone();
-        if let Some(addr) = &initial.client.status_addr {
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    if !addr.starts_with("127.")
-                        && !addr.starts_with("localhost")
-                        && !addr.starts_with("[::1]")
-                    {
-                        tracing::warn!(%addr, "status endpoint bound to non-loopback address; it has no authentication");
-                    }
-                    tracing::info!(%addr, "status endpoint listening");
-                    let cfg = initial.clone();
-                    let metrics = self.metrics.clone();
-                    let sd = shutdown.clone();
-                    tokio::spawn(async move {
-                        crate::status::run_status_server(listener, cfg, metrics, sd).await;
-                    });
-                }
-                Err(e) => tracing::error!(%addr, error = %e, "failed to bind status endpoint"),
+        let mut status_task = match bind_status(&initial.client.status_addr).await {
+            Ok(Some(listener)) => Some(spawn_status(
+                listener,
+                self.config.clone(),
+                self.metrics.clone(),
+                &shutdown,
+            )),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind status endpoint");
+                None
             }
-        }
+        };
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
         let mut attempt: u32 = 0;
         let mut reload_enabled = true;
@@ -177,8 +171,35 @@ impl Client {
                         match changed {
                             Ok(()) => {
                                 let new = reload_rx.borrow().clone();
+                                let old_status = self.config.read().client.status_addr.clone();
+                                let new_status = new.client.status_addr.clone();
+                                let status_listener = if old_status != new_status {
+                                    match bind_status(&new_status).await {
+                                        Ok(listener) => listener,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "status endpoint reload rejected; keeping current config"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 match self.apply_config(new) {
                                     Ok(()) => {
+                                        if old_status != new_status {
+                                            stop_status(&mut status_task).await;
+                                            if let Some(listener) = status_listener {
+                                                status_task = Some(spawn_status(
+                                                    listener,
+                                                    self.config.clone(),
+                                                    self.metrics.clone(),
+                                                    &shutdown,
+                                                ));
+                                            }
+                                        }
                                         tracing::info!("client configuration reloaded; reconnecting");
                                         reload_token.cancel();
                                         if tokio::time::timeout(
@@ -195,10 +216,13 @@ impl Client {
                                         immediate = true;
                                         break Ok(ConnectOutcome::Reconnect { connected: false });
                                     }
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        "client config reload rejected; keeping current config"
-                                    ),
+                                    Err(e) => {
+                                        drop(status_listener);
+                                        tracing::warn!(
+                                            error = %e,
+                                            "client config reload rejected; keeping current config"
+                                        );
+                                    }
                                 }
                             }
                             Err(_) => reload_enabled = false,
@@ -258,23 +282,14 @@ impl Client {
     /// 应用热重载后的客户端配置。失败时保留旧配置。
     fn apply_config(&self, mut new: ClientConfig) -> std::result::Result<(), String> {
         let old = self.config.read().clone();
-        if old.client.status_addr != new.client.status_addr {
-            tracing::warn!(
-                "[client].status_addr change requires restart; keeping current status endpoint"
-            );
-            new.client.status_addr = old.client.status_addr.clone();
-        }
         if old.client.run_id_file != new.client.run_id_file {
             tracing::warn!("[client].run_id_file change requires restart; keeping current run_id");
             new.client.run_id_file = old.client.run_id_file.clone();
         }
-        if old.client.tcp_keepalive_secs != new.client.tcp_keepalive_secs {
-            tracing::warn!(
-                "[client].tcp_keepalive_secs change requires restart; keeping current keepalive"
-            );
-            new.client.tcp_keepalive_secs = old.client.tcp_keepalive_secs;
-        }
         let tls = build_client_tls(&new).map_err(|e| e.to_string())?;
+        rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
+            new.client.tcp_keepalive_secs,
+        ));
         *self.tls.write() = tls;
         *self.config.write() = new;
         Ok(())
@@ -545,6 +560,57 @@ impl Client {
             }
         }
         rid
+    }
+}
+
+struct StatusTask {
+    token: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+async fn bind_status(addr: &Option<String>) -> std::result::Result<Option<TcpListener>, String> {
+    let Some(addr) = addr else {
+        return Ok(None);
+    };
+    match TcpListener::bind(addr).await {
+        Ok(listener) => {
+            if !addr.starts_with("127.")
+                && !addr.starts_with("localhost")
+                && !addr.starts_with("[::1]")
+            {
+                tracing::warn!(
+                    %addr,
+                    "status endpoint bound to non-loopback address; it has no authentication"
+                );
+            }
+            tracing::info!(%addr, "status endpoint listening");
+            Ok(Some(listener))
+        }
+        Err(e) => Err(format!("failed to bind status endpoint {addr}: {e}")),
+    }
+}
+
+fn spawn_status(
+    listener: TcpListener,
+    cfg: Arc<RwLock<ClientConfig>>,
+    metrics: Arc<ClientMetrics>,
+    shutdown: &CancellationToken,
+) -> StatusTask {
+    let token = shutdown.child_token();
+    let handle = tokio::spawn(crate::status::run_status_server(
+        listener,
+        cfg,
+        metrics,
+        token.clone(),
+    ));
+    StatusTask { token, handle }
+}
+
+async fn stop_status(task: &mut Option<StatusTask>) {
+    if let Some(task) = task.take() {
+        task.token.cancel();
+        task.handle.abort();
+        let _ = task.handle.await;
     }
 }
 

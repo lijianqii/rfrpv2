@@ -759,7 +759,7 @@ rfrps 对单个代理最多保留 `MAX_POOLED_WORK_CONNS_PER_PROXY`(32) 条空�
   `sessions` 锁做全表扫描。
 - **HTTP**：rfrps 用 `hyper` 读取请求头判定 Host，命中后将**已读缓冲区连同后续流**一起桥接到工作连接（不丢失已读字节）。
 - **HTTPS**：TLS 终止在 rfrps（使用 `vhost_tls_cert` / `vhost_tls_key`），rfrps 完成 TLS 握手拿到 SNI 后，按明文 HTTP 处理取 Host，再将**解密后的明文流**桥接到工作连接。工作连接承载明文，本地服务收到的是明文 HTTP。
-- HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。阶段 1 证书在 rfrps 启动时一次性加载到内存（`rustls::ServerConfig` 持有），文件更换需重启；阶段 2 计划在配置热重载时重建 TLS acceptor（见 9.6）。
+- HTTPS 所需证书由 rfrps 服务端配置提供（详见 9.1 `vhost_tls_cert` / `vhost_tls_key`）。证书变更走配置热重载：新建连接使用新 acceptor，已有连接保持原 TLS 会话（见 9.6）。
 - 命中 Proxy 后向 rfrpc 请求工作连接，流程同 TCP（8.2）。
 - **HTTP 与 HTTPS 独立**：一个 `[[proxy]]` 的 `type` 只能是 `http` 或 `https` 之一。若同一后端需同时暴露 HTTP 和 HTTPS，应声明两个 Proxy 条目（配置 `name` 不同，即协议 `proxy_name` 不同），`custom_domains` 可相同，分别走 `vhost_http_port` / `vhost_https_port`。
 
@@ -986,24 +986,27 @@ CLI 参数 > 配置文件 > 默认值。
 `Create/Modify/Remove` 事件（含编辑器原子 rename），事件后 300ms 防抖。解析/校验
 失败时保留旧配置并告警，进程不退出。CLI 参数每次重载后重新应用，优先级仍高于文件。
 
-**阶段 1（当前）**：
+**客户端**：`server_addr/server_port/token/tls_*`、心跳、keepalive、`[[proxy]]` 变更
+通过“结束当前控制连接并按新配置重连”生效；服务端按 run_id 清理旧代理监听后重新注册。
+已桥接的 TCP 用户连接保留，UDP 会话重建。`status_addr` 先绑定新监听再停旧监听；
+`run_id_file` 变更需重启（保留旧值并告警）。状态端点读取共享配置，代理列表热更新后
+展示同步刷新。
 
-- 客户端：`server_addr/server_port/token/tls_*`、心跳、`[[proxy]]` 变更通过“结束当前控制
-  连接并按新配置重连”生效；服务端按 run_id 清理旧代理监听后重新注册。已桥接的 TCP
-  用户连接保留，UDP 会话重建。`status_addr`、`run_id_file`、`tcp_keepalive_secs`
-  变更需重启（保留旧值并告警）。
-- 服务端：token 只影响新登录；心跳只影响新控制会话；`allow_ports` 对新注册生效；
-  Dashboard `user/password` 每次请求读取；`grace_secs`、`[log].level` 立即生效。
-  已有 UDP 代理的 `udp_session_timeout` 保持注册时值。
-- 服务端 `bind_addr/bind_port`、TLS 开关/证书、vhost 端口、`dashboard.addr` 以及
-  `tcp_keepalive_secs` 在阶段 1 冻结为启动值并告警需重启，避免运行时配置与实际监听不一致。
-- 日志 `output/format` 变更需重启；日志级别通过 `tracing-subscriber` reload layer 热更新。
+**服务端**：
 
-**阶段 2（计划）**：服务端控制/vhost/Dashboard 监听与 TLS acceptor 先绑定新资源再切换，
-失败保留旧资源；客户端 `status_addr` 重建；UDP 超时对已有代理解释为可动态更新。
+- token 只影响新登录；心跳/keepalive 影响新控制会话或新连接；`allow_ports` 对新注册
+  生效；`udp_session_timeout_secs` 更新已有 UDP 代理的清扫阈值。
+- 控制监听 `bind_addr/bind_port`：先绑定新 `TcpListener`，成功后通过 watch 切换
+  accept 循环；已有控制/用户连接保留。控制 TLS 开关/证书/`work_conn_tls` 先加载新
+  acceptor，再提交配置；已有 TLS 连接保留。
+- HTTP/HTTPS vhost 与 Dashboard 监听：先绑定新 listener / 加载新 TLS，成功后停止旧任务
+  并启动新任务；失败保留旧监听。HTTPS vhost 证书变更复用原 listener，仅替换共享
+  acceptor；Dashboard 地址变更会重建任务（已有登录会话失效），凭据变更不重建。
+- `grace_secs`、`[log].level` 立即生效；日志 `output/format` 需重启。
+- 配置提交采用“先准备、后提交”：任一 bind/证书加载失败都不会修改当前运行时配置。
 
-> 安全性：token 变更不主动踢掉已有会话，避免热重载无故中断长连接；需要立即失效时
-> 应重启服务端或后续增加显式“踢会话”操作。配置热重载不改变协议版本和帧格式。
+**安全性**：token 变更不主动踢掉已有会话，避免热重载无故中断长连接；需要立即失效时
+应重启服务端或后续增加显式“踢会话”操作。配置热重载不改变协议版本和帧格式。
 
 ## 10. 鉴权与加密
 

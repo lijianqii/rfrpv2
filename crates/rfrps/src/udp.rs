@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -178,7 +179,8 @@ pub struct UdpProxy {
     /// 每代理统计（Dashboard / Prometheus）；不能复用全局 `Metrics`。
     pub stats: Arc<crate::metrics::ProxyStats>,
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
-    pub session_timeout: Duration,
+    /// 会话空闲超时（毫秒）；运行期可热更新。
+    pub session_timeout_ms: AtomicU64,
     pub pending_timeout: Duration,
     /// 归属会话 ID：工作连接/清理时校验，防止同名/旧会话操作误伤。
     pub owner_session_id: String,
@@ -187,6 +189,14 @@ pub struct UdpProxy {
     /// 会话级停止信号：控制会话被清理时触发，用于结束仍在途的 UDP 工作连接，
     /// 释放其持有的 `Arc<UdpProxy>`（进而释放 UDP socket / 端口）。
     pub stop: CancellationToken,
+}
+
+impl UdpProxy {
+    /// 更新会话空闲超时；已在途会话的下一次 sweep 使用新值。
+    pub fn set_session_timeout(&self, timeout: Duration) {
+        self.session_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
+    }
 }
 
 /// 注册 UDP 代理：绑定 UDP socket 并启动监听循环。
@@ -224,7 +234,7 @@ pub async fn register_udp_proxy(
         metrics: state.metrics.clone(),
         stats,
         packet_pool: Arc::new(Mutex::new(Vec::new())),
-        session_timeout,
+        session_timeout_ms: AtomicU64::new(session_timeout.as_millis() as u64),
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
         owner_session_id: session.session_id.clone(),
         max_sessions: MAX_UDP_SESSIONS_PER_PROXY,
@@ -250,9 +260,9 @@ async fn run_udp_listener(
 ) {
     // 清理周期取两个超时中较小者的 1/4：pending 超时（默认 10s）远小于会话超时
     // （默认 300s），若只按后者计算，过期的 pending 会占用上限数十秒。
-    let sweep_period = Duration::from_secs(
-        (proxy.session_timeout.min(proxy.pending_timeout).as_secs() / 4).max(1),
-    );
+    let session_timeout = Duration::from_millis(proxy.session_timeout_ms.load(Ordering::Relaxed));
+    let sweep_period =
+        Duration::from_secs((session_timeout.min(proxy.pending_timeout).as_secs() / 4).max(1));
     let mut sweep_iv = tokio::time::interval(sweep_period);
     sweep_iv.tick().await; // 消耗首次立即 tick
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
@@ -434,9 +444,10 @@ async fn handle_datagram(
 /// 清理超时会话与超时待配对项。
 fn sweep(proxy: &Arc<UdpProxy>) {
     let now = Instant::now();
+    let session_timeout = Duration::from_millis(proxy.session_timeout_ms.load(Ordering::Relaxed));
     let mut sessions = proxy.sessions.lock();
     sessions.retain(|_, s| {
-        if now.duration_since(s.last_active) >= proxy.session_timeout {
+        if now.duration_since(s.last_active) >= session_timeout {
             // 先取消再删除：即使 handler 正阻塞在工作连接写/下行发送上，
             // 也会在 select! 的取消分支中退出，而不是等对端主动关闭。
             s.cancel.cancel();

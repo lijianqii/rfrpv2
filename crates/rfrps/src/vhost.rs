@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::RwLock;
+
 use rfrp_common::constants::{HTTP_HEAD_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
 use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
@@ -73,7 +75,7 @@ async fn handle_http_connection(stream: TcpStream, state: Arc<ServerState>) -> R
 /// HTTPS vhost accept 循环：TLS 终止后按 SNI/Host 路由。
 pub async fn run_https_vhost(
     listener: TcpListener,
-    tls: ServerTls,
+    tls: Arc<RwLock<Option<ServerTls>>>,
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
@@ -87,7 +89,10 @@ pub async fn run_https_vhost(
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TLS TCP stream");
                         }
-                        let tls = tls.clone();
+                        let Some(tls) = tls.read().clone() else {
+                            tracing::warn!(%peer, "HTTPS vhost TLS disabled; closing incoming connection");
+                            continue;
+                        };
                         let state = state.clone();
                         tokio::spawn(async move {
                             let accepted = tokio::time::timeout(

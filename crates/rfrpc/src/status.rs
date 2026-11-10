@@ -3,6 +3,7 @@
 //! 提供 `/`（状态页）、`/api/status`（JSON）、`/metrics`（Prometheus 文本）。
 //! 仅只读、无鉴权：默认应绑定回环地址；绑定非回环时启动会打印警告。
 
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use crate::metrics::ClientMetrics;
 /// 状态端点主循环。
 pub async fn run_status_server(
     listener: TcpListener,
-    cfg: ClientConfig,
+    cfg: Arc<RwLock<ClientConfig>>,
     metrics: Arc<ClientMetrics>,
     shutdown: CancellationToken,
 ) {
@@ -34,7 +35,7 @@ pub async fn run_status_server(
                 match accepted {
                     Ok((stream, peer)) => {
                         retry.record_ok();
-                        let cfg = cfg.clone();
+                        let cfg = cfg.read().clone();
                         let metrics = metrics.clone();
                         let limiter = limiter.clone();
                         tokio::spawn(async move {

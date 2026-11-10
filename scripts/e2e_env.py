@@ -193,6 +193,14 @@ def tcp_bulk_roundtrip(port: int, payload: bytes, timeout: float = 60.0) -> bool
         return False
 
 
+def tcp_connectable(port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def udp_roundtrip(sock: socket.socket, payload: bytes, timeout: float = 2.0) -> bool:
     try:
         sock.settimeout(timeout)
@@ -711,6 +719,8 @@ class E2E(unittest.TestCase):
         local_port: int,
         remote_port: int,
         name: str,
+        server_port: Optional[int] = None,
+        tls: bool = False,
     ) -> subprocess.Popen:
         binary = BIN
         if binary is None:
@@ -722,12 +732,19 @@ class E2E(unittest.TestCase):
                 [
                     "[client]",
                     'server_addr = "127.0.0.1"',
-                    f"server_port = {self._stack_control_port}",
+                    f"server_port = {server_port or self._stack_control_port}",
                     f'token = "{token}"',
                     "work_conn_tls = false",
                     "heartbeat_interval_secs = 5",
                     "heartbeat_timeout_secs = 3",
                     f'run_id_file = "{(self.temp / f"run-id-{name}").as_posix()}"',
+                    *((
+                        [
+                            "tls_enable = true",
+                            'tls_server_name = "localhost"',
+                            f'tls_ca = "{(ROOT / "examples" / "ca.pem").as_posix()}"',
+                        ]
+                    ) if tls else []),
                     "",
                     "[[proxy]]",
                     'name = "extra"',
@@ -863,6 +880,265 @@ class E2E(unittest.TestCase):
         # 收尾：恢复原始配置，确保后续事件不会影响其他测试。
         stack.server_config.write_text(original_server, encoding="utf-8")
         stack.client_config.write_text(original_client, encoding="utf-8")
+
+    def test_server_vhost_and_dashboard_listener_hot_reload(self) -> None:
+        backend = self.http_echo()
+        stack = self.make_stack(
+            vhost_local=backend.port,
+            vhost_domain="web.example",
+            log_level="info",
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+        old_vhost = stack.vhost_port
+        new_vhost = free_tcp_port()
+        while new_vhost in {
+            stack.control_port,
+            stack.dashboard_port,
+            old_vhost,
+        }:
+            new_vhost = free_tcp_port()
+        stack.server_config.write_text(
+            original.replace(
+                f"vhost_http_port = {old_vhost}",
+                f"vhost_http_port = {new_vhost}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get_host(new_vhost, "/", "web.example")[0] == 200,
+                10.0,
+            ),
+            "new vhost listener did not become ready",
+        )
+        self.assertTrue(
+            wait_until(lambda: not tcp_connectable(old_vhost), 10.0),
+            "old vhost listener was not released",
+        )
+
+        new_dashboard = free_tcp_port()
+        while new_dashboard in {
+            stack.control_port,
+            stack.dashboard_port,
+            old_vhost,
+            new_vhost,
+        }:
+            new_dashboard = free_tcp_port()
+        step = stack.server_config.read_text(encoding="utf-8")
+        stack.server_config.write_text(
+            step.replace(
+                f'addr = "127.0.0.1:{stack.dashboard_port}"',
+                f'addr = "127.0.0.1:{new_dashboard}"',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(new_dashboard, "/api/status")[0] == 200,
+                10.0,
+            ),
+            "new dashboard listener did not become ready",
+        )
+        self.assertTrue(
+            wait_until(lambda: not tcp_connectable(stack.dashboard_port), 10.0),
+            "old dashboard listener was not released",
+        )
+
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(stack.dashboard_port, "/api/status")[0] == 200,
+                10.0,
+            ),
+            "original dashboard listener was not restored",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get_host(old_vhost, "/", "web.example")[0] == 200,
+                10.0,
+            ),
+            "original vhost listener was not restored",
+        )
+
+    def test_client_status_addr_hot_reload(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, status=True, log_level="info")
+        old_status = stack.status_port
+        self.assertIsNotNone(old_status)
+        self.assertEqual(
+            http_get(old_status, "/api/status", auth=False)[0],
+            200,
+            "initial client status endpoint is not available",
+        )
+        original = stack.client_config.read_text(encoding="utf-8")
+        new_status = free_tcp_port()
+        while new_status in {
+            old_status,
+            stack.control_port,
+            stack.dashboard_port,
+            stack.remote_tcp,
+        }:
+            new_status = free_tcp_port()
+        stack.client_config.write_text(
+            original.replace(
+                f'status_addr = "127.0.0.1:{old_status}"',
+                f'status_addr = "127.0.0.1:{new_status}"',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(new_status, "/api/status", auth=False)[0] == 200,
+                10.0,
+            ),
+            "new client status endpoint did not become ready",
+        )
+        self.assertTrue(
+            wait_until(lambda: not tcp_connectable(old_status), 10.0),
+            "old client status endpoint was not released",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"status-reload-proxy"),
+            "proxy broke while moving client status endpoint",
+        )
+
+        stack.client_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: http_get(old_status, "/api/status", auth=False)[0] == 200,
+                10.0,
+            ),
+            "original client status endpoint was not restored",
+        )
+
+    def test_udp_session_timeout_hot_reload(self) -> None:
+        udp_echo = self.udp_echo()
+        stack = self.make_stack(udp_local=udp_echo.port, udp_timeout=300)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sock.close)
+        sock.connect(("127.0.0.1", stack.remote_udp))
+        self.assertTrue(udp_roundtrip(sock, b"timeout-hot"), "initial UDP roundtrip failed")
+        stack.wait_status(lambda s: s["udp_sessions"] >= 1)
+
+        original = stack.server_config.read_text(encoding="utf-8")
+        stack.server_config.write_text(
+            original.replace(
+                "udp_session_timeout_secs = 300",
+                "udp_session_timeout_secs = 1",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(lambda: stack.status()["udp_sessions"] == 0, 12.0),
+            "existing UDP session did not expire after timeout hot reload",
+        )
+        stack.server_config.write_text(original, encoding="utf-8")
+
+    def test_server_listener_and_tls_hot_reload(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original = stack.server_config.read_text(encoding="utf-8")
+
+        new_control = free_tcp_port()
+        while new_control in {
+            stack.control_port,
+            stack.dashboard_port,
+            stack.remote_tcp,
+        }:
+            new_control = free_tcp_port()
+        stack.server_config.write_text(
+            original.replace(
+                f"bind_port = {stack.control_port}",
+                f"bind_port = {new_control}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(lambda: tcp_connectable(new_control), 10.0),
+            "new control listener did not become ready",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"existing-control-session"),
+            "existing control session broke after listener replacement",
+        )
+
+        echo2 = self.tcp_echo()
+        remote2 = free_tcp_port()
+        while remote2 in {
+            stack.remote_tcp,
+            stack.control_port,
+            new_control,
+            stack.dashboard_port,
+        }:
+            remote2 = free_tcp_port()
+        extra = self.start_extra_client(
+            token="e2e-token",
+            local_port=echo2.port,
+            remote_port=remote2,
+            name="new-control",
+            server_port=new_control,
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(remote2, b"new-control-login", timeout=0.5),
+                20.0,
+            ),
+            "client could not connect to the replaced control listener",
+        )
+        extra.terminate()
+        extra.wait(timeout=5)
+
+        # 恢复原控制端口，确认新监听可以被替换回来。
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: tcp_connectable(stack.control_port), 10.0),
+            "original control listener was not restored",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-control-restore"),
+            "existing proxy broke after control listener restore",
+        )
+
+        # 开启控制链路 TLS：新 TLS 客户端应能连接，旧明文会话保持。
+        tls_config = original.replace("tls_enable = false", "tls_enable = true", 1)
+        tls_config = tls_config.replace(
+            "tls_enable = true\n",
+            "tls_enable = true\n"
+            f'tls_cert = "{(ROOT / "examples" / "cert.pem").as_posix()}"\n'
+            f'tls_key = "{(ROOT / "examples" / "key.pem").as_posix()}"\n',
+            1,
+        )
+        stack.server_config.write_text(tls_config, encoding="utf-8")
+        echo3 = self.tcp_echo()
+        remote3 = free_tcp_port()
+        while remote3 in {
+            stack.remote_tcp,
+            stack.control_port,
+            stack.dashboard_port,
+            remote2,
+        }:
+            remote3 = free_tcp_port()
+        tls_client = self.start_extra_client(
+            token="e2e-token",
+            local_port=echo3.port,
+            remote_port=remote3,
+            name="tls-control",
+            tls=True,
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(remote3, b"tls-control-login", timeout=0.5),
+                20.0,
+            ),
+            "TLS client could not connect after control TLS hot reload",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"plain-session-still-live"),
+            "existing plaintext session broke after enabling control TLS",
+        )
+        tls_client.terminate()
+        tls_client.wait(timeout=5)
+        stack.server_config.write_text(original, encoding="utf-8")
 
     def test_log_level_hot_reload(self) -> None:
         echo = self.tcp_echo()

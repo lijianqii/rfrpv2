@@ -18,10 +18,10 @@ use rfrp_common::protocol::msg::{MSG_LOGIN, MSG_START_WORK_CONN};
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
-use rfrp_common::util::tcp::configure_tcp_stream;
+use rfrp_common::util::tcp::{configure_tcp_stream, init_keepalive, KeepaliveConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +49,108 @@ pub struct Server {
     vhost_https: Option<(TcpListener, ServerTls)>,
     /// Dashboard 监听（可选）。
     dashboard: Option<TcpListener>,
+}
+
+/// vhost/Dashboard 监听任务；热重载时可停止旧任务并启动新任务。
+struct VhostTasks {
+    http: Option<(CancellationToken, JoinHandle<()>)>,
+    https: Option<(CancellationToken, JoinHandle<()>)>,
+    dashboard: Option<(CancellationToken, JoinHandle<()>)>,
+    /// HTTPS vhost 的当前 TLS acceptor；证书变更时原地替换，监听器无需重启。
+    https_tls: Arc<RwLock<Option<ServerTls>>>,
+}
+
+impl VhostTasks {
+    fn new(
+        vhost_http: Option<TcpListener>,
+        vhost_https: Option<(TcpListener, ServerTls)>,
+        dashboard: Option<TcpListener>,
+        dashboard_cfg: Option<Arc<RwLock<DashboardSection>>>,
+        state: &Arc<ServerState>,
+        shutdown: &CancellationToken,
+    ) -> Self {
+        let https_tls = Arc::new(RwLock::new(
+            vhost_https.as_ref().map(|(_, tls)| tls.clone()),
+        ));
+        let http =
+            vhost_http.map(|listener| spawn_http_vhost(listener, state.clone(), shutdown.clone()));
+        let https = vhost_https.map(|(listener, _)| {
+            spawn_https_vhost(listener, https_tls.clone(), state.clone(), shutdown.clone())
+        });
+        let dashboard = dashboard.and_then(|listener| {
+            dashboard_cfg
+                .clone()
+                .map(|cfg| spawn_dashboard(listener, cfg, state.clone(), shutdown.clone()))
+        });
+        Self {
+            http,
+            https,
+            dashboard,
+            https_tls,
+        }
+    }
+}
+
+fn spawn_http_vhost(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    shutdown: CancellationToken,
+) -> (CancellationToken, JoinHandle<()>) {
+    let token = shutdown.child_token();
+    let handle = tokio::spawn(crate::vhost::run_http_vhost(listener, state, token.clone()));
+    (token, handle)
+}
+
+fn spawn_https_vhost(
+    listener: TcpListener,
+    tls: Arc<RwLock<Option<ServerTls>>>,
+    state: Arc<ServerState>,
+    shutdown: CancellationToken,
+) -> (CancellationToken, JoinHandle<()>) {
+    let token = shutdown.child_token();
+    let handle = tokio::spawn(crate::vhost::run_https_vhost(
+        listener,
+        tls,
+        state,
+        token.clone(),
+    ));
+    (token, handle)
+}
+
+fn spawn_dashboard(
+    listener: TcpListener,
+    cfg: Arc<RwLock<DashboardSection>>,
+    state: Arc<ServerState>,
+    shutdown: CancellationToken,
+) -> (CancellationToken, JoinHandle<()>) {
+    let token = shutdown.child_token();
+    let handle = tokio::spawn(crate::dashboard::run_dashboard(
+        listener,
+        cfg,
+        state,
+        token.clone(),
+    ));
+    (token, handle)
+}
+
+async fn stop_task(task: &mut Option<(CancellationToken, JoinHandle<()>)>) {
+    if let Some((token, handle)) = task.take() {
+        token.cancel();
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+struct ReloadState<'a> {
+    config: &'a Arc<RwLock<ServerConfig>>,
+    dashboard_cfg: &'a mut Option<Arc<RwLock<DashboardSection>>>,
+    grace: &'a Arc<AtomicU64>,
+    grace_override: Option<Duration>,
+    listener_tx: &'a watch::Sender<Arc<TcpListener>>,
+    control_tls: &'a Arc<RwLock<Option<ServerTls>>>,
+    tasks: &'a mut VhostTasks,
+    state: &'a Arc<ServerState>,
+    shutdown: &'a CancellationToken,
 }
 
 impl Server {
@@ -123,11 +225,17 @@ impl Server {
     /// 使用旧监听。监听热替换见后续阶段。
     pub async fn run_with_reload(self, mut reload_rx: watch::Receiver<ServerConfig>) -> Result<()> {
         let shutdown = self.state.shutdown.clone();
-        let tls = self.tls.clone();
-        let vhost_http = self.vhost_http;
-        let vhost_https = self.vhost_https;
-        let dashboard = self.dashboard;
-        let dashboard_cfg = self.dashboard_cfg.clone();
+        let control_tls = Arc::new(RwLock::new(self.tls.clone()));
+        let (listener_tx, listener_rx) = watch::channel(Arc::new(self.listener));
+        let mut dashboard_cfg = self.dashboard_cfg.clone();
+        let mut listener_tasks = VhostTasks::new(
+            self.vhost_http,
+            self.vhost_https,
+            self.dashboard,
+            dashboard_cfg.clone(),
+            &self.state,
+            &shutdown,
+        );
         let config = self.config.clone();
         let grace = self.grace.clone();
         let grace_override = self.grace_override;
@@ -135,30 +243,6 @@ impl Server {
         let mut tasks = JoinSet::new();
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
-        // HTTP vhost 监听循环（可选）。
-        if let Some(listener) = vhost_http {
-            let state = self.state.clone();
-            let shutdown = shutdown.clone();
-            tasks.spawn(async move {
-                crate::vhost::run_http_vhost(listener, state, shutdown).await;
-            });
-        }
-        // Dashboard 监听循环（可选）。
-        if let (Some(listener), Some(cfg)) = (dashboard, dashboard_cfg.clone()) {
-            let state = self.state.clone();
-            let shutdown = shutdown.clone();
-            tasks.spawn(async move {
-                crate::dashboard::run_dashboard(listener, cfg, state, shutdown).await;
-            });
-        }
-        // HTTPS vhost 监听循环（可选）。
-        if let Some((listener, tls)) = vhost_https {
-            let state = self.state.clone();
-            let shutdown = shutdown.clone();
-            tasks.spawn(async move {
-                crate::vhost::run_https_vhost(listener, tls, state, shutdown).await;
-            });
-        }
         // 存活摘要：周期性输出计数，便于区分"进程卡死"与"网络不可达"
         // （客户端连不上时，看 accepted_total 是否增长即可判断 SYN 是否到达）。
         {
@@ -213,8 +297,9 @@ impl Server {
         // 判定不可恢复，进程以非零码退出交服务管理器重启（见 util::accept 说明）。
         let mut accept_retry = AcceptRetry::new();
         loop {
+            let listener = listener_rx.borrow().clone();
             tokio::select! {
-                res = self.listener.accept() => {
+                res = listener.accept() => {
                     match res {
                         Ok((stream, peer)) => {
                             accept_retry.record_ok();
@@ -224,7 +309,7 @@ impl Server {
                             }
                             let state = self.state.clone();
                             let config = config.clone();
-                            let tls = tls.clone();
+                            let tls = control_tls.read().clone();
                             let current = config.read().clone();
                             let heartbeat_interval = current.server.heartbeat_interval();
                             let heartbeat_timeout = current.server.heartbeat_timeout();
@@ -282,7 +367,23 @@ impl Server {
                     match changed {
                         Ok(()) => {
                             let new = reload_rx.borrow().clone();
-                            apply_reload(&config, &dashboard_cfg, &grace, grace_override, new);
+                            let mut reload = ReloadState {
+                                config: &config,
+                                dashboard_cfg: &mut dashboard_cfg,
+                                grace: &grace,
+                                grace_override,
+                                listener_tx: &listener_tx,
+                                control_tls: &control_tls,
+                                tasks: &mut listener_tasks,
+                                state: &self.state,
+                                shutdown: &shutdown,
+                            };
+                            if let Err(e) = apply_reload(&mut reload, new).await {
+                                tracing::warn!(
+                                    error = %e,
+                                    "server config reload rejected; keeping previous listeners/TLS"
+                                );
+                            }
                         }
                         Err(_) => {
                             // 配置监视器已退出：不再轮询该分支，避免忙循环。
@@ -319,97 +420,182 @@ impl Server {
 ///
 /// 阶段 1 的可热更字段直接写入共享配置；监听/TLS/vhost/Dashboard 地址等
 /// 需要重建资源的字段保持旧值并告警，避免配置变更后实际监听与日志描述不一致。
-fn apply_reload(
-    config: &Arc<RwLock<ServerConfig>>,
-    dashboard_cfg: &Option<Arc<RwLock<DashboardSection>>>,
-    grace: &Arc<AtomicU64>,
-    grace_override: Option<Duration>,
-    mut new: ServerConfig,
-) {
-    let old = config.read().clone();
-    let mut restart_fields: Vec<&str> = Vec::new();
-    if old.server.bind_addr != new.server.bind_addr {
-        restart_fields.push("server.bind_addr");
-    }
-    if old.server.bind_port != new.server.bind_port {
-        restart_fields.push("server.bind_port");
-    }
-    if old.server.tls_enable != new.server.tls_enable {
-        restart_fields.push("server.tls_enable");
-    }
-    if old.server.tls_cert != new.server.tls_cert {
-        restart_fields.push("server.tls_cert");
-    }
-    if old.server.tls_key != new.server.tls_key {
-        restart_fields.push("server.tls_key");
-    }
-    if old.server.work_conn_tls != new.server.work_conn_tls {
-        restart_fields.push("server.work_conn_tls");
-    }
-    if old.server.tcp_keepalive_secs != new.server.tcp_keepalive_secs {
-        restart_fields.push("server.tcp_keepalive_secs");
-    }
-    if old.proxy.vhost_http_port != new.proxy.vhost_http_port {
-        restart_fields.push("proxy.vhost_http_port");
-    }
-    if old.proxy.vhost_https_port != new.proxy.vhost_https_port {
-        restart_fields.push("proxy.vhost_https_port");
-    }
-    if old.proxy.vhost_tls_cert != new.proxy.vhost_tls_cert {
-        restart_fields.push("proxy.vhost_tls_cert");
-    }
-    if old.proxy.vhost_tls_key != new.proxy.vhost_tls_key {
-        restart_fields.push("proxy.vhost_tls_key");
-    }
-    let old_dashboard_addr = old.dashboard.as_ref().map(|d| d.addr.as_str());
-    let new_dashboard_addr = new.dashboard.as_ref().map(|d| d.addr.as_str());
-    if old_dashboard_addr != new_dashboard_addr {
-        restart_fields.push("dashboard.addr");
-    }
-    if !restart_fields.is_empty() {
-        tracing::warn!(
-            fields = ?restart_fields,
-            "server config changes require restart; keeping current listeners/TLS"
-        );
+async fn apply_reload(
+    ctx: &mut ReloadState<'_>,
+    new: ServerConfig,
+) -> std::result::Result<(), String> {
+    let old = ctx.config.read().clone();
+    let bind_addr_changed = old.server.bind_addr != new.server.bind_addr;
+    let bind_changed = bind_addr_changed || old.server.bind_port != new.server.bind_port;
+    let tls_changed = old.server.tls_enable != new.server.tls_enable
+        || old.server.tls_cert != new.server.tls_cert
+        || old.server.tls_key != new.server.tls_key
+        || old.server.work_conn_tls != new.server.work_conn_tls;
+    let http_changed = bind_addr_changed || old.proxy.vhost_http_port != new.proxy.vhost_http_port;
+    let https_port_changed =
+        bind_addr_changed || old.proxy.vhost_https_port != new.proxy.vhost_https_port;
+    let https_tls_changed = old.proxy.vhost_tls_cert != new.proxy.vhost_tls_cert
+        || old.proxy.vhost_tls_key != new.proxy.vhost_tls_key;
+    let old_dashboard_addr = old.dashboard.as_ref().map(|d| d.addr.clone());
+    let new_dashboard_addr = new.dashboard.as_ref().map(|d| d.addr.clone());
+    let dashboard_addr_changed = old_dashboard_addr != new_dashboard_addr;
+
+    // 先准备所有新资源；任一步失败都不提交配置，旧监听继续服务。
+    let new_control_tls = if tls_changed {
+        Some(load_control_tls(&new).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let new_control_listener = if bind_changed {
+        Some(
+            bind_port(
+                &new.server.bind_addr,
+                new.server.bind_port,
+                "control listener",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let new_http_listener = if http_changed {
+        match new.proxy.vhost_http_port {
+            Some(port) => {
+                Some(bind_port(&new.server.bind_addr, port, "http vhost listener").await?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let new_https_listener = if https_port_changed {
+        match new.proxy.vhost_https_port {
+            Some(port) => {
+                Some(bind_port(&new.server.bind_addr, port, "https vhost listener").await?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let new_https_tls = if https_port_changed || https_tls_changed {
+        match new.proxy.vhost_https_port {
+            Some(_) => Some(Some(load_vhost_tls(&new).map_err(|e| e.to_string())?)),
+            None => Some(None),
+        }
+    } else {
+        None
+    };
+    let new_dashboard_listener = if dashboard_addr_changed && new.dashboard.is_some() {
+        bind_dashboard(&new).await.map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let new_dashboard = new.dashboard.clone();
+
+    // 提交。此时所有待启用的监听/TLS 均已成功创建。
+    let effective_grace = ctx.grace_override.unwrap_or_else(|| new.server.grace());
+    ctx.grace
+        .store(effective_grace.as_secs(), Ordering::Relaxed);
+
+    if dashboard_addr_changed {
+        if let Some(dashboard) = new_dashboard {
+            if let Some(slot) = ctx.dashboard_cfg.as_ref() {
+                *slot.write() = dashboard;
+            } else {
+                *ctx.dashboard_cfg = Some(Arc::new(RwLock::new(dashboard)));
+            }
+            if let Some(listener) = new_dashboard_listener {
+                let cfg = ctx
+                    .dashboard_cfg
+                    .clone()
+                    .expect("dashboard config must exist after update");
+                stop_task(&mut ctx.tasks.dashboard).await;
+                ctx.tasks.dashboard = Some(spawn_dashboard(
+                    listener,
+                    cfg,
+                    ctx.state.clone(),
+                    ctx.shutdown.clone(),
+                ));
+            }
+        } else {
+            stop_task(&mut ctx.tasks.dashboard).await;
+            *ctx.dashboard_cfg = None;
+        }
+    } else if let (Some(slot), Some(dashboard)) = (ctx.dashboard_cfg.as_ref(), new_dashboard) {
+        *slot.write() = dashboard;
     }
 
-    // 冻结需要重建监听/TLS 的字段：运行时共享配置必须与当前实际资源一致。
-    new.server.bind_addr = old.server.bind_addr.clone();
-    new.server.bind_port = old.server.bind_port;
-    new.server.tls_enable = old.server.tls_enable;
-    new.server.tls_cert = old.server.tls_cert.clone();
-    new.server.tls_key = old.server.tls_key.clone();
-    new.server.work_conn_tls = old.server.work_conn_tls;
-    new.server.tcp_keepalive_secs = old.server.tcp_keepalive_secs;
-    new.proxy.vhost_http_port = old.proxy.vhost_http_port;
-    new.proxy.vhost_https_port = old.proxy.vhost_https_port;
-    new.proxy.vhost_tls_cert = old.proxy.vhost_tls_cert.clone();
-    new.proxy.vhost_tls_key = old.proxy.vhost_tls_key.clone();
-
-    match (&old.dashboard, &new.dashboard) {
-        (Some(old_d), Some(new_d)) => {
-            let mut frozen = new_d.clone();
-            frozen.addr = old_d.addr.clone();
-            new.dashboard = Some(frozen);
+    if http_changed {
+        stop_task(&mut ctx.tasks.http).await;
+        if let Some(listener) = new_http_listener {
+            ctx.tasks.http = Some(spawn_http_vhost(
+                listener,
+                ctx.state.clone(),
+                ctx.shutdown.clone(),
+            ));
         }
-        (None, Some(_)) => {
-            tracing::warn!("[dashboard] enabling at runtime requires restart");
-            new.dashboard = None;
-        }
-        (Some(_), None) => {
-            tracing::warn!("[dashboard] disabling at runtime requires restart");
-            new.dashboard = old.dashboard.clone();
-        }
-        (None, None) => {}
     }
 
-    let effective_grace = grace_override.unwrap_or_else(|| new.server.grace());
-    grace.store(effective_grace.as_secs(), Ordering::Relaxed);
-    if let (Some(slot), Some(new_d)) = (dashboard_cfg, new.dashboard.as_ref()) {
-        *slot.write() = new_d.clone();
+    if https_port_changed {
+        stop_task(&mut ctx.tasks.https).await;
+        if let Some(listener) = new_https_listener {
+            if let Some(Some(tls)) = &new_https_tls {
+                *ctx.tasks.https_tls.write() = Some(tls.clone());
+            } else if let Some(None) = &new_https_tls {
+                *ctx.tasks.https_tls.write() = None;
+            }
+            ctx.tasks.https = Some(spawn_https_vhost(
+                listener,
+                ctx.tasks.https_tls.clone(),
+                ctx.state.clone(),
+                ctx.shutdown.clone(),
+            ));
+        } else if let Some(None) = &new_https_tls {
+            *ctx.tasks.https_tls.write() = None;
+        }
+    } else if let Some(Some(tls)) = &new_https_tls {
+        *ctx.tasks.https_tls.write() = Some(tls.clone());
     }
-    *config.write() = new;
+
+    // 控制 TLS 先于配置提交；随后切换 listener，避免新连接看到配置/握手模式不一致。
+    if let Some(tls) = new_control_tls {
+        *ctx.control_tls.write() = tls;
+    }
+    init_keepalive(KeepaliveConfig::from_secs(new.server.tcp_keepalive_secs));
+    let udp_session_timeout = new.server.udp_session_timeout();
+    for proxy in ctx.state.udp.lock().values() {
+        proxy.set_session_timeout(udp_session_timeout);
+    }
+    *ctx.config.write() = new;
+    if let Some(listener) = new_control_listener {
+        let addr = listener.local_addr().ok();
+        ctx.listener_tx
+            .send(Arc::new(listener))
+            .map_err(|_| "control accept loop is shutting down".to_string())?;
+        tracing::info!(?addr, "control listener replaced");
+    }
     tracing::info!("server configuration reloaded");
+    Ok(())
+}
+
+async fn bind_port(
+    bind_addr: &str,
+    port: u16,
+    what: &str,
+) -> std::result::Result<TcpListener, String> {
+    let addr = format!("{bind_addr}:{port}");
+    TcpListener::bind((bind_addr, port))
+        .await
+        .map_err(|e| bind_error(what, &addr, e).to_string())
+}
+
+fn load_vhost_tls(config: &ServerConfig) -> Result<ServerTls> {
+    let missing =
+        || Error::Config("vhost_https_port requires vhost_tls_cert and vhost_tls_key".into());
+    let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(missing)?;
+    let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(missing)?;
+    ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))
 }
 
 /// 连接处理失败是否属于"对端行为"（RST/EOF/协议不符等预期噪声）。

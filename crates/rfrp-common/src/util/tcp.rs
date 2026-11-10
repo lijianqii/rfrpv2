@@ -5,14 +5,15 @@
 //! 由内核探测发现，避免"终端卡住"）。
 //!
 //! keepalive 参数为**进程级**配置，启动时由配置注入（见 [`init_keepalive`]）；
-//! 未注入时使用默认值（`TCP_KEEPALIVE_INTERVAL` / `TCP_KEEPALIVE_PROBE_INTERVAL`），
+//! 配置热重载时可再次调用，只影响之后新建的连接。未注入时使用默认值
+//! （`TCP_KEEPALIVE_INTERVAL` / `TCP_KEEPALIVE_PROBE_INTERVAL`），
 //! 可通过 `tcp_keepalive_secs = 0` 禁用。
 //!
 //! 历史说明：Windows 曾因**只设置空闲时间而未设置探测间隔**（interval=0）导致空闲连接
 //! 约 30s 后被断开，因而一度禁用；现统一同时设置 time+interval（Windows 走
 //! `SIO_KEEPALIVE_VALS`），与 Linux 行为一致。
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use socket2::SockRef;
@@ -51,15 +52,22 @@ impl KeepaliveConfig {
     }
 }
 
-static KEEPALIVE: OnceLock<KeepaliveConfig> = OnceLock::new();
+static KEEPALIVE: RwLock<KeepaliveConfig> = RwLock::new(KeepaliveConfig {
+    idle: Duration::from_secs(TCP_KEEPALIVE_INTERVAL),
+    interval: Duration::from_secs(TCP_KEEPALIVE_PROBE_INTERVAL),
+});
 
-/// 注入进程级 keepalive 参数（启动时调用一次；重复调用忽略）。
+/// 注入/更新进程级 keepalive 参数。热重载只影响之后新建的连接。
 pub fn init_keepalive(cfg: KeepaliveConfig) {
-    let _ = KEEPALIVE.set(cfg);
+    *KEEPALIVE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg;
 }
 
 fn keepalive() -> KeepaliveConfig {
-    KEEPALIVE.get().copied().unwrap_or_default()
+    *KEEPALIVE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 对 TCP 流启用 `TCP_NODELAY` 与 keepalive。
