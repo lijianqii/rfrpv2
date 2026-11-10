@@ -27,9 +27,24 @@ const MAX_LOGIN_BODY: usize = 4096;
 /// Dashboard 服务端会话表：Cookie 只保存随机会话 ID，不再保存 base64(user:pass)。
 ///
 /// 这样 Cookie 泄露不等于密码泄露，且服务端可真正执行 TTL 与 logout 撤销。
+struct DashboardSession {
+    expires: Instant,
+    /// 登录时的 user/password 指纹；凭据热更新后旧会话必须失效。
+    credentials: u64,
+}
+
 struct DashboardSessions {
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<String, DashboardSession>>,
     ttl: Duration,
+}
+
+fn credentials_fingerprint(cfg: &DashboardSection) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.user.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    cfg.password.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl DashboardSessions {
@@ -40,25 +55,37 @@ impl DashboardSessions {
         }
     }
 
-    fn create(&self) -> String {
+    fn create_for(&self, cfg: &DashboardSection) -> String {
+        self.create_with(credentials_fingerprint(cfg))
+    }
+
+    fn create_with(&self, credentials: u64) -> String {
         let token = uuid::Uuid::new_v4().to_string();
         let now = Instant::now();
         let mut sessions = self.inner.lock();
-        sessions.retain(|_, expires| *expires > now);
+        sessions.retain(|_, session| session.expires > now);
         // Dashboard 会话数量很少；超过上限时整体清空，避免异常登录刷爆内存。
         if sessions.len() >= 1024 {
             sessions.clear();
         }
-        sessions.insert(token.clone(), now + self.ttl);
+        sessions.insert(
+            token.clone(),
+            DashboardSession {
+                expires: now + self.ttl,
+                credentials,
+            },
+        );
         token
     }
 
-    fn is_valid(&self, token: &str) -> bool {
+    fn is_valid_for(&self, token: &str, cfg: &DashboardSection) -> bool {
+        let fingerprint = credentials_fingerprint(cfg);
         let now = Instant::now();
         let mut sessions = self.inner.lock();
         match sessions.get(token) {
-            Some(expires) if *expires > now => true,
+            Some(session) if session.expires > now && session.credentials == fingerprint => true,
             Some(_) => {
+                // 过期或凭据已变更：立即删除，避免旧密码会话继续有效。
                 sessions.remove(token);
                 false
             }
@@ -177,7 +204,7 @@ async fn handle_request(
         let (user, pass) = parse_login_form(&body);
         if verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass) {
             // Cookie 只保存随机、可撤销的服务端会话 ID，不保存凭据本身。
-            let value = sessions.create();
+            let value = sessions.create_for(cfg);
             let headers = format!(
                 "Location: /\r\nSet-Cookie: {}\r\n",
                 session_cookie(&value, cfg)
@@ -280,7 +307,7 @@ fn authorized(req: &RequestHead, cfg: &DashboardSection, sessions: &DashboardSes
     }
     if let Some(cookie) = req.cookie.as_deref() {
         if let Some(value) = cookie_value(cookie, SESSION_COOKIE) {
-            return sessions.is_valid(&value);
+            return sessions.is_valid_for(&value, cfg);
         }
     }
     false
@@ -601,7 +628,7 @@ mod authorized_tests {
         // 表单登录后浏览器只带随机会话 ID（无 Authorization 头）。
         let cfg = cfg();
         let sessions = sessions();
-        let value = sessions.create();
+        let value = sessions.create_for(&cfg);
         let head =
             format!("GET / HTTP/1.1\r\nCookie: theme=dark; {SESSION_COOKIE}={value}\r\n\r\n");
         assert!(authorized(&parsed(&head), &cfg, &sessions));
@@ -614,15 +641,35 @@ mod authorized_tests {
     fn expired_or_revoked_session_cookie_rejected() {
         let cfg = cfg();
         let expired_sessions = DashboardSessions::new(0);
-        let value = expired_sessions.create();
+        let value = expired_sessions.create_for(&cfg);
         let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={value}\r\n\r\n");
         assert!(!authorized(&parsed(&head), &cfg, &expired_sessions));
 
         let sessions = sessions();
-        let value = sessions.create();
+        let value = sessions.create_for(&cfg);
         sessions.revoke(&value);
         let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={value}\r\n\r\n");
         assert!(!authorized(&parsed(&head), &cfg, &sessions));
+    }
+
+    #[test]
+    fn session_cookie_invalidated_when_credentials_change() {
+        let cfg = cfg();
+        let sessions = sessions();
+        let value = sessions.create_for(&cfg);
+        let head = format!("GET / HTTP/1.1\r\nCookie: {SESSION_COOKIE}={value}\r\n\r\n");
+        assert!(authorized(&parsed(&head), &cfg, &sessions));
+
+        let mut changed = cfg.clone();
+        changed.password = "new-secret".into();
+        assert!(
+            !authorized(&parsed(&head), &changed, &sessions),
+            "old dashboard session must be invalid after password change"
+        );
+        assert!(
+            !authorized(&parsed(&head), &cfg, &sessions),
+            "invalidated session must stay invalid"
+        );
     }
 
     #[test]

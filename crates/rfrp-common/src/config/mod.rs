@@ -10,7 +10,7 @@ mod client;
 mod server;
 
 /// `[log]` 日志设置（整段可选），服务端与客户端共用。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LogSection {
     #[serde(default)]

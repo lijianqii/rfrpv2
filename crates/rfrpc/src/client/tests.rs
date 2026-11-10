@@ -46,6 +46,38 @@ fn cfg_for(path: &std::path::Path) -> ClientConfig {
 }
 
 #[test]
+fn only_session_affecting_changes_require_control_reconnect() {
+    let base = cfg_for(std::path::Path::new("/tmp/rfrp-test-run-id"));
+    let mut log_only = base.clone();
+    log_only.log.level = Some("debug".into());
+    assert!(!Client::control_reconnect_required(&base, &log_only));
+
+    let mut status_only = base.clone();
+    status_only.client.status_addr = Some("127.0.0.1:7400".into());
+    assert!(!Client::control_reconnect_required(&base, &status_only));
+
+    let mut keepalive_only = base.clone();
+    keepalive_only.client.tcp_keepalive_secs = Some(10);
+    assert!(!Client::control_reconnect_required(&base, &keepalive_only));
+
+    let mut token_changed = base.clone();
+    token_changed.client.token = "new-token".into();
+    assert!(Client::control_reconnect_required(&base, &token_changed));
+
+    let mut proxy_changed = base.clone();
+    proxy_changed.proxies.push(ClientProxy {
+        name: "new".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: 22,
+        remote_port: Some(2222),
+        custom_domains: None,
+        pool_size: 0,
+    });
+    assert!(Client::control_reconnect_required(&base, &proxy_changed));
+}
+
+#[test]
 fn new_fails_fast_when_tls_required_but_unconfigurable() {
     // ClientTls 缓存提前到 Client::new：work_conn_tls=true 但缺 tls_server_name，
     // 应立刻报错而非等到首次重连才发现（§6.5 负路径）。

@@ -173,6 +173,10 @@ impl Client {
                                 let new = reload_rx.borrow().clone();
                                 let old_status = self.config.read().client.status_addr.clone();
                                 let new_status = new.client.status_addr.clone();
+                                let reconnect_required = Self::control_reconnect_required(
+                                    &self.config.read(),
+                                    &new,
+                                );
                                 let status_listener = if old_status != new_status {
                                     match bind_status(&new_status).await {
                                         Ok(listener) => listener,
@@ -200,21 +204,31 @@ impl Client {
                                                 ));
                                             }
                                         }
-                                        tracing::info!("client configuration reloaded; reconnecting");
-                                        reload_token.cancel();
-                                        if tokio::time::timeout(
-                                            Duration::from_secs(5),
-                                            &mut connect,
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            tracing::warn!(
-                                                "connect task did not stop after config reload; dropping"
+                                        if reconnect_required {
+                                            tracing::info!(
+                                                "client configuration reloaded; reconnecting"
+                                            );
+                                            reload_token.cancel();
+                                            if tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                &mut connect,
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                tracing::warn!(
+                                                    "connect task did not stop after config reload; dropping"
+                                                );
+                                            }
+                                            immediate = true;
+                                            break Ok(ConnectOutcome::Reconnect {
+                                                connected: false,
+                                            });
+                                        } else {
+                                            tracing::info!(
+                                                "client configuration updated without reconnect"
                                             );
                                         }
-                                        immediate = true;
-                                        break Ok(ConnectOutcome::Reconnect { connected: false });
                                     }
                                     Err(e) => {
                                         drop(status_listener);
@@ -277,6 +291,21 @@ impl Client {
         }
         sig.abort();
         Ok(())
+    }
+
+    /// 是否需要断开控制连接才能应用新配置。
+    ///
+    /// 日志级别、状态端点、keepalive 和 run_id_file 由其他路径处理，不应打断隧道。
+    fn control_reconnect_required(old: &ClientConfig, new: &ClientConfig) -> bool {
+        let mut old_client = old.client.clone();
+        let mut new_client = new.client.clone();
+        old_client.status_addr = None;
+        new_client.status_addr = None;
+        old_client.tcp_keepalive_secs = None;
+        new_client.tcp_keepalive_secs = None;
+        old_client.run_id_file = None;
+        new_client.run_id_file = None;
+        old_client != new_client || old.proxies != new.proxies
     }
 
     /// 应用热重载后的客户端配置。失败时保留旧配置。

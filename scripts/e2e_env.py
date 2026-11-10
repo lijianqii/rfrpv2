@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -191,6 +192,20 @@ def tcp_bulk_roundtrip(port: int, payload: bytes, timeout: float = 60.0) -> bool
             return not send_errors and bytes(received) == payload
     except OSError:
         return False
+
+
+def https_get_host(port: int, path: str, host: str) -> tuple[int, str]:
+    """向 HTTPS vhost 端口发请求；测试证书为自签，跳过证书校验。"""
+    context = ssl._create_unverified_context()
+    conn = http.client.HTTPSConnection(
+        "127.0.0.1", port, timeout=3, context=context
+    )
+    try:
+        conn.request("GET", path, headers={"Host": host})
+        response = conn.getresponse()
+        return response.status, response.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
 
 
 def tcp_connectable(port: int, timeout: float = 0.5) -> bool:
@@ -373,6 +388,8 @@ class Stack:
         udp_local: Optional[int] = None,
         vhost_local: Optional[int] = None,
         vhost_domain: str = "web.example",
+        vhost_https_local: Optional[int] = None,
+        vhost_https_domain: str = "dev.example.com",
         same_port: bool = False,
         tls: bool = False,
         udp_timeout: int = 300,
@@ -387,9 +404,12 @@ class Stack:
         self.udp_local = udp_local
         self.vhost_local = vhost_local
         self.vhost_domain = vhost_domain
+        self.vhost_https_local = vhost_https_local
+        self.vhost_https_domain = vhost_https_domain
         self.remote_tcp: Optional[int] = None
         self.remote_udp: Optional[int] = None
         self.vhost_port: Optional[int] = None
+        self.vhost_https_port: Optional[int] = None
         self.status_port: Optional[int] = None
 
         used: set[int] = set()
@@ -405,6 +425,8 @@ class Stack:
                 self.remote_udp = self._port(used, free_udp_port)
         if vhost_local is not None:
             self.vhost_port = self._port(used, free_tcp_port)
+        if vhost_https_local is not None:
+            self.vhost_https_port = self._port(used, free_tcp_port)
         if status:
             self.status_port = self._port(used, free_tcp_port)
 
@@ -466,6 +488,14 @@ class Stack:
         ]
         if self.vhost_port is not None:
             lines.append(f"vhost_http_port = {self.vhost_port}")
+        if self.vhost_https_port is not None:
+            lines.append(f"vhost_https_port = {self.vhost_https_port}")
+            lines.append(
+                f'vhost_tls_cert = "{(ROOT / "examples" / "vhost-cert.pem").as_posix()}"'
+            )
+            lines.append(
+                f'vhost_tls_key = "{(ROOT / "examples" / "vhost-key.pem").as_posix()}"'
+            )
         lines += [
             "",
             "[log]",
@@ -525,6 +555,16 @@ class Stack:
                 f"local_port = {self.vhost_local}",
                 f'custom_domains = ["{self.vhost_domain}"]',
             ]
+        if self.vhost_https_local is not None:
+            lines += [
+                "",
+                "[[proxy]]",
+                'name = "web-https"',
+                'type = "https"',
+                'local_ip = "127.0.0.1"',
+                f"local_port = {self.vhost_https_local}",
+                f'custom_domains = ["{self.vhost_https_domain}"]',
+            ]
         lines += [
             "",
             "[log]",
@@ -564,10 +604,19 @@ class Stack:
         if self.vhost_local is not None:
             if not wait_until(lambda: self._vhost_ready(), timeout):
                 return False
+        if self.vhost_https_local is not None:
+            if not wait_until(lambda: self._vhost_https_ready(), timeout):
+                return False
         return True
 
     def _vhost_ready(self) -> bool:
         status, body = http_get_host(self.vhost_port, "/", self.vhost_domain)
+        return status == 200 and body == "vhost-ok"
+
+    def _vhost_https_ready(self) -> bool:
+        status, body = https_get_host(
+            self.vhost_https_port, "/", self.vhost_https_domain
+        )
         return status == 200 and body == "vhost-ok"
 
     def status(self) -> dict:
@@ -785,6 +834,219 @@ class E2E(unittest.TestCase):
         self._stack_control_port = stack.control_port
         return stack
 
+    def test_hot_reload_preserves_established_tcp(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original = stack.client_config.read_text(encoding="utf-8")
+        sock = socket.create_connection(("127.0.0.1", stack.remote_tcp), timeout=3)
+        self.addCleanup(sock.close)
+        sock.settimeout(3)
+
+        def echo_once(payload: bytes) -> None:
+            sock.sendall(payload)
+            received = b""
+            while len(received) < len(payload):
+                chunk = sock.recv(len(payload) - len(received))
+                if not chunk:
+                    raise AssertionError("long-lived TCP connection closed")
+                received += chunk
+            self.assertEqual(received, payload)
+
+        echo_once(b"before-hot-reload")
+        second_echo = self.tcp_echo()
+        second_remote = free_tcp_port()
+        while second_remote in {
+            stack.remote_tcp,
+            stack.control_port,
+            stack.dashboard_port,
+        }:
+            second_remote = free_tcp_port()
+        stack.client_config.write_text(
+            original
+            + "\n[[proxy]]\n"
+            + 'name = "tcp2"\n'
+            + 'type = "tcp"\n'
+            + 'local_ip = "127.0.0.1"\n'
+            + f"local_port = {second_echo.port}\n"
+            + f"remote_port = {second_remote}\n"
+            + "pool_size = 0\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(second_remote, b"added", timeout=0.5),
+                20.0,
+            ),
+            "added proxy did not become ready",
+        )
+        echo_once(b"after-proxy-add")
+
+        stack.client_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: not tcp_roundtrip(second_remote, b"gone", timeout=0.5),
+                20.0,
+            ),
+            "removed proxy port was not released",
+        )
+        echo_once(b"after-proxy-remove")
+
+    def test_hot_reload_rollback_on_bind_failure(self) -> None:
+        backend = self.http_echo()
+        stack = self.make_stack(
+            vhost_local=backend.port,
+            vhost_domain="web.example",
+            log_level="info",
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+        old_vhost = stack.vhost_port
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        blocked_port = blocker.getsockname()[1]
+        stack.server_config.write_text(
+            original.replace(
+                f"vhost_http_port = {old_vhost}",
+                f"vhost_http_port = {blocked_port}",
+            ),
+            encoding="utf-8",
+        )
+        time.sleep(2)
+        # 新监听绑定失败，旧 vhost 与进程必须继续可用。
+        self.assertEqual(
+            http_get_host(old_vhost, "/", "web.example")[0],
+            200,
+            "old vhost listener was lost after failed reload",
+        )
+        self.assertIsNone(stack.server_proc.poll())
+        blocker.close()
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertEqual(
+            http_get_host(old_vhost, "/", "web.example")[0],
+            200,
+            "vhost did not recover after failed bind was removed",
+        )
+
+        # 控制端口被占用：失败后旧控制监听与数据代理必须继续工作。
+        control_blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        control_blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        control_blocker.bind(("127.0.0.1", 0))
+        control_blocker.listen(1)
+        self.addCleanup(control_blocker.close)
+        blocked_control = control_blocker.getsockname()[1]
+        stack.server_config.write_text(
+            original.replace(
+                f"bind_port = {stack.control_port}",
+                f"bind_port = {blocked_control}",
+            ),
+            encoding="utf-8",
+        )
+        time.sleep(2)
+        self.assertIsNone(stack.server_proc.poll())
+        self.assertEqual(
+            http_get_host(old_vhost, "/", "web.example")[0],
+            200,
+            "vhost proxy broke after failed control port rebind",
+        )
+        self.assertTrue(
+            tcp_connectable(stack.control_port),
+            "old control listener was lost after failed rebind",
+        )
+        control_blocker.close()
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            tcp_connectable(stack.control_port),
+            "control listener did not recover after failed rebind",
+        )
+
+        # Dashboard 新地址被占用：旧 Dashboard 必须继续可用。
+        dashboard_blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dashboard_blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        dashboard_blocker.bind(("127.0.0.1", 0))
+        dashboard_blocker.listen(1)
+        self.addCleanup(dashboard_blocker.close)
+        blocked_dashboard = dashboard_blocker.getsockname()[1]
+        stack.server_config.write_text(
+            original.replace(
+                f'addr = "127.0.0.1:{stack.dashboard_port}"',
+                f'addr = "127.0.0.1:{blocked_dashboard}"',
+            ),
+            encoding="utf-8",
+        )
+        time.sleep(2)
+        self.assertEqual(
+            http_get(stack.dashboard_port, "/api/status")[0],
+            200,
+            "old dashboard was lost after failed address rebind",
+        )
+        dashboard_blocker.close()
+        stack.server_config.write_text(original, encoding="utf-8")
+
+    def test_hot_reload_rollback_on_invalid_tls(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original_server = stack.server_config.read_text(encoding="utf-8")
+        original_client = stack.client_config.read_text(encoding="utf-8")
+        bad_cert = self.temp / "bad-cert.pem"
+        bad_cert.write_text("not a certificate\n", encoding="utf-8")
+
+        bad_server = original_server.replace(
+            "tls_enable = false", "tls_enable = true", 1
+        ).replace(
+            "tls_enable = true\n",
+            "tls_enable = true\n"
+            f'tls_cert = "{bad_cert.as_posix()}"\n'
+            f'tls_key = "{bad_cert.as_posix()}"\n',
+            1,
+        )
+        stack.server_config.write_text(bad_server, encoding="utf-8")
+        time.sleep(2)
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"server-tls-rollback"),
+            "server kept serving after invalid TLS reload",
+        )
+        stack.server_config.write_text(original_server, encoding="utf-8")
+
+        bad_client = original_client.replace(
+            "tls_enable = false", "tls_enable = true", 1
+        ).replace(
+            "tls_enable = true\n",
+            "tls_enable = true\n"
+            'tls_server_name = "localhost"\n'
+            f'tls_ca = "{bad_cert.as_posix()}"\n',
+            1,
+        )
+        stack.client_config.write_text(bad_client, encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(stack.client_proc.poll())
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"client-tls-rollback"),
+            "client kept serving after invalid TLS reload",
+        )
+        stack.client_config.write_text(original_client, encoding="utf-8")
+
+    def test_hot_reload_file_delete_and_recreate(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(tcp_local=echo.port, log_level="info")
+        original = stack.client_config.read_text(encoding="utf-8")
+        stack.client_config.unlink()
+        time.sleep(1)
+        self.assertIsNone(stack.client_proc.poll())
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"after-config-delete"),
+            "proxy broke after config file deletion",
+        )
+        stack.client_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(stack.remote_tcp, b"after-config-recreate"),
+                10.0,
+            ),
+            "proxy did not recover after config file recreation",
+        )
+
     def test_config_hot_reload(self) -> None:
         echo = self.tcp_echo()
         stack = self.make_stack(tcp_local=echo.port)
@@ -881,6 +1143,79 @@ class E2E(unittest.TestCase):
         stack.server_config.write_text(original_server, encoding="utf-8")
         stack.client_config.write_text(original_client, encoding="utf-8")
 
+    def test_server_https_vhost_hot_reload(self) -> None:
+        backend = self.http_echo()
+        stack = self.make_stack(
+            vhost_https_local=backend.port,
+            vhost_https_domain="dev.example.com",
+            log_level="info",
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+        old_https = stack.vhost_https_port
+        self.assertEqual(
+            https_get_host(old_https, "/", "dev.example.com")[0],
+            200,
+            "initial HTTPS vhost is not available",
+        )
+
+        new_https = free_tcp_port()
+        while new_https in {
+            stack.control_port,
+            stack.dashboard_port,
+            old_https,
+        }:
+            new_https = free_tcp_port()
+        stack.server_config.write_text(
+            original.replace(
+                f"vhost_https_port = {old_https}",
+                f"vhost_https_port = {new_https}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: https_get_host(
+                    new_https, "/", "dev.example.com"
+                )[0]
+                == 200,
+                10.0,
+            ),
+            "new HTTPS vhost listener did not become ready",
+        )
+        self.assertTrue(
+            wait_until(lambda: not tcp_connectable(old_https), 10.0),
+            "old HTTPS vhost listener was not released",
+        )
+
+        # 同端口证书替换：复用 listener，仅替换共享 TLS acceptor。
+        current = stack.server_config.read_text(encoding="utf-8")
+        current = current.replace("vhost-cert.pem", "cert.pem").replace(
+            "vhost-key.pem", "key.pem"
+        )
+        stack.server_config.write_text(current, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: https_get_host(
+                    new_https, "/", "dev.example.com"
+                )[0]
+                == 200,
+                10.0,
+            ),
+            "HTTPS vhost broke after certificate hot reload",
+        )
+
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: https_get_host(
+                    old_https, "/", "dev.example.com"
+                )[0]
+                == 200,
+                10.0,
+            ),
+            "original HTTPS vhost was not restored",
+        )
+
     def test_server_vhost_and_dashboard_listener_hot_reload(self) -> None:
         backend = self.http_echo()
         stack = self.make_stack(
@@ -965,11 +1300,9 @@ class E2E(unittest.TestCase):
         stack = self.make_stack(tcp_local=echo.port, status=True, log_level="info")
         old_status = stack.status_port
         self.assertIsNotNone(old_status)
-        self.assertEqual(
-            http_get(old_status, "/api/status", auth=False)[0],
-            200,
-            "initial client status endpoint is not available",
-        )
+        code, body = http_get(old_status, "/api/status", auth=False)
+        self.assertEqual(code, 200, "initial client status endpoint is not available")
+        before_reconnects = json.loads(body)["metrics"]["reconnects_total"]
         original = stack.client_config.read_text(encoding="utf-8")
         new_status = free_tcp_port()
         while new_status in {
@@ -997,6 +1330,14 @@ class E2E(unittest.TestCase):
             wait_until(lambda: not tcp_connectable(old_status), 10.0),
             "old client status endpoint was not released",
         )
+        code, body = http_get(new_status, "/api/status", auth=False)
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            json.loads(body)["metrics"]["reconnects_total"],
+            before_reconnects,
+            "status_addr-only reload must not reconnect the control channel",
+        )
+        self.assertEqual(len(stack.status()["sessions"]), 1)
         self.assertTrue(
             tcp_roundtrip(stack.remote_tcp, b"status-reload-proxy"),
             "proxy broke while moving client status endpoint",

@@ -20,7 +20,7 @@ fn default_pool_size() -> u32 {
 }
 
 /// `[client]` 连接服务端与鉴权。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSection {
     pub server_addr: String,
@@ -97,7 +97,7 @@ impl ClientSection {
 }
 
 /// 单个 `[[proxy]]` 条目。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientProxy {
     pub name: String,
@@ -189,7 +189,7 @@ impl ClientProxy {
 }
 
 /// 完整客户端配置。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     #[serde(default)]
