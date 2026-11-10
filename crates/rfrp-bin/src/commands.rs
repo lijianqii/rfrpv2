@@ -5,14 +5,22 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::summary::{
     init_logging, log_client_summary, log_server_summary, print_client_config_summary,
     print_server_config_summary, LogOverrides,
 };
+use crate::watch::{watch_config_file, ConfigWatcher};
 
 /// 服务端子命令参数。
+#[derive(Clone)]
 pub struct ServerArgs {
     pub config: PathBuf,
     pub bind: Option<String>,
@@ -21,9 +29,11 @@ pub struct ServerArgs {
     pub work_conn_tls: Option<bool>,
     pub grace_secs: Option<u64>,
     pub check: bool,
+    pub watch_exit: bool,
 }
 
 /// 客户端子命令参数。
+#[derive(Clone)]
 pub struct ClientArgs {
     pub config: PathBuf,
     pub server: Option<String>,
@@ -31,35 +41,186 @@ pub struct ClientArgs {
     pub tls_enable: Option<bool>,
     pub work_conn_tls: Option<bool>,
     pub check: bool,
+    pub watch_exit: bool,
+}
+
+/// 加载服务端配置并应用 CLI 覆盖；启动和 watch 退出校验共用。
+fn load_server_cfg(
+    args: &ServerArgs,
+) -> std::result::Result<rfrp_common::config::ServerConfig, String> {
+    let mut cfg = rfrp_common::config::load_server_config(&args.config).map_err(|e| {
+        format!(
+            "failed to load server config {}: {e}",
+            args.config.display()
+        )
+    })?;
+    rfrps::cli::apply_cli_overrides(
+        &mut cfg,
+        args.bind.clone(),
+        args.token.clone(),
+        args.tls_enable,
+        args.work_conn_tls,
+    )
+    .map_err(|e| e.to_string())?;
+    cfg.validate()
+        .map_err(|e| format!("server config invalid after CLI overrides: {e}"))?;
+    Ok(cfg)
+}
+
+/// 加载客户端配置并应用 CLI 覆盖；启动和 watch 退出校验共用。
+fn load_client_cfg(
+    args: &ClientArgs,
+) -> std::result::Result<rfrp_common::config::ClientConfig, String> {
+    let mut cfg = rfrp_common::config::load_client_config(&args.config).map_err(|e| {
+        format!(
+            "failed to load client config {}: {e}",
+            args.config.display()
+        )
+    })?;
+    rfrpc::cli::apply_cli_overrides(
+        &mut cfg,
+        args.server.clone(),
+        args.token.clone(),
+        args.tls_enable,
+        args.work_conn_tls,
+    )
+    .map_err(|e| e.to_string())?;
+    cfg.validate()
+        .map_err(|e| format!("client config invalid after CLI overrides: {e}"))?;
+    Ok(cfg)
+}
+
+struct ExitWatcher {
+    _watcher: ConfigWatcher,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ExitWatcher {
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+/// `--watch-config=exit`：配置变化且校验通过后触发优雅退出。
+fn start_server_exit_watcher(
+    args: ServerArgs,
+    shutdown: CancellationToken,
+    requested: Arc<AtomicBool>,
+) -> std::result::Result<ExitWatcher, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher =
+        watch_config_file(&args.config, tx).map_err(|e| format!("cannot watch config: {e}"))?;
+    let task = tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                event = rx.recv() => event,
+            };
+            let Some(()) = event else {
+                break;
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while rx.try_recv().is_ok() {}
+            match load_server_cfg(&args) {
+                Ok(_) => {
+                    tracing::info!("valid config change; exiting for restart");
+                    requested.store(true, Ordering::Relaxed);
+                    shutdown.cancel();
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "config change invalid; keeping current process")
+                }
+            }
+        }
+    });
+    Ok(ExitWatcher {
+        _watcher: watcher,
+        task: Some(task),
+    })
+}
+
+fn start_client_exit_watcher(
+    args: ClientArgs,
+    shutdown: CancellationToken,
+    requested: Arc<AtomicBool>,
+) -> std::result::Result<ExitWatcher, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher =
+        watch_config_file(&args.config, tx).map_err(|e| format!("cannot watch config: {e}"))?;
+    let task = tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                event = rx.recv() => event,
+            };
+            let Some(()) = event else {
+                break;
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while rx.try_recv().is_ok() {}
+            match load_client_cfg(&args) {
+                Ok(_) => {
+                    tracing::info!("valid config change; exiting for restart");
+                    requested.store(true, Ordering::Relaxed);
+                    shutdown.cancel();
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "config change invalid; keeping current process")
+                }
+            }
+        }
+    });
+    Ok(ExitWatcher {
+        _watcher: watcher,
+        task: Some(task),
+    })
+}
+
+/// supervisor 子进程从 stdin 接收 shutdown；EOF（父进程退出）也触发清理。
+fn spawn_supervised_stdin(shutdown: CancellationToken) {
+    if std::env::var_os("RFRP_SUPERVISOR_PIPE").is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        tracing::info!("supervisor stdin pipe reader started");
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) if line.trim() == "shutdown" => {
+                    tracing::info!("supervisor stdin shutdown command received");
+                    break;
+                }
+                Ok(Some(other)) => {
+                    tracing::warn!(line = %other, "ignoring unknown supervisor stdin command");
+                }
+                Ok(None) => {
+                    tracing::warn!("supervisor stdin EOF; shutting down child");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "supervisor stdin read error; shutting down child");
+                    break;
+                }
+            }
+        }
+        shutdown.cancel();
+    });
 }
 
 /// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
 pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
-    let mut cfg = match rfrp_common::config::load_server_config(&args.config) {
+    let cfg = match load_server_cfg(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "failed to load server config {}: {e}",
-                args.config.display()
-            );
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
-    // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrps。
-    if let Err(e) = rfrps::cli::apply_cli_overrides(
-        &mut cfg,
-        args.bind,
-        args.token,
-        args.tls_enable,
-        args.work_conn_tls,
-    ) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = cfg.validate() {
-        eprintln!("server config invalid after CLI overrides: {e}");
-        return ExitCode::FAILURE;
-    }
     if args.check {
         print_server_config_summary(&args.config, &cfg);
         return ExitCode::SUCCESS;
@@ -80,7 +241,6 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     // 优雅退出宽限期可由 CLI 覆盖（配置文件为 [server].grace_secs，见 §14.4）。
     let server = match args.grace_secs {
         Some(g) => {
-            // CLI 覆盖发生在配置校验之后，必须在这里重复上限校验。
             if g > rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS {
                 eprintln!(
                     "invalid --grace-secs {g}: max is {}",
@@ -92,8 +252,31 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         }
         None => server,
     };
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let exit_watcher = if args.watch_exit {
+        match start_server_exit_watcher(
+            args.clone(),
+            server.shutdown_token(),
+            restart_requested.clone(),
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to start config watcher");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    spawn_supervised_stdin(server.shutdown_token());
+
     tracing::info!(addr = %server.local_addr(), "rfrps listening");
-    match server.run().await {
+    let result = server.run().await;
+    if let Some(watcher) = exit_watcher {
+        watcher.stop().await;
+    }
+    match result {
+        Ok(()) if restart_requested.load(Ordering::Relaxed) => ExitCode::from(75),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "rfrps exited with error");
@@ -104,31 +287,13 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
 
 /// 客户端：加载配置 → CLI 覆盖 → 校验 → 日志 → 长驻运行（重连直到退出）。
 pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
-    let mut cfg = match rfrp_common::config::load_client_config(&args.config) {
+    let cfg = match load_client_cfg(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "failed to load client config {}: {e}",
-                args.config.display()
-            );
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
-    // CLI 参数覆盖配置文件（DESIGN §9.3），解析逻辑归属 rfrpc。
-    if let Err(e) = rfrpc::cli::apply_cli_overrides(
-        &mut cfg,
-        args.server,
-        args.token,
-        args.tls_enable,
-        args.work_conn_tls,
-    ) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = cfg.validate() {
-        eprintln!("client config invalid after CLI overrides: {e}");
-        return ExitCode::FAILURE;
-    }
     if args.check {
         print_client_config_summary(&args.config, &cfg);
         return ExitCode::SUCCESS;
@@ -146,7 +311,30 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match client.run().await {
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let exit_watcher = if args.watch_exit {
+        match start_client_exit_watcher(
+            args.clone(),
+            client.shutdown_token(),
+            restart_requested.clone(),
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to start config watcher");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    spawn_supervised_stdin(client.shutdown_token());
+
+    let result = client.run().await;
+    if let Some(watcher) = exit_watcher {
+        watcher.stop().await;
+    }
+    match result {
+        Ok(()) if restart_requested.load(Ordering::Relaxed) => ExitCode::from(75),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "rfrpc exited with error");

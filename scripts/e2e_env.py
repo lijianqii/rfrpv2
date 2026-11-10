@@ -85,10 +85,17 @@ def basic_auth() -> str:
     return base64.b64encode(f"{DASH_USER}:{DASH_PASSWORD}".encode()).decode()
 
 
-def http_get(port: int, path: str, auth: bool = True) -> tuple[int, str]:
+def http_get(
+    port: int,
+    path: str,
+    auth: bool = True,
+    user: str = DASH_USER,
+    password: str = DASH_PASSWORD,
+) -> tuple[int, str]:
     headers = {}
     if auth:
-        headers["Authorization"] = "Basic " + basic_auth()
+        credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers["Authorization"] = "Basic " + credentials
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", headers=headers
     )
@@ -222,6 +229,40 @@ def wait_until(predicate, timeout: float, interval: float = 0.5) -> bool:
             pass
         time.sleep(interval)
     return False
+
+
+def child_pids(pid: int) -> list[int]:
+    """Linux 下返回直接子进程 PID；其他平台返回空。"""
+    if os.name != "posix":
+        return []
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-P", str(pid)], text=True, stderr=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [int(line) for line in out.splitlines() if line.strip().isdigit()]
+
+
+def server_child_pids(pid: int) -> list[int]:
+    """supervisor 的直接子进程中排除 `--check` 校验进程。"""
+    result = []
+    for child in child_pids(pid):
+        try:
+            cmdline = Path(f"/proc/{child}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"--check" not in cmdline:
+            result.append(child)
+    return result
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def process_fd_count(pid: int) -> Optional[int]:
@@ -363,6 +404,8 @@ class Stack:
         udp_timeout: int = 300,
         log_level: str = "debug",
         status: bool = False,
+        server_extra_args: Optional[list[str]] = None,
+        client_extra_args: Optional[list[str]] = None,
     ) -> None:
         self.case = case
         self.temp = case.temp
@@ -376,6 +419,8 @@ class Stack:
         self.remote_udp: Optional[int] = None
         self.vhost_port: Optional[int] = None
         self.status_port: Optional[int] = None
+        self.server_extra_args = list(server_extra_args or [])
+        self.client_extra_args = list(client_extra_args or [])
 
         used: set[int] = set()
         self.control_port = self._port(used, free_tcp_port)
@@ -522,8 +567,9 @@ class Stack:
         log_path = self.temp / f"{role}.log"
         log = open(log_path, "ab", buffering=0)
         self._log_handles.append(log)
+        extra = self.server_extra_args if role == "server" else self.client_extra_args
         proc = subprocess.Popen(
-            [str(BIN), role, "-c", str(config)],
+            [str(BIN), role, "-c", str(config), *extra],
             stdout=log,
             stderr=subprocess.STDOUT,
         )
@@ -672,7 +718,11 @@ class E2E(unittest.TestCase):
                         f"--- {name} ---\n{path.read_text(encoding='utf-8')}",
                         file=sys.stderr,
                     )
-        self.tempdir.cleanup()
+        if failed and os.environ.get("E2E_KEEP_TEMP") == "1":
+            self.tempdir._finalizer.detach()
+            print(f"E2E temp dir preserved: {self.temp}", file=sys.stderr)
+        else:
+            self.tempdir.cleanup()
 
     def logs_tail(self, lines: int = 60) -> str:
         parts = []
@@ -705,6 +755,170 @@ class E2E(unittest.TestCase):
             raise AssertionError(f"stack setup failed: {exc}\n{self.logs_tail()}") from exc
         self.stacks.append(stack)
         return stack
+
+    def test_watch_config_exit_mode(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=exit"],
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+
+        stack.server_config.write_text("invalid = [\n", encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(
+            stack.server_proc.poll(),
+            "invalid config must not exit watch-config=exit process",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"exit-invalid"),
+            "proxy broke after invalid config in exit mode",
+        )
+
+        stack.server_config.write_text(
+            original.replace(
+                'password = "secret123"', 'password = "exit-new-pass"'
+            ),
+            encoding="utf-8",
+        )
+        code = stack.server_proc.wait(timeout=15)
+        self.assertEqual(
+            code,
+            75,
+            "valid config change should exit with code 75 for supervisor restart",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_restart_mode(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0),
+            "supervisor did not start exactly one child",
+        )
+        old_child = server_child_pids(parent.pid)[0]
+
+        stack.server_config.write_text("invalid = [\n", encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(parent.poll())
+        self.assertEqual(
+            server_child_pids(parent.pid),
+            [old_child],
+            "invalid config must not replace the child",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"restart-invalid"),
+            "proxy broke after invalid config in restart mode",
+        )
+
+        stack.server_config.write_text(
+            original.replace(
+                'password = "secret123"', 'password = "restart-new-pass"'
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                15.0,
+            ),
+            "supervisor did not replace the child after valid config change",
+        )
+        new_child = server_child_pids(parent.pid)[0]
+        self.assertIsNone(parent.poll(), "supervisor parent exited unexpectedly")
+        last_dashboard = []
+
+        def dashboard_ok() -> bool:
+            try:
+                code, body = http_get(
+                    stack.dashboard_port,
+                    "/api/status",
+                    password="restart-new-pass",
+                )
+                last_dashboard.append((code, body[:120]))
+                return code == 200
+            except Exception as exc:
+                last_dashboard.append(("exception", repr(exc)))
+                return False
+
+        if not wait_until(dashboard_ok, 15.0):
+            print(
+                f"dashboard port={stack.dashboard_port} probe tail={last_dashboard[-8:]} new_child={new_child}",
+                file=sys.stderr,
+            )
+            self.fail("child did not start with the new config")
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"restart-valid", timeout=1.0
+                ),
+                15.0,
+            ),
+            "proxy did not recover after supervised child restart",
+        )
+
+        parent.terminate()
+        parent.wait(timeout=15)
+        self.assertTrue(
+            wait_until(lambda: not pid_alive(new_child), 10.0),
+            "supervisor left an orphan child process",
+        )
+
+    def test_watch_config_exit_mode_client(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            client_extra_args=["--watch-config=exit"],
+        )
+        original = stack.client_config.read_text(encoding="utf-8")
+        stack.client_config.write_text("invalid = [\n", encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(
+            stack.client_proc.poll(),
+            "invalid config must not exit client watch-config=exit process",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"client-exit-invalid"),
+            "proxy broke after invalid client config",
+        )
+        stack.client_config.write_text(
+            original.replace("pool_size = 1", "pool_size = 0"),
+            encoding="utf-8",
+        )
+        code = stack.client_proc.wait(timeout=15)
+        self.assertEqual(code, 75, "client config change should exit with 75")
+
+    def test_watch_config_check_bypasses_supervisor(self) -> None:
+        binary = BIN
+        self.assertIsNotNone(binary)
+        result = subprocess.run(
+            [
+                str(binary),
+                "server",
+                "-c",
+                str(ROOT / "examples" / "rfrp-server.toml"),
+                "--watch-config=restart",
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"--check with --watch-config must not supervise: {result.stderr}",
+        )
+        self.assertIn("server config OK", result.stdout)
 
     def test_tcp_proxy_concurrent_and_large_transfer(self) -> None:
         echo = self.tcp_echo()

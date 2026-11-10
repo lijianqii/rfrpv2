@@ -241,6 +241,34 @@ format = "text"                 # 或 "json"（结构化，便于采集）
 
 启动时会打印版本与关键配置摘要（不含 token），便于排障。
 
+### 配置变更后重启
+
+不提供进程内热重载；配置变化后重新启动进程，所有配置从启动路径重新加载。
+
+```bash
+# Windows 控制台、直接运行：内置 supervisor
+rfrp server -c server.toml --watch-config=restart
+rfrp client -c client.toml --watch-config=restart
+
+# systemd / NSSM / WinSW：校验后退出，由服务管理器重启
+rfrp server -c server.toml --watch-config=exit
+rfrp client -c client.toml --watch-config=exit
+```
+
+`--watch-config` 不写值时等价于 `restart`。
+
+**restart 模式**：父进程不监听业务端口，只负责监听配置文件、运行 `--check`
+校验、通过 stdin 通知子进程优雅退出并重新启动。配置非法时保留当前子进程；
+子进程异常退出时按指数退避重启。适合 Windows 控制台和没有服务管理器的环境。
+
+**exit 模式**：配置变化且校验通过后，进程优雅退出并返回退出码 `75`。系统服务
+管理器应配置为在非零退出后重启，例如 systemd `Restart=on-failure`、NSSM 的
+exit action 或 WinSW 的 restart。配置非法时进程继续运行。
+
+两种模式都只使用文件系统事件（`notify`，非轮询），事件后 300ms 防抖；`--check`
+只验证配置和证书文件可读性，不验证端口能否绑定。配置变化会造成一次短暂重启，
+已有连接会断开。`--watch-config` 与 `--check` 同时出现时只检查配置，不启动监听。
+
 ## 目录结构
 
 ```text
@@ -263,7 +291,9 @@ cargo test --all
   UDP 多客户端/大包、UDP 会话超时重建、TLS 控制/工作连接、rfrps 重启后重连、UDP 突发后可用性；
 - 性能冒烟：TCP 16 MiB 吞吐、短连接 p50/p95 延迟；
 - 稳定性：300 次 TCP 连接后的 fd/RSS 回落、20 个 UDP 会话反复创建/清理、
-  5 秒 TCP+UDP 混合负载、连续 3 次 rfrps 重启。
+  5 秒 TCP+UDP 混合负载、连续 3 次 rfrps 重启；
+- 配置变更重启：supervisor 子进程替换、非法配置保留旧进程、`exit` 退出码 75、
+  `--check` 不进入 supervisor。
 
 ```bash
 make e2e

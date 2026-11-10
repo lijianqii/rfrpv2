@@ -70,6 +70,7 @@
 | 指标 | `prometheus` | 指标暴露 |
 | Dashboard | `axum` | Dashboard HTTP 服务（基于 hyper，复用 tokio） |
 | 静态资源 | `rust-embed` | Dashboard 前端页面嵌入二进制 |
+| 文件监听 | `notify` | 配置变更事件（inotify/ReadDirectoryChangesW/FSEvents） |
 | 工具 | `bytes` / `tokio-util` | 缓冲区、codec |
 
 > 心跳时间戳 `ts`（Unix 毫秒）用 `std::time::SystemTime` 获取，不引入 `chrono` 等外部时间库。
@@ -978,6 +979,25 @@ CLI 参数 > 配置文件 > 默认值。
 - 非法格式（如 `abc`、`7000-`、`8000-7000`）启动时报错中止。
 
 ---
+
+### 9.6 配置变更后重启
+
+不实现进程内配置热重载。`rfrp` 提供两种基于**文件系统事件**（`notify`）的重启模式，
+配置变化后由新进程完整加载：
+
+- `--watch-config=restart`：父进程监督子进程。父进程不绑定业务端口，负责监听配置、
+  通过相同 CLI 参数的 `--check` 校验、通过子进程 stdin 发送 `shutdown`、等待优雅退出
+  后重新启动。配置非法时保留旧子进程；子进程异常退出按 1s→30s 指数退避重启。
+  适合 Windows 控制台/无服务管理器环境。
+- `--watch-config=exit`：配置校验通过后触发优雅退出，退出码 `75`；由 systemd
+  `Restart=on-failure`、NSSM/WinSW 等外部服务管理器重新拉起。配置非法时继续运行。
+- 事件后 300ms 防抖；`--check` 与 watch 同时出现时只校验，不进入 supervisor。
+- 父/子进程通过 stdin 管道控制，避免依赖 Windows 控制台事件；父进程退出时管道 EOF
+  也会让子进程清理。
+- 校验复用启动路径（配置解析 + CLI 覆盖 + 校验），不实现第二套配置语义。
+- `--check` 仍不验证端口可绑定性；端口冲突时由 supervisor/服务管理器重试或报警。
+
+该方案不改变协议、不迁移运行期状态；代价是配置变化时连接会中断。
 
 ## 10. 鉴权与加密
 
