@@ -193,6 +193,14 @@ def tcp_bulk_roundtrip(port: int, payload: bytes, timeout: float = 60.0) -> bool
         return False
 
 
+def tcp_connectable(port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def udp_roundtrip(sock: socket.socket, payload: bytes, timeout: float = 2.0) -> bool:
     try:
         sock.settimeout(timeout)
@@ -919,6 +927,150 @@ class E2E(unittest.TestCase):
             f"--check with --watch-config must not supervise: {result.stderr}",
         )
         self.assertIn("server config OK", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_restart_rollback_on_startup_failure(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0),
+            "supervisor did not start a child",
+        )
+        old_child = server_child_pids(parent.pid)[0]
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        blocked = blocker.getsockname()[1]
+        stack.server_config.write_text(
+            original.replace(
+                f"bind_port = {stack.control_port}",
+                f"bind_port = {blocked}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                20.0,
+            ),
+            "supervisor did not start a rollback child",
+        )
+        self.assertIsNone(parent.poll())
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"rollback-old-config", timeout=1.0
+                ),
+                15.0,
+            ),
+            "rollback to old config did not restore the proxy",
+        )
+        self.assertTrue(
+            tcp_connectable(stack.control_port),
+            "rollback child did not bind the old control port",
+        )
+
+        blocker.close()
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"after-rollback-recovery", timeout=1.0
+                ),
+                20.0,
+            ),
+            "proxy did not recover after restoring config",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "SIGKILL test requires POSIX")
+    def test_watch_config_parent_sigkill_cleans_child(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0)
+        )
+        child = server_child_pids(parent.pid)[0]
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        self.assertTrue(
+            wait_until(lambda: not pid_alive(child), 10.0),
+            "child survived after supervisor was SIGKILLed",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_restart_mode_client(self) -> None:
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            client_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.client_proc
+        original = stack.client_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0)
+        )
+        old_child = server_child_pids(parent.pid)[0]
+
+        stack.client_config.write_text("invalid = [\n", encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(parent.poll())
+        self.assertEqual(
+            server_child_pids(parent.pid),
+            [old_child],
+            "invalid config must not replace client child",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"client-restart-invalid"),
+            "proxy broke after invalid client config",
+        )
+
+        stack.client_config.write_text(
+            original.replace(
+                "heartbeat_interval_secs = 5", "heartbeat_interval_secs = 6"
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                15.0,
+            ),
+            "client supervisor did not replace the child",
+        )
+        self.assertIsNone(parent.poll())
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"client-restart-valid", timeout=1.0
+                ),
+                15.0,
+            ),
+            "proxy did not recover after client child restart",
+        )
+
+        new_child = server_child_pids(parent.pid)[0]
+        parent.terminate()
+        parent.wait(timeout=15)
+        self.assertTrue(
+            wait_until(lambda: not pid_alive(new_child), 10.0),
+            "client supervisor left an orphan child",
+        )
 
     def test_tcp_proxy_concurrent_and_large_transfer(self) -> None:
         echo = self.tcp_echo()
