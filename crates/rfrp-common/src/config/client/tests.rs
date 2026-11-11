@@ -584,3 +584,24 @@ fn status_addr_port_zero_rejected() {
         "status_addr port 0 must be rejected"
     );
 }
+
+#[tokio::test]
+async fn resolve_server_addrs_returns_all_candidates_and_accepts_brackets() {
+    let s = ClientSection {
+        server_addr: "localhost".into(),
+        server_port: 7000,
+        ..Default::default()
+    };
+    let addrs = s.resolve_server_addrs().await.unwrap();
+    assert!(!addrs.is_empty());
+    assert!(addrs.iter().all(|a| a.port() == 7000));
+
+    let s = ClientSection {
+        server_addr: "[::1]".into(),
+        server_port: 7000,
+        ..Default::default()
+    };
+    let addrs = s.resolve_server_addrs().await.unwrap();
+    assert_eq!(addrs.len(), 1);
+    assert!(addrs[0].ip().is_loopback());
+}

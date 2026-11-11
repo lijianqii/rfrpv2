@@ -25,6 +25,7 @@ use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -60,8 +61,9 @@ pub struct ClientState {
 /// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
 enum ConnectOutcome {
     /// 需要重连。`connected` 表示本次是否已经成功建立过控制会话；
-    /// 若为 `true`，退避计时器应重置，避免用历史大退避惩罚一次健康的长连接。
-    Reconnect { connected: bool },
+    /// `lived` 从登录成功开始计时（不含 DNS/建连/TLS/登录等待），仅对
+    /// `connected=true` 有意义。
+    Reconnect { connected: bool, lived: Duration },
     /// 致命错误（鉴权 / 版本不兼容），不应重连。
     Fatal(String),
 }
@@ -101,6 +103,19 @@ pub fn validate_tls_config(config: &ClientConfig) -> RfrpResult<()> {
     build_tls(config).map(|_| ())
 }
 
+/// 状态端点任务守卫：`run` 的任何返回路径（含致命错误）都取消监听并 abort。
+struct StatusTask {
+    task: JoinHandle<()>,
+    shutdown: CancellationToken,
+}
+
+impl Drop for StatusTask {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
+}
+
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
         let tls = build_tls(&config)?;
@@ -134,7 +149,7 @@ impl Client {
         // 监听 OS 终止信号，触发统一退出令牌。
         let sig = spawn_signal_watcher(shutdown.clone());
         // 可选状态端点（[client] status_addr）：绑定失败只告警，不影响隧道功能。
-        if let Some(addr) = &self.config.client.status_addr {
+        let _status_task = if let Some(addr) = &self.config.client.status_addr {
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     if !addr.starts_with("127.")
@@ -147,13 +162,22 @@ impl Client {
                     let cfg = self.config.clone();
                     let metrics = self.metrics.clone();
                     let sd = shutdown.clone();
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         crate::status::run_status_server(listener, cfg, metrics, sd).await;
                     });
+                    Some(StatusTask {
+                        task,
+                        shutdown: shutdown.clone(),
+                    })
                 }
-                Err(e) => tracing::error!(%addr, error = %e, "failed to bind status endpoint"),
+                Err(e) => {
+                    tracing::error!(%addr, error = %e, "failed to bind status endpoint");
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
         let mut backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
         let mut attempt: u32 = 0;
         loop {
@@ -163,20 +187,18 @@ impl Client {
             }
             attempt += 1;
             tracing::debug!(attempt, "connection attempt");
-            let attempt_started = std::time::Instant::now();
             match self.connect_once(&run_id, &shutdown).await {
                 Ok(ConnectOutcome::Fatal(reason)) => {
                     sig.abort();
                     return Err(anyhow::anyhow!("login fatal: {reason}"));
                 }
-                Ok(ConnectOutcome::Reconnect { connected }) => {
+                Ok(ConnectOutcome::Reconnect { connected, lived }) => {
                     if shutdown.is_cancelled() {
                         break;
                     }
                     self.metrics.inc_reconnect();
                     // 仅"稳定连接"重置退避：会话刚建立即断开（抖动/被顶替）时保持退避增长，
-                    // 避免 1s 间隔的重连风暴。
-                    let lived = attempt_started.elapsed();
+                    // 避免 1s 间隔的重连风暴。计时从登录成功开始，避免慢解析/建连被误判为稳定。
                     if should_reset_backoff(connected, lived) {
                         attempt = 0;
                         backoff = Duration::from_secs(RECONNECT_BACKOFF_INITIAL);
@@ -215,34 +237,70 @@ impl Client {
         shutdown: &CancellationToken,
     ) -> AnyResult<ConnectOutcome> {
         // 允许 server_addr 为域名：每次建连都重新解析（IP 字面量则直接使用）。
-        let server_addr = self.config.client.resolve_server_addr().await?;
-        let tls = self.tls.clone();
-        // 带超时建连：防火墙静默丢包时 connect 可能阻塞约 2 分钟（Linux），
-        // 期间无法感知失败、也无法进入退避重试。
-        let stream = match tokio::time::timeout(
-            Duration::from_secs(CONNECT_TIMEOUT),
-            TcpStream::connect(server_addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => {
-                if let Err(e) = configure_tcp_stream(&s) {
-                    tracing::warn!(error = %e, "failed to configure control TCP stream");
+        // 双栈域名可能返回多个地址：在同一个 CONNECT_TIMEOUT 内逐个尝试，
+        // 避免首个地址不可达时永远连不上；解析本身也受该截止时间约束。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(CONNECT_TIMEOUT);
+        let server_addrs = tokio::select! {
+            _ = shutdown.cancelled() => {
+                return Ok(ConnectOutcome::Reconnect { connected: false, lived: Duration::ZERO });
+            }
+            resolved = tokio::time::timeout_at(
+                deadline,
+                self.config.client.resolve_server_addrs(),
+            ) => match resolved {
+                Ok(Ok(addrs)) => addrs,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "resolve server_addr failed");
+                    return Err(anyhow::anyhow!(e));
                 }
-                s
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "connect failed");
-                return Err(anyhow::anyhow!(e));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    server = %server_addr,
-                    "connect timeout (SYN 无响应：请检查服务端是否在监听、防火墙/网络配置文件、路由与源地址)"
-                );
-                return Err(anyhow::anyhow!("connect timeout"));
+                Err(_) => {
+                    tracing::warn!("resolve server_addr timeout");
+                    return Err(anyhow::anyhow!("resolve server_addr timeout"));
+                }
             }
         };
+
+        let mut connected = None;
+        let mut last_err = None;
+        for addr in server_addrs {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let attempt = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    return Ok(ConnectOutcome::Reconnect { connected: false, lived: Duration::ZERO });
+                }
+                result = tokio::time::timeout(remaining, TcpStream::connect(addr)) => result,
+            };
+            match attempt {
+                Ok(Ok(stream)) => {
+                    connected = Some((stream, addr));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %addr, error = %e, "connect failed");
+                    last_err = Some(anyhow::anyhow!(e));
+                }
+                Err(_) => {
+                    tracing::warn!(server = %addr, "connect timeout");
+                    last_err = Some(anyhow::anyhow!("connect timeout"));
+                    break;
+                }
+            }
+        }
+        let (stream, server_addr) = match connected {
+            Some(v) => v,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!("no resolved server address could connect")
+                }));
+            }
+        };
+        let tls = self.tls.clone();
+        if let Err(e) = configure_tcp_stream(&stream) {
+            tracing::warn!(error = %e, "failed to configure control TCP stream");
+        }
         tracing::info!(
             server = %server_addr,
             local = %stream.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
@@ -300,14 +358,18 @@ impl Client {
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
         let (login_otx, login_orx) = oneshot::channel();
+        let mut connected_at = None;
         state.login_tx.lock().replace(login_otx);
 
+        // 每次控制会话使用独立子令牌：单次连接失败时可以只清理本会话的
+        // writer/heartbeat，而不影响全局退出令牌。
+        let session_shutdown = shutdown.child_token();
         let ctrl = tokio::spawn(control::control_loop(
             stream,
             rx,
             state.clone(),
             self.config.clone(),
-            shutdown.clone(),
+            session_shutdown.clone(),
             self.heartbeat_interval,
             self.heartbeat_timeout,
         ));
@@ -330,8 +392,7 @@ impl Client {
                                 error = msg,
                                 "login rejected: unusable TLS configuration"
                             );
-                            ctrl.abort();
-                            let _ = ctrl.await;
+                            stop_control(ctrl, &session_shutdown).await;
                             return Ok(ConnectOutcome::Fatal(msg.into()));
                         }
                     };
@@ -350,6 +411,7 @@ impl Client {
                         tracing::debug!(version = negotiated, "protocol version negotiated");
                     }
                     self.metrics.set_connected(true);
+                    connected_at = Some(std::time::Instant::now());
                 }
                 if !resp.ok {
                     let reason = resp.error.clone().unwrap_or_else(|| "auth failed".into());
@@ -358,29 +420,34 @@ impl Client {
                     if login_rejection_is_fatal(&resp) {
                         tracing::error!(error = %reason, "login fatal; not reconnecting");
                         // 中止控制任务：服务端若未主动断开，await 会永久挂住导致进程无法退出。
-                        ctrl.abort();
-                        let _ = ctrl.await;
+                        stop_control(ctrl, &session_shutdown).await;
                         return Ok(ConnectOutcome::Fatal(reason));
                     }
                     tracing::warn!(error = ?resp.error, "login rejected; reconnecting");
-                    ctrl.abort();
-                    let _ = ctrl.await;
-                    return Ok(ConnectOutcome::Reconnect { connected: false });
+                    stop_control(ctrl, &session_shutdown).await;
+                    return Ok(ConnectOutcome::Reconnect {
+                        connected: false,
+                        lived: Duration::ZERO,
+                    });
                 }
             }
             Ok(Err(_)) => {
                 tracing::warn!("login response channel dropped; reconnecting");
                 // 必须中止控制任务：仅 return 会把任务分离，导致心跳/写任务与旧连接泄漏，
                 // 每次登录失败都累积一个常驻任务。
-                ctrl.abort();
-                let _ = ctrl.await;
-                return Ok(ConnectOutcome::Reconnect { connected: false });
+                stop_control(ctrl, &session_shutdown).await;
+                return Ok(ConnectOutcome::Reconnect {
+                    connected: false,
+                    lived: Duration::ZERO,
+                });
             }
             Err(_) => {
                 tracing::warn!("login response timeout; reconnecting");
-                ctrl.abort();
-                let _ = ctrl.await;
-                return Ok(ConnectOutcome::Reconnect { connected: false });
+                stop_control(ctrl, &session_shutdown).await;
+                return Ok(ConnectOutcome::Reconnect {
+                    connected: false,
+                    lived: Duration::ZERO,
+                });
             }
         }
 
@@ -389,15 +456,14 @@ impl Client {
         let mut retryable: Vec<ClientProxy> = Vec::new();
         let mut persistent: Vec<ClientProxy> = Vec::new();
         for p in state.proxies.values() {
-            match register_one_proxy(&tx, &state, p).await {
+            match register_one_proxy(&tx, &state, p, shutdown).await {
                 RegisterOutcome::Ok => {}
                 RegisterOutcome::Retryable => retryable.push(p.clone()),
                 RegisterOutcome::Persistent => persistent.push(p.clone()),
                 RegisterOutcome::Failed => {}
                 RegisterOutcome::ConnLost => {
                     // 注册阶段控制连接已断：统一收尾，避免状态端点继续显示已连接。
-                    ctrl.abort();
-                    let _ = ctrl.await;
+                    stop_control(ctrl, &session_shutdown).await;
                     self.metrics.set_connected(false);
                     anyhow::bail!(
                         "control connection closed or congested during proxy registration"
@@ -422,7 +488,10 @@ impl Client {
         // 兜底清理未消费的注册响应通道（正常情况下各路径已各自移除）。
         state.resps.lock().clear();
         self.metrics.set_connected(false);
-        Ok(ConnectOutcome::Reconnect { connected: true })
+        Ok(ConnectOutcome::Reconnect {
+            connected: true,
+            lived: connected_at.map(|t| t.elapsed()).unwrap_or_default(),
+        })
     }
 
     /// 生成或复用 run_id 并持久化（§6.6 / §8.3 重连身份）。
@@ -477,6 +546,19 @@ fn resolve_run_id_path(run_id_file: &Option<String>) -> PathBuf {
     match run_id_file {
         Some(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => default_run_id_path(),
+    }
+}
+
+/// 取消并收尾一次控制会话；正常情况下让 `control_loop` 走完 writer/heartbeat 清理，
+/// 超时再 abort，避免 `ctrl.abort()` 直接丢弃父任务导致子任务悬挂。
+async fn stop_control<T>(ctrl: JoinHandle<T>, session_shutdown: &CancellationToken) {
+    let abort = ctrl.abort_handle();
+    session_shutdown.cancel();
+    if tokio::time::timeout(Duration::from_secs(2), ctrl)
+        .await
+        .is_err()
+    {
+        abort.abort();
     }
 }
 
@@ -553,15 +635,27 @@ async fn register_one_proxy(
     tx: &mpsc::Sender<Message>,
     state: &Arc<ClientState>,
     p: &ClientProxy,
+    shutdown: &CancellationToken,
 ) -> RegisterOutcome {
     let (otx, orx) = oneshot::channel();
     state.resps.lock().insert(p.name.clone(), otx);
-    if !send_with_timeout(tx, Message::NewProxy(new_proxy_from_config(p))).await {
-        // 控制连接已断：清理未消费的响应通道，避免条目随连接生命周期累积。
+    let sent = tokio::select! {
+        _ = shutdown.cancelled() => false,
+        ok = send_with_timeout(tx, Message::NewProxy(new_proxy_from_config(p))) => ok,
+    };
+    if !sent {
+        // 控制连接已断或正在退出：清理未消费的响应通道。
         state.resps.lock().remove(&p.name);
         return RegisterOutcome::ConnLost;
     }
-    match tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx).await {
+    let response = tokio::select! {
+        _ = shutdown.cancelled() => {
+            state.resps.lock().remove(&p.name);
+            return RegisterOutcome::ConnLost;
+        }
+        result = tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx) => result,
+    };
+    match response {
         Ok(Ok(resp)) if resp.ok => {
             tracing::info!(proxy = %p.name, "proxy registered");
             spawn_preheat(state, p);
@@ -709,7 +803,7 @@ async fn retry_loop(
         delay = (delay * 2).min(max_delay);
         let mut still = Vec::new();
         for p in pending {
-            match register_one_proxy(tx, state, &p).await {
+            match register_one_proxy(tx, state, &p, shutdown).await {
                 RegisterOutcome::Ok => {
                     state.metrics.inc_proxy_register_retry_success();
                     tracing::info!(proxy = %p.name, round, "proxy registered after retry");

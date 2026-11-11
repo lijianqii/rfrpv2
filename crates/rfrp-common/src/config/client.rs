@@ -56,27 +56,40 @@ pub struct ClientSection {
 }
 
 impl ClientSection {
-    /// 解析服务端地址为 `SocketAddr`：IP 字面量直接使用，域名走 DNS 解析。
+    /// 解析服务端地址为全部候选 `SocketAddr`：IP 字面量直接使用，域名走 DNS。
     ///
     /// 每次建连都会调用，因此重连时会重新解析，能拿到 DNS 变更后的地址。
-    pub async fn resolve_server_addr(&self) -> Result<std::net::SocketAddr> {
-        if let Ok(ip) = self.server_addr.parse::<std::net::IpAddr>() {
-            return Ok(std::net::SocketAddr::new(ip, self.server_port));
+    /// 双栈域名可能返回多个地址，调用方应在总超时内逐个尝试。
+    pub async fn resolve_server_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        let host = self.server_addr.trim();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(vec![std::net::SocketAddr::new(ip, self.server_port)]);
         }
-        let mut addrs = tokio::net::lookup_host((self.server_addr.as_str(), self.server_port))
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, self.server_port))
             .await
             .map_err(|e| {
                 config(format!(
                     "cannot resolve server_addr '{}': {e}",
                     self.server_addr
                 ))
-            })?;
-        addrs.next().ok_or_else(|| {
-            config(format!(
+            })?
+            .collect();
+        if addrs.is_empty() {
+            return Err(config(format!(
                 "server_addr '{}' resolved to no address",
                 self.server_addr
-            ))
-        })
+            )));
+        }
+        Ok(addrs)
+    }
+
+    /// 兼容单地址调用：返回解析结果中的第一个地址。
+    pub async fn resolve_server_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(self.resolve_server_addrs().await?.remove(0))
     }
 
     /// 生效的心跳发送间隔（配置缺省时用默认值）。
