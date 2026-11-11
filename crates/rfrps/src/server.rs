@@ -348,16 +348,37 @@ async fn bind_vhost_https(config: &ServerConfig) -> Result<Option<(TcpListener, 
     let Some(port) = config.proxy.vhost_https_port else {
         return Ok(None);
     };
-    let missing =
-        || Error::Config("vhost_https_port requires vhost_tls_cert and vhost_tls_key".into());
-    let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(missing)?;
-    let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(missing)?;
+    let tls = load_vhost_tls(config)?.expect("vhost_https_port checked above");
     let addr = format!("{}:{port}", config.server.bind_addr);
     let listener = TcpListener::bind((config.server.bind_addr.as_str(), port))
         .await
         .map_err(|e| bind_error("https vhost listener", &addr, e))?;
-    let tls = ServerTls::new(std::path::Path::new(cert), std::path::Path::new(key))?;
     Ok(Some((listener, tls)))
+}
+
+/// 加载 HTTPS vhost 证书与私钥；未启用 HTTPS vhost 时返回 `None`。
+fn load_vhost_tls(config: &ServerConfig) -> Result<Option<ServerTls>> {
+    if config.proxy.vhost_https_port.is_none() {
+        return Ok(None);
+    }
+    let missing =
+        || Error::Config("vhost_https_port requires vhost_tls_cert and vhost_tls_key".into());
+    let cert = config.proxy.vhost_tls_cert.as_deref().ok_or_else(missing)?;
+    let key = config.proxy.vhost_tls_key.as_deref().ok_or_else(missing)?;
+    Ok(Some(ServerTls::new(
+        std::path::Path::new(cert),
+        std::path::Path::new(key),
+    )?))
+}
+
+/// 仅校验 TLS 证书/私钥可解析，不绑定任何端口。
+///
+/// `Server::new` 会先绑定端口再加载 TLS；`--check` 与 exit 预检不能绑端口，
+/// 因此用该函数提前发现证书损坏/不匹配，避免进程退出后才发现配置不可用。
+pub fn validate_tls_config(config: &ServerConfig) -> Result<()> {
+    load_control_tls(config)?;
+    load_vhost_tls(config)?;
+    Ok(())
 }
 
 /// 控制链路 / 工作连接共用的 TLS acceptor（可选）。

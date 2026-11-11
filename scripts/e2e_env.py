@@ -797,6 +797,71 @@ class E2E(unittest.TestCase):
             "valid config change should exit with code 75 for supervisor restart",
         )
 
+    def test_watch_config_exit_mode_changed_port_with_vhost(self) -> None:
+        # 只改控制端口时，旧进程仍占用未变化的 vhost 端口；预检不能把它当成冲突。
+        echo = self.http_echo()
+        stack = self.make_stack(
+            vhost_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=exit"],
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+        new_port = free_tcp_port()
+        updated = original.replace(
+            f"bind_port = {stack.control_port}", f"bind_port = {new_port}"
+        )
+        self.assertNotEqual(updated, original)
+        stack.server_config.write_text(updated, encoding="utf-8")
+        code = stack.server_proc.wait(timeout=15)
+        self.assertEqual(
+            code,
+            75,
+            "changing only bind_port must not be blocked by unchanged vhost port",
+        )
+
+    def test_watch_config_exit_mode_rejects_occupied_new_port(self) -> None:
+        # 新增监听端口被占用时保留旧进程；释放后再次保存配置应正常退出。
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=exit"],
+        )
+        original = stack.server_config.read_text(encoding="utf-8")
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        blocked = blocker.getsockname()[1]
+        updated = original.replace(
+            "[proxy]\n", f"[proxy]\nvhost_http_port = {blocked}\n"
+        )
+        stack.server_config.write_text(updated, encoding="utf-8")
+        time.sleep(2)
+        self.assertIsNone(
+            stack.server_proc.poll(),
+            "occupied new listener port must keep the old process alive",
+        )
+        self.assertTrue(
+            tcp_roundtrip(stack.remote_tcp, b"exit-preflight-blocked"),
+            "proxy broke while rejecting an occupied new port",
+        )
+
+        blocker.close()
+        stack.server_config.write_text(
+            updated.replace(
+                'password = "secret123"', 'password = "exit-preflight-pass"'
+            ),
+            encoding="utf-8",
+        )
+        code = stack.server_proc.wait(timeout=15)
+        self.assertEqual(
+            code,
+            75,
+            "released listener port should allow the config change to exit",
+        )
+
     @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
     def test_watch_config_restart_mode(self) -> None:
         echo = self.tcp_echo()
@@ -878,6 +943,11 @@ class E2E(unittest.TestCase):
         self.assertTrue(
             wait_until(lambda: not pid_alive(new_child), 10.0),
             "supervisor left an orphan child process",
+        )
+        self.assertEqual(
+            list(self.temp.glob(".*.stage.*.toml")),
+            [],
+            "supervisor did not clean its active stage config",
         )
 
     def test_watch_config_exit_mode_client(self) -> None:

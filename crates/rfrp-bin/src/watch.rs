@@ -29,9 +29,21 @@ pub fn watch_config_file(
 
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
-            let Ok(event) = result else {
-                return;
+            let event = match result {
+                Ok(event) => event,
+                Err(e) => {
+                    // supervisor 父进程没有 tracing subscriber，这里直接写 stderr，
+                    // exit 模式也能看到；同时触发一次重新校验，避免静默丢事件。
+                    eprintln!("rfrp config watcher error: {e}; scheduling reload");
+                    let _ = events.send(());
+                    return;
+                }
             };
+            // inotify/Windows 缓冲溢出会标记 rescan：必须按“可能有任意变更”处理。
+            if event.need_rescan() {
+                eprintln!("rfrp config watcher requested rescan; scheduling reload");
+                let _ = events.send(());
+            }
             if matches!(event.kind, EventKind::Access(_)) {
                 return;
             }

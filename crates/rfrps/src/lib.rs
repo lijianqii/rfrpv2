@@ -19,4 +19,4 @@ pub mod udp;
 pub mod vhost;
 pub mod work;
 
-pub use server::Server;
+pub use server::{validate_tls_config, Server};

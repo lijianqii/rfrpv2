@@ -81,18 +81,29 @@ pub struct Client {
     shutdown: CancellationToken,
 }
 
+/// 按配置构建客户端 TLS；不启用 TLS 时返回 `None`。
+///
+/// 只要配置了 `tls_server_name` 就构建，以便服务端在 LoginResp 中要求工作连接
+/// 升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
+fn build_tls(config: &ClientConfig) -> RfrpResult<Option<ClientTls>> {
+    if config.client.tls_enable
+        || config.client.work_conn_tls
+        || config.client.tls_server_name.is_some()
+    {
+        Ok(Some(ClientTls::new(&config.client)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 仅校验 TLS 材料（CA/服务端名称）可解析，不建立连接。
+pub fn validate_tls_config(config: &ClientConfig) -> RfrpResult<()> {
+    build_tls(config).map(|_| ())
+}
+
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
-        // 只要配置了 tls_server_name 就构建 TLS 客户端，以便服务端在 LoginResp 中要求
-        // 工作连接升级到 TLS 时（DESIGN §6.5 决策表）可以立即使用。
-        let tls = if config.client.tls_enable
-            || config.client.work_conn_tls
-            || config.client.tls_server_name.is_some()
-        {
-            Some(ClientTls::new(&config.client)?)
-        } else {
-            None
-        };
+        let tls = build_tls(&config)?;
         Ok(Self {
             heartbeat_interval: config.client.heartbeat_interval(),
             heartbeat_timeout: config.client.heartbeat_timeout(),

@@ -14,4 +14,4 @@ pub mod metrics;
 pub mod status;
 pub mod workconn;
 
-pub use client::Client;
+pub use client::{validate_tls_config, Client};

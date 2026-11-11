@@ -3,7 +3,7 @@
 //! 统一流程：加载配置 → 应用 CLI 覆盖 → 校验 →（`--check` 打印摘要并退出）→
 //! 初始化日志 → 进入长驻循环。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,10 @@ fn load_server_cfg(
     .map_err(|e| e.to_string())?;
     cfg.validate()
         .map_err(|e| format!("server config invalid after CLI overrides: {e}"))?;
+    // 提前解析证书/私钥：`Server::new` 会先绑端口再加载 TLS，若只在启动时发现
+    // 证书损坏，exit 模式已经退出、restart 模式也会多一次无谓的重启/回滚。
+    rfrps::validate_tls_config(&cfg)
+        .map_err(|e| format!("server TLS config invalid after CLI overrides: {e}"))?;
     Ok(cfg)
 }
 
@@ -87,7 +91,14 @@ fn load_client_cfg(
     .map_err(|e| e.to_string())?;
     cfg.validate()
         .map_err(|e| format!("client config invalid after CLI overrides: {e}"))?;
+    rfrpc::validate_tls_config(&cfg)
+        .map_err(|e| format!("client TLS config invalid after CLI overrides: {e}"))?;
     Ok(cfg)
+}
+
+struct ExitWatch {
+    _watcher: ConfigWatcher,
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 }
 
 struct ExitWatcher {
@@ -104,15 +115,103 @@ impl ExitWatcher {
     }
 }
 
+/// 在主配置加载前打开监听，启动期间的变更也会留在队列里。
+fn open_exit_watch(path: &Path) -> std::result::Result<ExitWatch, String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher = watch_config_file(path, tx).map_err(|e| format!("cannot watch config: {e}"))?;
+    Ok(ExitWatch {
+        _watcher: watcher,
+        rx,
+    })
+}
+
+/// 从 `host:port` / `[v6]:port` 形式的监听地址提取端口。
+fn endpoint_port(addr: &str) -> Option<u16> {
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
+struct ListenerTarget {
+    label: &'static str,
+    display: String,
+    host: String,
+    /// `None` 表示 `host` 本身已是完整 socket 地址（dashboard）。
+    port: Option<u16>,
+    port_key: u16,
+}
+
+/// 对 exit 模式的新配置做监听端口预检：只检查旧进程当前没有占用的新端口。
+///
+/// 旧进程持有的端口会在退出时释放，不能用来 bind，否则“只改控制端口”也会对
+/// 未变化的 vhost 端口误报冲突；旧配置未出现的新端口才需要提前验证。
+async fn preflight_server_listeners(
+    old: &rfrp_common::config::ServerConfig,
+    new: &rfrp_common::config::ServerConfig,
+) -> std::result::Result<(), String> {
+    use std::collections::BTreeSet;
+
+    use tokio::net::TcpListener;
+
+    let mut old_ports = BTreeSet::new();
+    old_ports.insert(old.server.bind_port);
+    old_ports.extend(old.proxy.vhost_http_port);
+    old_ports.extend(old.proxy.vhost_https_port);
+    if let Some(d) = &old.dashboard {
+        old_ports.extend(endpoint_port(&d.addr));
+    }
+
+    let mut targets = vec![ListenerTarget {
+        label: "control listener",
+        display: format!("{}:{}", new.server.bind_addr, new.server.bind_port),
+        host: new.server.bind_addr.clone(),
+        port: Some(new.server.bind_port),
+        port_key: new.server.bind_port,
+    }];
+    for (label, port) in [
+        ("http vhost listener", new.proxy.vhost_http_port),
+        ("https vhost listener", new.proxy.vhost_https_port),
+    ] {
+        if let Some(port) = port {
+            targets.push(ListenerTarget {
+                label,
+                display: format!("{}:{port}", new.server.bind_addr),
+                host: new.server.bind_addr.clone(),
+                port: Some(port),
+                port_key: port,
+            });
+        }
+    }
+    if let Some(d) = &new.dashboard {
+        targets.push(ListenerTarget {
+            label: "dashboard listener",
+            display: d.addr.clone(),
+            host: d.addr.clone(),
+            port: None,
+            port_key: endpoint_port(&d.addr).unwrap_or(0),
+        });
+    }
+
+    for target in targets {
+        if target.port_key != 0 && old_ports.contains(&target.port_key) {
+            continue;
+        }
+        let result = match target.port {
+            Some(port) => TcpListener::bind((target.host.as_str(), port)).await,
+            None => TcpListener::bind(target.host.as_str()).await,
+        };
+        result.map_err(|e| format!("preflight bind {} {}: {e}", target.label, target.display))?;
+    }
+    Ok(())
+}
+
 /// `--watch-config=exit`：配置变化且校验通过后触发优雅退出。
-fn start_server_exit_watcher(
+fn spawn_server_exit_watcher(
     args: ServerArgs,
+    baseline: rfrp_common::config::ServerConfig,
+    watch: ExitWatch,
     shutdown: CancellationToken,
     requested: Arc<AtomicBool>,
-) -> std::result::Result<ExitWatcher, String> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let watcher =
-        watch_config_file(&args.config, tx).map_err(|e| format!("cannot watch config: {e}"))?;
+) -> ExitWatcher {
+    let ExitWatch { _watcher, mut rx } = watch;
     let task = tokio::spawn(async move {
         loop {
             let event = tokio::select! {
@@ -125,32 +224,37 @@ fn start_server_exit_watcher(
             tokio::time::sleep(Duration::from_millis(300)).await;
             while rx.try_recv().is_ok() {}
             match load_server_cfg(&args) {
-                Ok(_) => {
-                    tracing::info!("valid config change; exiting for restart");
-                    requested.store(true, Ordering::Relaxed);
-                    shutdown.cancel();
-                    break;
-                }
+                Ok(new_cfg) => match preflight_server_listeners(&baseline, &new_cfg).await {
+                    Ok(()) => {
+                        tracing::info!("valid config change; exiting for restart");
+                        requested.store(true, Ordering::Relaxed);
+                        shutdown.cancel();
+                        break;
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "new config listener preflight failed; keeping current process"
+                    ),
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "config change invalid; keeping current process")
                 }
             }
         }
     });
-    Ok(ExitWatcher {
-        _watcher: watcher,
+    ExitWatcher {
+        _watcher,
         task: Some(task),
-    })
+    }
 }
 
-fn start_client_exit_watcher(
+fn spawn_client_exit_watcher(
     args: ClientArgs,
+    watch: ExitWatch,
     shutdown: CancellationToken,
     requested: Arc<AtomicBool>,
-) -> std::result::Result<ExitWatcher, String> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let watcher =
-        watch_config_file(&args.config, tx).map_err(|e| format!("cannot watch config: {e}"))?;
+) -> ExitWatcher {
+    let ExitWatch { _watcher, mut rx } = watch;
     let task = tokio::spawn(async move {
         loop {
             let event = tokio::select! {
@@ -175,10 +279,10 @@ fn start_client_exit_watcher(
             }
         }
     });
-    Ok(ExitWatcher {
-        _watcher: watcher,
+    ExitWatcher {
+        _watcher,
         task: Some(task),
-    })
+    }
 }
 
 /// supervisor 子进程从 stdin 接收 shutdown；EOF（父进程退出）也触发清理。
@@ -187,25 +291,12 @@ fn spawn_supervised_stdin(shutdown: CancellationToken) {
         return;
     }
     tokio::spawn(async move {
-        tracing::info!("supervisor stdin pipe reader started");
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) if line.trim() == "shutdown" => {
-                    tracing::info!("supervisor stdin shutdown command received");
-                    break;
-                }
-                Ok(Some(other)) => {
-                    tracing::warn!(line = %other, "ignoring unknown supervisor stdin command");
-                }
-                Ok(None) => {
-                    tracing::warn!("supervisor stdin EOF; shutting down child");
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "supervisor stdin read error; shutting down child");
-                    break;
-                }
+                Ok(Some(line)) if line.trim() == "shutdown" => break,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
             }
         }
         shutdown.cancel();
@@ -214,6 +305,17 @@ fn spawn_supervised_stdin(shutdown: CancellationToken) {
 
 /// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
 pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
+    let exit_watch = if args.watch_exit && !args.check {
+        match open_exit_watch(&args.config) {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let cfg = match load_server_cfg(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -231,6 +333,7 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         cfg.server.tcp_keepalive_secs,
     ));
 
+    let cfg_snapshot = cfg.clone();
     let server = match rfrps::Server::new(cfg).await {
         Ok(s) => s,
         Err(e) => {
@@ -253,21 +356,15 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         None => server,
     };
     let restart_requested = Arc::new(AtomicBool::new(false));
-    let exit_watcher = if args.watch_exit {
-        match start_server_exit_watcher(
+    let exit_watcher = exit_watch.map(|watch| {
+        spawn_server_exit_watcher(
             args.clone(),
+            cfg_snapshot,
+            watch,
             server.shutdown_token(),
             restart_requested.clone(),
-        ) {
-            Ok(watcher) => Some(watcher),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to start config watcher");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
+        )
+    });
     spawn_supervised_stdin(server.shutdown_token());
 
     tracing::info!(addr = %server.local_addr(), "rfrps listening");
@@ -287,6 +384,17 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
 
 /// 客户端：加载配置 → CLI 覆盖 → 校验 → 日志 → 长驻运行（重连直到退出）。
 pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
+    let exit_watch = if args.watch_exit && !args.check {
+        match open_exit_watch(&args.config) {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let cfg = match load_client_cfg(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -312,21 +420,14 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
         }
     };
     let restart_requested = Arc::new(AtomicBool::new(false));
-    let exit_watcher = if args.watch_exit {
-        match start_client_exit_watcher(
+    let exit_watcher = exit_watch.map(|watch| {
+        spawn_client_exit_watcher(
             args.clone(),
+            watch,
             client.shutdown_token(),
             restart_requested.clone(),
-        ) {
-            Ok(watcher) => Some(watcher),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to start config watcher");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
+        )
+    });
     spawn_supervised_stdin(client.shutdown_token());
 
     let result = client.run().await;
@@ -407,4 +508,63 @@ async fn fetch_status_inner(addr: &str) -> std::io::Result<String> {
         ));
     }
     Ok(body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfrp_common::config::{ProxySection, ServerConfig, ServerSection};
+    use std::net::TcpListener as StdTcpListener;
+
+    fn free_port() -> u16 {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_ignores_ports_still_held_by_old_process() {
+        // 旧进程仍占着未变化的 vhost 端口；只改控制端口时不能因此误报冲突。
+        let vhost = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let vhost_port = vhost.local_addr().unwrap().port();
+        let old = ServerConfig {
+            server: ServerSection {
+                bind_addr: "127.0.0.1".into(),
+                bind_port: free_port(),
+                ..Default::default()
+            },
+            proxy: ProxySection {
+                vhost_http_port: Some(vhost_port),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.server.bind_port = free_port();
+        preflight_server_listeners(&old, &new)
+            .await
+            .expect("unchanged listener ports must not be preflighted");
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_rejects_newly_added_occupied_port() {
+        let blocker = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked = blocker.local_addr().unwrap().port();
+        let old = ServerConfig {
+            server: ServerSection {
+                bind_addr: "127.0.0.1".into(),
+                bind_port: free_port(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.proxy.vhost_http_port = Some(blocked);
+        let err = preflight_server_listeners(&old, &new)
+            .await
+            .expect_err("new occupied listener port must fail preflight");
+        assert!(
+            err.contains("http vhost listener"),
+            "unexpected error: {err}"
+        );
+    }
 }

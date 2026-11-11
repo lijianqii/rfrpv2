@@ -1,13 +1,20 @@
 //! `--watch-config=restart`：父进程监督子进程，配置变化时优雅重启。
 //!
 //! 父进程不监听业务端口，也不解析配置；它用同一套 CLI/`--check` 校验新配置，
-//! 然后通过 stdin 管道让子进程优雅退出，再重新启动子进程。这样每次重启都走完整
-//! 启动路径，不存在进程内配置迁移。
+//! 然后通过 stdin 管道让子进程优雅退出，再重新启动子进程。每次子进程启动都使用
+//! 一个私有 stage 配置文件（0600），旧 stage 保留到新子进程确认启动成功后才删除；
+//! 新子进程启动失败时直接回到旧 stage。这样避免了“校验的是 A、子进程读到 B”的
+//! 配置快照竞态，也不会用新配置覆盖用户原文件。
 //!
-//! 新配置的子进程在启动窗口内退出时，父进程会用最后一份正常配置启动回退子进程，
-//! 并保留原配置文件不覆盖；服务先恢复到旧配置，等待下一次配置事件。
+//! 父进程被强杀时，子进程 stdin 会 EOF 并优雅退出；stage 文件可能残留，但权限为
+//! 0600，正常退出时会删除当前 active stage。
 
 use std::ffi::{OsStr, OsString};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -37,18 +44,9 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let child_args: Vec<OsString> = args.into_iter().skip(1).collect();
+    let base_args: Vec<OsString> = args.into_iter().skip(1).collect();
 
-    // 初始配置不合法时不要进入“启动失败→退避→再启动”的死循环。
-    if !validate(&exe, &child_args).await {
-        eprintln!("rfrp supervisor: initial config validation failed; not starting");
-        return ExitCode::FAILURE;
-    }
-
-    let rollback_path = rollback_path(&config);
-    let _ = std::fs::remove_file(&rollback_path);
-    let mut last_good = std::fs::read(&config).ok();
-
+    // 监听必须在读取/校验初始配置之前建立，避免启动窗口内的变更被漏掉。
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let _watcher = match watch_config_file(&config, event_tx) {
         Ok(watcher) => watcher,
@@ -58,15 +56,37 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         }
     };
 
+    let mut generation = 0u64;
+    let mut active_stage = match stage_config(&config, generation) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("rfrp supervisor: cannot create initial stage config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut active_args = match with_config_arg(&base_args, &active_stage) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("rfrp supervisor: cannot build child args: {e}");
+            let _ = fs::remove_file(&active_stage);
+            return ExitCode::FAILURE;
+        }
+    };
+    if !validate(&exe, &active_args).await {
+        eprintln!("rfrp supervisor: initial config validation failed; not starting");
+        let _ = fs::remove_file(&active_stage);
+        return ExitCode::FAILURE;
+    }
+
     let shutdown = CancellationToken::new();
     let sig = spawn_signal_watcher(shutdown.clone());
 
-    let mut active_args = child_args.clone();
     let mut child = match spawn_child(&exe, &active_args).await {
         Ok(child) => child,
         Err(e) => {
             eprintln!("rfrp supervisor: cannot start child: {e}");
             sig.abort();
+            let _ = fs::remove_file(&active_stage);
             return ExitCode::FAILURE;
         }
     };
@@ -137,22 +157,43 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         sleep(DEBOUNCE).await;
         while event_rx.try_recv().is_ok() {}
 
-        if !validate(&exe, &child_args).await {
+        // 先把新配置复制到私有 stage，再校验 stage；子进程只读取这个快照，
+        // 用户随后再次保存也不会让“校验的内容”和“实际启动的内容”不一致。
+        generation += 1;
+        let new_stage = match stage_config(&config, generation) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "rfrp supervisor: cannot create stage config: {e}; keeping current child"
+                );
+                continue;
+            }
+        };
+        let new_args = match with_config_arg(&base_args, &new_stage) {
+            Ok(args) => args,
+            Err(e) => {
+                eprintln!("rfrp supervisor: cannot build child args: {e}; keeping current child");
+                let _ = fs::remove_file(&new_stage);
+                continue;
+            }
+        };
+        if !validate(&exe, &new_args).await {
             eprintln!("rfrp supervisor: config invalid; keeping current child");
+            let _ = fs::remove_file(&new_stage);
             continue;
         }
         eprintln!("rfrp supervisor: config valid; restarting child");
-        // 在停止旧子进程前快照本次要启动的配置；启动窗口内用户可能再次保存，
-        // 不能让“最后正常配置”被后写入的未验证内容污染。
-        let new_config_bytes = std::fs::read(&config).ok();
+
+        let old_stage = active_stage.clone();
+        let old_args = active_args.clone();
         stop_child(&mut child).await;
 
-        match spawn_and_check(&exe, &child_args).await {
+        match spawn_and_check(&exe, &new_args).await {
             Ok(new_child) => {
                 child = new_child;
-                active_args = child_args.clone();
-                last_good = new_config_bytes.or(last_good);
-                let _ = std::fs::remove_file(&rollback_path);
+                active_args = new_args;
+                active_stage = new_stage;
+                let _ = fs::remove_file(&old_stage);
                 eprintln!(
                     "rfrp supervisor: started child pid={}",
                     child.id().unwrap_or(0)
@@ -161,43 +202,24 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("rfrp supervisor: new config child failed to start: {e}; rolling back");
-                let Some(bytes) = last_good.as_ref() else {
-                    eprintln!("rfrp supervisor: no last-good config available");
-                    stop_child(&mut child).await;
-                    sig.abort();
-                    let _ = std::fs::remove_file(&rollback_path);
-                    return ExitCode::FAILURE;
-                };
-                if let Err(write_err) = std::fs::write(&rollback_path, bytes) {
-                    eprintln!("rfrp supervisor: cannot write rollback config: {write_err}");
-                    sig.abort();
-                    let _ = std::fs::remove_file(&rollback_path);
-                    return ExitCode::FAILURE;
-                }
-                let rollback_args = match with_config_arg(&child_args, &rollback_path) {
-                    Ok(args) => args,
-                    Err(e) => {
-                        eprintln!("rfrp supervisor: cannot build rollback args: {e}");
-                        sig.abort();
-                        let _ = std::fs::remove_file(&rollback_path);
-                        return ExitCode::FAILURE;
-                    }
-                };
-                match spawn_and_check(&exe, &rollback_args).await {
-                    Ok(rollback_child) => {
+                let _ = fs::remove_file(&new_stage);
+                // 旧 stage 一直保留到新子进程成功后才删除，因此回滚是确定可用的。
+                match spawn_rollback_with_retry(&exe, &old_args, &shutdown).await {
+                    Some(rollback_child) => {
                         child = rollback_child;
-                        active_args = rollback_args;
+                        active_args = old_args;
+                        active_stage = old_stage;
                         eprintln!(
                             "rfrp supervisor: rollback child pid={} (config file unchanged)",
                             child.id().unwrap_or(0)
                         );
                         backoff = BACKOFF_INITIAL;
                     }
-                    Err(e) => {
-                        eprintln!("rfrp supervisor: rollback child failed to start: {e}");
+                    None => {
+                        // 回滚重试期间收到退出信号。
                         sig.abort();
-                        let _ = std::fs::remove_file(&rollback_path);
-                        return ExitCode::FAILURE;
+                        let _ = fs::remove_file(&old_stage);
+                        return ExitCode::SUCCESS;
                     }
                 }
             }
@@ -205,9 +227,47 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     }
 
     stop_child(&mut child).await;
-    let _ = std::fs::remove_file(&rollback_path);
+    let _ = fs::remove_file(&active_stage);
     sig.abort();
     ExitCode::SUCCESS
+}
+
+/// 将配置复制到同目录的私有 stage 文件；同目录保证相对证书路径仍能解析。
+fn stage_config(config: &Path, generation: u64) -> std::result::Result<PathBuf, String> {
+    let bytes = fs::read(config).map_err(|e| format!("read {}: {e}", config.display()))?;
+    let path = stage_path(config, generation);
+    write_private(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn stage_path(config: &Path, generation: u64) -> PathBuf {
+    let name = config
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("config.toml");
+    config.with_file_name(format!(
+        ".{name}.stage.{}.{generation}.toml",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Windows 下文件继承配置目录的 ACL；不额外引入平台 unsafe API。
+    fs::write(path, bytes)
 }
 
 /// 使用同一 argv 运行 `--check`，确保 CLI 覆盖和校验逻辑与子进程启动完全一致。
@@ -254,6 +314,27 @@ async fn spawn_and_check(
     }
 }
 
+/// 新配置启动失败后，持续用旧 stage 尝试恢复；避免父进程直接退出导致长期离线。
+async fn spawn_rollback_with_retry(
+    exe: &Path,
+    args: &[OsString],
+    shutdown: &CancellationToken,
+) -> Option<Child> {
+    let mut delay = BACKOFF_INITIAL;
+    loop {
+        match spawn_and_check(exe, args).await {
+            Ok(child) => return Some(child),
+            Err(e) => {
+                eprintln!("rfrp supervisor: rollback child failed to start: {e}; retrying");
+                if !wait_or_shutdown(delay, shutdown).await {
+                    return None;
+                }
+                delay = (delay * 2).min(BACKOFF_MAX);
+            }
+        }
+    }
+}
+
 async fn spawn_child(exe: &Path, child_args: &[OsString]) -> std::io::Result<Child> {
     Command::new(exe)
         .args(child_args)
@@ -287,14 +368,6 @@ async fn stop_child(child: &mut Child) {
     }
 }
 
-fn rollback_path(config: &Path) -> PathBuf {
-    let name = config
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("config.toml");
-    config.with_file_name(format!(".{name}.rollback.{}.toml", std::process::id()))
-}
-
 fn with_config_arg(args: &[OsString], config: &Path) -> std::result::Result<Vec<OsString>, String> {
     let mut out = Vec::with_capacity(args.len());
     let mut replaced = false;
@@ -318,6 +391,15 @@ fn with_config_arg(args: &[OsString], config: &Path) -> std::result::Result<Vec<
         }
         if text.starts_with("-c=") {
             let mut value = OsString::from("-c=");
+            value.push(config);
+            out.push(value);
+            i += 1;
+            replaced = true;
+            continue;
+        }
+        // Clap 也接受短选项粘连写法 `-cPATH`。
+        if text.starts_with("-c") && text.len() > 2 && !text.starts_with("-c=") {
+            let mut value = OsString::from("-c");
             value.push(config);
             out.push(value);
             i += 1;
@@ -361,14 +443,40 @@ mod tests {
         let replaced = with_config_arg(&args, path).unwrap();
         assert_eq!(replaced[1], "-c=/tmp/new-config.toml");
 
+        let args = vec![OsString::from("server"), OsString::from("-cold.toml")];
+        let replaced = with_config_arg(&args, path).unwrap();
+        assert_eq!(replaced[1], "-c/tmp/new-config.toml");
+
         assert!(with_config_arg(&[OsString::from("server")], path).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn rollback_path_stays_in_config_directory() {
+    fn stage_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "rfrp-stage-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("server.toml");
+        std::fs::write(&config, "token = \"secret\"\n").unwrap();
+        let stage = stage_config(&config, 0).unwrap();
+        let mode = std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_path_stays_in_config_directory() {
         let config = Path::new("/etc/rfrp/server.toml");
-        let path = rollback_path(config);
+        let path = stage_path(config, 7);
         assert_eq!(path.parent(), config.parent());
-        assert!(path.to_string_lossy().contains("rollback"));
+        assert!(path.to_string_lossy().contains("stage"));
+        assert!(path.to_string_lossy().contains(".7."));
     }
 }
