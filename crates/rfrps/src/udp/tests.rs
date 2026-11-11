@@ -18,6 +18,7 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         metrics: Arc::new(Metrics::new()),
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
+        queue_bytes: Arc::new(AtomicUsize::new(0)),
         session_timeout,
         pending_timeout,
         owner_session_id: "test-session".into(),
@@ -191,7 +192,7 @@ async fn datagram_dropped_when_session_channel_full() {
     let peer: SocketAddr = "127.0.0.1:1004".parse().unwrap();
 
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
-    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None).unwrap())
         .expect("fill channel");
     proxy.sessions.lock().insert(
         peer,
@@ -229,7 +230,7 @@ async fn datagram_dropped_when_pending_channel_full() {
     let peer: SocketAddr = "127.0.0.1:1005".parse().unwrap();
 
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
-    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8]))
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None).unwrap())
         .expect("fill channel");
     proxy.pending_by_id.lock().insert(
         7,
@@ -257,6 +258,39 @@ async fn datagram_dropped_when_pending_channel_full() {
         1
     );
     assert!(ctl_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn queue_byte_budget_rejects_and_releases() {
+    let proxy = test_proxy(Duration::from_secs(1), Duration::from_secs(1)).await;
+    let near_limit = UDP_PROXY_QUEUE_MAX_BYTES - 8;
+    proxy.queue_bytes.store(near_limit, Ordering::Relaxed);
+
+    assert!(
+        alloc_udp_packet(&proxy.packet_pool, &[0u8; 16], Some(&proxy.queue_bytes)).is_none(),
+        "packet exceeding the proxy queue budget must be rejected"
+    );
+    assert_eq!(
+        proxy.queue_bytes.load(Ordering::Relaxed),
+        near_limit,
+        "rejected packet must not leak budget"
+    );
+
+    let packet = alloc_udp_packet(&proxy.packet_pool, &[0u8; 8], Some(&proxy.queue_bytes))
+        .expect("packet under the remaining budget");
+    assert_eq!(
+        proxy.queue_bytes.load(Ordering::Relaxed),
+        UDP_PROXY_QUEUE_MAX_BYTES,
+        "accepted packet must be charged"
+    );
+
+    let mut packets = vec![packet];
+    recycle_packets(&proxy.packet_pool, &mut packets);
+    assert_eq!(
+        proxy.queue_bytes.load(Ordering::Relaxed),
+        near_limit,
+        "recycling a consumed packet must release its budget"
+    );
 }
 
 #[tokio::test]

@@ -56,6 +56,7 @@ async fn cleanup_clears_proxy_domains() {
         metrics: Arc::new(crate::metrics::Metrics::new()),
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
+        queue_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         session_timeout: std::time::Duration::from_secs(60),
         pending_timeout: std::time::Duration::from_secs(10),
         owner_session_id: session.session_id.clone(),

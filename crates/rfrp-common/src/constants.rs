@@ -71,6 +71,16 @@ pub const FIRST_FRAME_TIMEOUT: u64 = 10;
 pub const TLS_HANDSHAKE_TIMEOUT: u64 = 10;
 /// HTTP 请求头读取总超时（Dashboard/状态端点/vhost）：防慢速请求（slowloris）。
 pub const HTTP_HEAD_TIMEOUT: u64 = 10;
+/// 单个 HTTP 响应写出总超时：客户端不读响应时不得永久占用任务。
+pub const HTTP_RESPONSE_TIMEOUT: u64 = 30;
+/// vhost HTTP/HTTPS 认证前（TLS/请求头阶段）的最大并发连接数。
+///
+/// 与主控制口的 `MAX_UNAUTHENTICATED_CONNECTIONS` 分开，避免 vhost 洪泛挤占控制登录。
+pub const VHOST_MAX_PREAUTH_CONNECTIONS: usize = 1024;
+/// Dashboard 单监听口最大并发请求数（含慢连接）。
+pub const DASHBOARD_MAX_CONCURRENT_CONNECTIONS: usize = 256;
+/// 客户端状态端点单监听口最大并发请求数。
+pub const STATUS_MAX_CONCURRENT_CONNECTIONS: usize = 128;
 
 /// 心跳发送间隔。
 pub const HEARTBEAT_INTERVAL: u64 = 30;
@@ -224,6 +234,17 @@ pub const UDP_RECV_BATCH: usize = 64;
 pub const UDP_WRITE_BATCH: usize = 32;
 /// 一次从工作连接批量解析的最大数据报个数（一次 read 解析多帧，避免每包一次唤醒）。
 pub const UDP_READ_BATCH: usize = 32;
+/// 单个 UDP 代理所有待发送队列允许占用的最大字节数。
+///
+/// 队列深度按“包数”限制无法约束最大包场景：`64 × 65 KiB × 256 pending`
+/// 可接近 1 GiB。这里再加一道按字节的上界，超限直接丢包并计入
+/// `udp_dropped_total`；16 MiB 足够覆盖正常 RDP 突发，又不会让单代理
+/// 在低内存机器上无界增长。
+pub const UDP_PROXY_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// UDP 读/写缓冲的初始容量。按实际数据增长，避免每个会话一上来就占 64 KiB。
+pub const UDP_BUF_INITIAL_BYTES: usize = 8 * 1024;
+/// 包池只回收不超过该容量的缓冲；超大包缓冲用完即丢，防止池被 65 KiB 缓冲撑大。
+pub const UDP_PACKET_POOL_MAX_BUF_BYTES: usize = 16 * 1024;
 /// UDP socket 接收缓冲目标值（best-effort，内核可能按 rmem_max 截断）。
 ///
 /// 突发时先由内核缓冲吸收，避免应用层队列还没腾出空间就丢包。

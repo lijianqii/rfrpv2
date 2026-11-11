@@ -180,8 +180,9 @@ impl UdpFrameBuf {
             if !out.is_empty() {
                 return Ok(out.len());
             }
-            // 一个完整帧都没有：继续读（阻塞等待首批数据）
-            self.buf.reserve(64 * 1024);
+            // 一个完整帧都没有：继续读（阻塞等待首批数据）。
+            // 从小块开始按需增长：空闲会话不再预先占用 64 KiB。
+            self.buf.reserve(crate::constants::UDP_BUF_INITIAL_BYTES);
             let n = r.read_buf(&mut self.buf).await?;
             if n == 0 {
                 return if self.buf.is_empty() {

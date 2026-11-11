@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rfrp_common::config::ClientConfig;
+use rfrp_common::constants::STATUS_MAX_CONCURRENT_CONNECTIONS;
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
 use rfrp_common::util::ratelimit::RateLimiter;
@@ -25,6 +26,10 @@ pub async fn run_status_server(
 ) {
     // 与 Dashboard 对称的每 IP 限频（端点默认关闭且建议绑回环，此处仅兜底防刷）。
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
+    // 并发上限：请求头/响应都带超时，但慢连接仍可能堆积任务。
+    let concurrent = Arc::new(tokio::sync::Semaphore::new(
+        STATUS_MAX_CONCURRENT_CONNECTIONS,
+    ));
     // accept 出错不得结束循环：状态端点自行退出后，客户端进程仍会继续跑隧道，
     // 监控侧只会看到"状态端点没了"却无从判断原因。
     let mut retry = AcceptRetry::new();
@@ -34,10 +39,16 @@ pub async fn run_status_server(
                 match accepted {
                     Ok((stream, peer)) => {
                         retry.record_ok();
+                        let Ok(permit) = concurrent.clone().try_acquire_owned() else {
+                            tracing::debug!(%peer, "status concurrency limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let cfg = cfg.clone();
                         let metrics = metrics.clone();
                         let limiter = limiter.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let _ = handle_request(stream, &cfg, &metrics, &limiter, peer).await;
                         });
                     }

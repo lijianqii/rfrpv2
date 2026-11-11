@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use rfrp_common::auth::verify_token;
 use rfrp_common::config::DashboardSection;
+use rfrp_common::constants::DASHBOARD_MAX_CONCURRENT_CONNECTIONS;
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
 use rfrp_common::util::ratelimit::RateLimiter;
@@ -80,6 +81,10 @@ pub async fn run_dashboard(
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
     let sessions = Arc::new(DashboardSessions::new(cfg.session_ttl()));
+    // 单监听口并发上限：请求头读取和响应写都有超时，但慢连接仍可能堆积任务。
+    let concurrent = Arc::new(tokio::sync::Semaphore::new(
+        DASHBOARD_MAX_CONCURRENT_CONNECTIONS,
+    ));
     // accept 出错不得结束循环：Dashboard 是进程级监听，自行退出后只能靠重启恢复。
     let mut retry = AcceptRetry::new();
     loop {
@@ -89,11 +94,17 @@ pub async fn run_dashboard(
                     Ok((stream, peer)) => {
                         retry.record_ok();
                         tracing::debug!(%peer, "dashboard connection");
+                        let Ok(permit) = concurrent.clone().try_acquire_owned() else {
+                            tracing::debug!(%peer, "dashboard concurrency limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let cfg = cfg.clone();
                         let state = state.clone();
                         let limiter = limiter.clone();
                         let sessions = sessions.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let _ = handle_request(
                                 stream,
                                 &cfg,

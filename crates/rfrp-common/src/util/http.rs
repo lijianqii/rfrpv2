@@ -122,7 +122,33 @@ where
 }
 
 /// 写一个简单响应并关闭连接（`Connection: close`）。
+///
+/// 整体带超时：客户端只连不读时，响应体（例如较大的 `/metrics`）不能永久
+/// 占住任务与缓冲区。
 pub async fn write_response<W>(
+    stream: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra_header: Option<&str>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(
+        Duration::from_secs(crate::constants::HTTP_RESPONSE_TIMEOUT),
+        write_response_inner(stream, status, content_type, body, extra_header),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP response write timed out",
+        )
+    })?
+}
+
+async fn write_response_inner<W>(
     stream: &mut W,
     status: u16,
     content_type: &str,

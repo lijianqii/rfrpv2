@@ -4,7 +4,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rfrp_common::constants::{HTTP_HEAD_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
+use rfrp_common::constants::{
+    HTTP_HEAD_TIMEOUT, TLS_HANDSHAKE_TIMEOUT, VHOST_MAX_PREAUTH_CONNECTIONS,
+};
 use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
@@ -27,6 +29,8 @@ pub async fn run_http_vhost(
     // accept 出错不得结束循环：vhost 监听是进程级的，自行退出会让所有 vhost 代理
     // 静默失效（详见 util::accept 模块说明）。
     let mut retry = AcceptRetry::new();
+    // 认证前并发上限：请求头/TLS 握手阶段每个连接最多占 10s，必须在 spawn 前限流。
+    let preauth = Arc::new(tokio::sync::Semaphore::new(VHOST_MAX_PREAUTH_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -36,8 +40,14 @@ pub async fn run_http_vhost(
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TCP stream");
                         }
+                        let Ok(permit) = preauth.clone().try_acquire_owned() else {
+                            tracing::debug!(%peer, "vhost http preauth limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let state = state.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let _ = handle_http_connection(stream, state).await;
                         });
                     }
@@ -78,6 +88,8 @@ pub async fn run_https_vhost(
     shutdown: CancellationToken,
 ) {
     let mut retry = AcceptRetry::new();
+    // 认证前并发上限：TLS 握手 + 请求头阶段可各占 10s，必须在 spawn 前限流。
+    let preauth = Arc::new(tokio::sync::Semaphore::new(VHOST_MAX_PREAUTH_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -87,9 +99,15 @@ pub async fn run_https_vhost(
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TLS TCP stream");
                         }
+                        let Ok(permit) = preauth.clone().try_acquire_owned() else {
+                            tracing::debug!(%peer, "vhost https preauth limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let tls = tls.clone();
                         let state = state.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let accepted = tokio::time::timeout(
                                 Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
                                 tls.accept(stream),

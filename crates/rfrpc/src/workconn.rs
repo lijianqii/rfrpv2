@@ -208,7 +208,8 @@ async fn udp_bridge(
     // 本地 UDP 收包缓冲：只在本任务内复用，不再每包分配。
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
     // 上行（本地 → 工作连接）写缓冲：一批数据报合成一次 write，TLS 下即一个 record。
-    let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    // 从小容量起步，按实际突发增长，避免每个会话固定占 64 KiB。
+    let mut write_buf = Vec::with_capacity(rfrp_common::constants::UDP_BUF_INITIAL_BYTES);
     // 下行：一次 read 解析多帧（突发时内核里通常已排好多个完整帧）。
     let mut reader = UdpFrameBuf::new();
     let mut down: Vec<Bytes> = Vec::with_capacity(UDP_READ_BATCH);

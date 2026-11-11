@@ -4,13 +4,16 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use rfrp_common::constants::{
-    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, MAX_UDP_SESSIONS_PER_PROXY, UDP_READ_BATCH,
-    UDP_RECV_BATCH, UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
+    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, MAX_UDP_SESSIONS_PER_PROXY,
+    UDP_BUF_INITIAL_BYTES, UDP_PACKET_POOL_MAX_BUF_BYTES, UDP_PROXY_QUEUE_MAX_BYTES,
+    UDP_READ_BATCH, UDP_RECV_BATCH, UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH,
+    WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
@@ -32,17 +35,36 @@ const UDP_PACKET_POOL_MAX: usize = 256;
 ///
 /// 成功批量写入后由 [`recycle_packets`] 归还；通道满/写失败等丢弃路径随
 /// `UdpPacket` 一起释放，不进入池（避免为了归还而给 Drop 加锁）。
+/// `budget` 记录该包在代理队列中的字节额度，任何丢弃路径都会在 Drop 中归还。
 pub struct UdpPacket {
     data: BytesMut,
+    budget: Option<Arc<AtomicUsize>>,
+    weight: usize,
 }
 
 impl UdpPacket {
-    fn new(data: BytesMut) -> Self {
-        Self { data }
+    fn new(data: BytesMut, budget: Option<Arc<AtomicUsize>>, weight: usize) -> Self {
+        Self {
+            data,
+            budget,
+            weight,
+        }
     }
 
-    fn into_buf(self) -> BytesMut {
-        self.data
+    fn into_buf(mut self) -> BytesMut {
+        // 数据已被消费：这里主动归还额度，随后 Drop 不再重复扣减。
+        if let Some(budget) = self.budget.take() {
+            budget.fetch_sub(self.weight, Ordering::Relaxed);
+        }
+        std::mem::take(&mut self.data)
+    }
+}
+
+impl Drop for UdpPacket {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.fetch_sub(self.weight, Ordering::Relaxed);
+        }
     }
 }
 
@@ -61,14 +83,28 @@ impl Deref for UdpPacket {
 }
 
 /// 从池中借出缓冲并拷贝一个数据报；池空时按常见 RDP 包大小起步。
-fn alloc_udp_packet(pool: &Arc<Mutex<Vec<BytesMut>>>, data: &[u8]) -> UdpPacket {
+///
+/// `budget` 是代理级队列字节计数器：入队前先占用额度，失败直接丢包；
+/// 包在写成功/丢弃时通过 `Drop` 归还。
+fn alloc_udp_packet(
+    pool: &Arc<Mutex<Vec<BytesMut>>>,
+    data: &[u8],
+    budget: Option<&Arc<AtomicUsize>>,
+) -> Option<UdpPacket> {
+    if let Some(budget) = budget {
+        let prev = budget.fetch_add(data.len(), Ordering::Relaxed);
+        if prev.saturating_add(data.len()) > UDP_PROXY_QUEUE_MAX_BYTES {
+            budget.fetch_sub(data.len(), Ordering::Relaxed);
+            return None;
+        }
+    }
     let mut buf = pool
         .lock()
         .pop()
         .unwrap_or_else(|| BytesMut::with_capacity(data.len().max(2048)));
     buf.clear();
     buf.extend_from_slice(data);
-    UdpPacket::new(buf)
+    Some(UdpPacket::new(buf, budget.map(Arc::clone), data.len()))
 }
 
 /// 批量归还一批已写入的包缓冲：整批只加一次锁，避免每包 Drop 抢锁。
@@ -78,10 +114,12 @@ fn recycle_packets(pool: &Arc<Mutex<Vec<BytesMut>>>, packets: &mut Vec<UdpPacket
     }
     let mut pool = pool.lock();
     for p in packets.drain(..) {
-        if pool.len() >= UDP_PACKET_POOL_MAX {
-            break;
+        // 先消费 packet 归还字节额度；池满或缓冲过大时直接丢弃该缓冲。
+        let buf = p.into_buf();
+        if pool.len() >= UDP_PACKET_POOL_MAX || buf.capacity() > UDP_PACKET_POOL_MAX_BUF_BYTES {
+            continue;
         }
-        pool.push(p.into_buf());
+        pool.push(buf);
     }
 }
 
@@ -178,6 +216,8 @@ pub struct UdpProxy {
     /// 每代理统计（Dashboard / Prometheus）；不能复用全局 `Metrics`。
     pub stats: Arc<crate::metrics::ProxyStats>,
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
+    /// 所有队列中尚未消费的 UDP 数据报总字节数（代理级内存上界）。
+    pub queue_bytes: Arc<AtomicUsize>,
     pub session_timeout: Duration,
     pub pending_timeout: Duration,
     /// 归属会话 ID：工作连接/清理时校验，防止同名/旧会话操作误伤。
@@ -224,6 +264,7 @@ pub async fn register_udp_proxy(
         metrics: state.metrics.clone(),
         stats,
         packet_pool: Arc::new(Mutex::new(Vec::new())),
+        queue_bytes: Arc::new(AtomicUsize::new(0)),
         session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
         owner_session_id: session.session_id.clone(),
@@ -335,10 +376,16 @@ async fn handle_datagram(
             );
             return;
         }
-        if tx
-            .try_send(alloc_udp_packet(&proxy.packet_pool, data))
-            .is_err()
-        {
+        let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes))
+        else {
+            proxy.metrics.inc_udp_dropped();
+            tracing::debug!(
+                proxy = %proxy_name, %peer,
+                "udp queue byte budget reached; dropping datagram"
+            );
+            return;
+        };
+        if tx.try_send(packet).is_err() {
             proxy.metrics.inc_udp_dropped();
             tracing::debug!(
                 proxy = %proxy_name, %peer,
@@ -364,10 +411,16 @@ async fn handle_datagram(
                 );
                 return;
             }
-            if tx
-                .try_send(alloc_udp_packet(&proxy.packet_pool, data))
-                .is_err()
-            {
+            let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes))
+            else {
+                proxy.metrics.inc_udp_dropped();
+                tracing::debug!(
+                    proxy = %proxy_name, %peer,
+                    "udp queue byte budget reached; dropping datagram"
+                );
+                return;
+            };
+            if tx.try_send(packet).is_err() {
                 proxy.metrics.inc_udp_dropped();
                 tracing::debug!(
                     proxy = %proxy_name, %peer,
@@ -398,7 +451,15 @@ async fn handle_datagram(
     let (tx, rx) = mpsc::channel::<UdpPacket>(UDP_SESSION_QUEUE_DEPTH);
     let work_id = state.next_work_id();
     record_up(proxy, data.len());
-    let _ = tx.send(alloc_udp_packet(&proxy.packet_pool, data)).await;
+    let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes)) else {
+        proxy.metrics.inc_udp_dropped();
+        tracing::debug!(
+            proxy = %proxy_name, %peer,
+            "udp queue byte budget reached; dropping datagram"
+        );
+        return;
+    };
+    let _ = tx.send(packet).await;
     proxy.pending_by_id.lock().insert(
         work_id,
         PendingUdp {
@@ -535,7 +596,8 @@ pub async fn handle_udp_work_conn(
     let mut rx = rx;
     let mut stream = stream;
     // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
-    let mut write_buf = Vec::with_capacity(MAX_UDP_PACKET_SIZE);
+    // 从小容量起步，按实际突发增长，避免每个会话固定占 64 KiB。
+    let mut write_buf = Vec::with_capacity(UDP_BUF_INITIAL_BYTES);
     let mut batch: Vec<UdpPacket> = Vec::with_capacity(UDP_WRITE_BATCH);
     // 下行：一次 read 解析多帧，避免每包一次任务唤醒。
     let mut reader = UdpFrameBuf::new();
