@@ -30,6 +30,8 @@ pub async fn run_status_server(
     let concurrent = Arc::new(tokio::sync::Semaphore::new(
         STATUS_MAX_CONCURRENT_CONNECTIONS,
     ));
+    // 每连接任务跟踪：退出时等待在途响应完成（最多 5s），避免句柄被直接丢弃。
+    let tasks = rfrp_common::util::tasks::TaskGroup::new();
     // accept 出错不得结束循环：状态端点自行退出后，客户端进程仍会继续跑隧道，
     // 监控侧只会看到"状态端点没了"却无从判断原因。
     let mut retry = AcceptRetry::new();
@@ -47,7 +49,8 @@ pub async fn run_status_server(
                         let cfg = cfg.clone();
                         let metrics = metrics.clone();
                         let limiter = limiter.clone();
-                        tokio::spawn(async move {
+                        let tracker = tasks.clone();
+                        tracker.spawn(async move {
                             let _permit = permit;
                             let _ = handle_request(stream, &cfg, &metrics, &limiter, peer).await;
                         });
@@ -71,6 +74,8 @@ pub async fn run_status_server(
             }
         }
     }
+    tasks.close();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await;
 }
 
 async fn handle_request(

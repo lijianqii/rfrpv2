@@ -46,7 +46,8 @@ pub async fn run_http_vhost(
                             continue;
                         };
                         let state = state.clone();
-                        tokio::spawn(async move {
+                        let tracker = state.data_tasks.clone();
+                        tracker.spawn(async move {
                             let _permit = permit;
                             let _ = handle_http_connection(stream, state).await;
                         });
@@ -106,7 +107,8 @@ pub async fn run_https_vhost(
                         };
                         let tls = tls.clone();
                         let state = state.clone();
-                        tokio::spawn(async move {
+                        let tracker = state.data_tasks.clone();
+                        tracker.spawn(async move {
                             let _permit = permit;
                             let accepted = tokio::time::timeout(
                                 Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),

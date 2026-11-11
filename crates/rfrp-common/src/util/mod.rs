@@ -9,6 +9,7 @@ pub mod platform;
 pub mod ratelimit;
 pub mod signal;
 pub mod stream;
+pub mod tasks;
 pub mod tcp;
 pub mod udp;
 

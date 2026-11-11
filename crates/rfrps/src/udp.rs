@@ -276,7 +276,8 @@ pub async fn register_udp_proxy(
     let session = session.clone();
     let state = state.clone();
     let shutdown = state.shutdown.clone();
-    let handle = tokio::spawn(async move {
+    let tracker = state.data_tasks.clone();
+    let handle = tracker.spawn(async move {
         run_udp_listener(proxy, proxy_name, session, state, shutdown).await;
     });
     Ok(handle)
@@ -477,7 +478,8 @@ async fn handle_datagram(
     let tx_ctl = session.tx.clone();
     let pname = proxy_name.to_string();
     let proxy_cleanup = proxy.clone();
-    tokio::spawn(async move {
+    let tracker = state.data_tasks.clone();
+    tracker.spawn(async move {
         if !send_with_timeout(
             &tx_ctl,
             Message::ReqWorkConn(ReqWorkConn {

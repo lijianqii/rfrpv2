@@ -152,7 +152,8 @@ pub async fn register_proxy(
             let proxy_name = np.proxy_name.clone();
             let session = session.clone();
             let state_loop = state.clone();
-            tokio::spawn(async move {
+            let tracker = state.data_tasks.clone();
+            tracker.spawn(async move {
                 proxy_accept_loop(listener, proxy_name, session, state_loop).await;
             })
         }
@@ -405,7 +406,8 @@ pub(crate) fn dispatch_user_connection<S>(
     if let Some(work) = pooled {
         tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
         let pname = proxy_name.clone();
-        tokio::spawn(async move {
+        let tracker = state.data_tasks.clone();
+        tracker.spawn(async move {
             let _ = bridge(user, work).await;
             tracing::debug!(proxy = %pname, "pooled work bridge finished");
         });
@@ -435,7 +437,8 @@ pub(crate) fn dispatch_user_connection<S>(
     let tx = session.tx.clone();
     let state2 = state.clone();
     let interval = state.pending_request_interval();
-    tokio::spawn(async move {
+    let tracker = state2.data_tasks.clone();
+    tracker.spawn(async move {
         // 超时兜底由 Server::run 里的单周期扫描任务负责（见 sweep_expired_pending）。
         // 这里在超时窗口内**周期性重发** ReqWorkConn：工作连接建立失败（客户端本地服务
         // 瞬时不可用、建连抖动）时，单次请求会让用户连接白等超时被关闭。

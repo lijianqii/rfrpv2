@@ -32,6 +32,7 @@ use rfrp_common::constants::{
     MAX_SESSIONS_PER_IP, MAX_UNAUTHENTICATED_CONNECTIONS, WORK_CONN_REQUEST_INTERVAL_MS,
 };
 use rfrp_common::util::stream::BoxedStream;
+use rfrp_common::util::tasks::TaskGroup;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::{Metrics, ProxyStats};
@@ -130,6 +131,9 @@ pub struct ServerState {
     pub pending_request_interval_ms: AtomicU64,
     /// 当前处于首帧握手阶段的连接数。
     pub handshakes_active: AtomicUsize,
+    /// 数据面与监听任务跟踪器：池命中的用户桥接、vhost/Dashboard 每连接任务、
+    /// 代理监听和 UDP 监听都在这里登记，退出时按 grace 统一等待。
+    pub data_tasks: TaskGroup,
     /// 优雅退出令牌：信号触发后，accept 循环与所有长连接任务据此退出（§14.4）。
     pub shutdown: CancellationToken,
 }
@@ -152,6 +156,7 @@ impl ServerState {
             max_sessions_per_ip: AtomicUsize::new(MAX_SESSIONS_PER_IP),
             pending_request_interval_ms: AtomicU64::new(WORK_CONN_REQUEST_INTERVAL_MS),
             handshakes_active: AtomicUsize::new(0),
+            data_tasks: TaskGroup::new(),
             shutdown: CancellationToken::new(),
         })
     }

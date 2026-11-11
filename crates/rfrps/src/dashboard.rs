@@ -103,7 +103,8 @@ pub async fn run_dashboard(
                         let state = state.clone();
                         let limiter = limiter.clone();
                         let sessions = sessions.clone();
-                        tokio::spawn(async move {
+                        let tracker = state.data_tasks.clone();
+                        tracker.spawn(async move {
                             let _permit = permit;
                             let _ = handle_request(
                                 stream,

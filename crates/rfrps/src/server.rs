@@ -248,6 +248,13 @@ impl Server {
                                     consecutive = accept_retry.consecutive(),
                                     "accept loop failed repeatedly; exiting for supervisor restart"
                                 );
+                                self.state.shutdown.cancel();
+                                self.state.data_tasks.close();
+                                let _ = tokio::time::timeout(
+                                    self.grace,
+                                    self.state.data_tasks.wait(),
+                                )
+                                .await;
                                 sig.abort();
                                 return Err(Error::Other("accept loop failed repeatedly".into()));
                             }
@@ -265,6 +272,8 @@ impl Server {
             }
         }
         // 优雅期：等待在途连接任务自然结束；无在途任务时立即返回，超时后强制返回。
+        // 先关闭 tracker，禁止退出阶段再登记新数据面任务。
+        self.state.data_tasks.close();
         let deadline = Instant::now() + self.grace;
         while !tasks.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -277,6 +286,11 @@ impl Server {
             {
                 break;
             }
+        }
+        // 池命中桥接、vhost/Dashboard 每连接任务、代理/UDP 监听都在 tracker 中。
+        if !self.state.data_tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(remaining, self.state.data_tasks.wait()).await;
         }
         sig.abort();
         Ok(())
