@@ -399,3 +399,32 @@ fn unknown_field_errors() {
     "#;
     assert!(toml::from_str::<ServerConfig>(toml).is_err());
 }
+
+#[test]
+fn duplicate_tcp_listener_ports_rejected() {
+    let mut cfg = ServerConfig::default();
+    cfg.proxy.vhost_http_port = Some(cfg.server.bind_port);
+    assert!(
+        cfg.validate().is_err(),
+        "control port and vhost_http port must not be identical"
+    );
+
+    let mut cfg = ServerConfig::default();
+    cfg.proxy.vhost_http_port = Some(8080);
+    cfg.proxy.vhost_https_port = Some(8080);
+    assert!(
+        cfg.validate().is_err(),
+        "vhost_http and vhost_https must not share a TCP port"
+    );
+}
+
+#[test]
+fn dashboard_port_zero_rejected() {
+    let d = DashboardSection {
+        addr: "127.0.0.1:0".into(),
+        user: "admin".into(),
+        password: "secret123".into(),
+        ..Default::default()
+    };
+    assert!(d.validate().is_err(), "dashboard port 0 must be rejected");
+}

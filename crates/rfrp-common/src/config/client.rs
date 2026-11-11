@@ -251,8 +251,12 @@ impl ClientConfig {
             self.client.heartbeat_timeout_secs,
         )?;
         if let Some(addr) = &self.client.status_addr {
-            addr.parse::<std::net::SocketAddr>()
+            let parsed = addr
+                .parse::<std::net::SocketAddr>()
                 .map_err(|e| config(format!("invalid status_addr '{addr}': {e}")))?;
+            if parsed.port() == 0 {
+                return Err(config("status_addr port must be 1-65535"));
+            }
         }
         if (self.client.tls_enable || self.client.work_conn_tls)
             && self

@@ -139,13 +139,16 @@ impl DashboardSection {
     }
 
     pub fn validate(&self) -> Result<()> {
-        // 地址必须可解析为带端口的 SocketAddr。
-        self.addr.parse::<SocketAddr>().map_err(|e| {
+        // 地址必须可解析为带端口的 SocketAddr；端口 0 会让实际监听端口不可知。
+        let addr: SocketAddr = self.addr.parse().map_err(|e| {
             config(format!(
                 "invalid dashboard addr '{}' (expected IP:PORT, e.g. 127.0.0.1:7500): {e}",
                 self.addr
             ))
         })?;
+        if addr.port() == 0 {
+            return Err(config("dashboard port must be 1-65535"));
+        }
         if self.user.is_empty() {
             return Err(config("dashboard.user must not be empty"));
         }
@@ -337,6 +340,23 @@ impl ServerConfig {
         {
             if !(1..=65535).contains(&p) {
                 return Err(config(format!("vhost port {p} out of range 1-65535")));
+            }
+        }
+        // 控制口与 vhost 共用 bind_addr，同端口不可能同时绑定；vhost HTTP/HTTPS
+        // 也不能共用同一 TCP 端口。提前在配置阶段拒绝，避免 --check/exit 预检
+        // 通过后，进程退出才发现启动失败。
+        let mut tcp_ports = std::collections::HashSet::new();
+        tcp_ports.insert(self.server.bind_port);
+        for (name, port) in [
+            ("vhost_http_port", self.proxy.vhost_http_port),
+            ("vhost_https_port", self.proxy.vhost_https_port),
+        ] {
+            if let Some(port) = port {
+                if !tcp_ports.insert(port) {
+                    return Err(config(format!(
+                        "{name} port {port} conflicts with another TCP listener port"
+                    )));
+                }
             }
         }
         if self.proxy.vhost_https_port.is_some() {

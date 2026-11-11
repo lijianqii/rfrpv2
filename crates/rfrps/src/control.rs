@@ -295,7 +295,11 @@ where
         loop {
             iv.tick().await;
             let ts = now_ms();
+            // 先切换到本轮 ts，再清零上一轮的 pong 标记：即使本轮发送前收到
+            // 迟到的旧响应，也不会被误认为本轮已回应；同时避免墙钟回拨后
+            // 旧的 pong_ts 大于新 ts 导致心跳永久“立即通过”。
             hb_last_sent.store(ts, Ordering::Relaxed);
+            hb_pong_ts.store(0, Ordering::Relaxed);
             tracing::debug!(session = %session_id_hb, ts, "heartbeat sent");
             // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
             // 说明控制写路径已不可用：此时等不到 pong，必须直接判定连接失效。

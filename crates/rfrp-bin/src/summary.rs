@@ -21,7 +21,7 @@ pub fn init_logging(log: &LogSection, overrides: &LogOverrides) {
 }
 
 /// 打印服务端启动摘要（版本与关键配置；不打印 token）。
-pub fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
+pub fn log_server_summary(cfg: &rfrp_common::config::ServerConfig, grace: std::time::Duration) {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = %format!("{}:{}", cfg.server.bind_addr, cfg.server.bind_port),
@@ -29,7 +29,7 @@ pub fn log_server_summary(cfg: &rfrp_common::config::ServerConfig) {
         work_conn_tls = cfg.server.work_conn_tls,
         tcp_keepalive_secs = cfg.server.tcp_keepalive_secs.unwrap_or(30),
         udp_session_timeout_secs = cfg.server.udp_session_timeout().as_secs(),
-        grace_secs = cfg.server.grace().as_secs(),
+        grace_secs = grace.as_secs(),
         allow_ports = if cfg.proxy.allow_ports.trim().is_empty() {
             "all"
         } else {
@@ -77,6 +77,7 @@ fn describe_secret(s: &str) -> String {
 pub fn print_server_config_summary(
     path: &std::path::Path,
     cfg: &rfrp_common::config::ServerConfig,
+    grace: std::time::Duration,
 ) {
     println!("server config OK: {}", path.display());
     println!("  bind: {}:{}", cfg.server.bind_addr, cfg.server.bind_port);
@@ -85,7 +86,7 @@ pub fn print_server_config_summary(
         "  tls_enable: {}, work_conn_tls: {}",
         cfg.server.tls_enable, cfg.server.work_conn_tls
     );
-    println!("  grace_secs: {}", cfg.server.grace().as_secs());
+    println!("  grace_secs: {}", grace.as_secs());
     println!(
         "  allow_ports: {}",
         if cfg.proxy.allow_ports.trim().is_empty() {

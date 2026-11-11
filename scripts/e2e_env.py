@@ -1062,6 +1062,62 @@ class E2E(unittest.TestCase):
             "proxy did not recover after restoring config",
         )
 
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_restart_recovers_when_old_stage_invalid(self) -> None:
+        # 旧 stage 被破坏时，回滚重试不能永久忽略新的配置事件。
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0),
+            "supervisor did not start a child",
+        )
+        stages = list(self.temp.glob(".server.toml.stage.*.0.toml"))
+        self.assertEqual(len(stages), 1, f"unexpected stage files: {stages}")
+        stages[0].unlink()
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        blocked = blocker.getsockname()[1]
+        stack.server_config.write_text(
+            original.replace(
+                f"bind_port = {stack.control_port}",
+                f"bind_port = {blocked}",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 0, 20.0),
+            "rollback should be stuck after the old stage was removed",
+        )
+        time.sleep(4)
+        self.assertIsNone(parent.poll(), "supervisor exited during rollback")
+
+        # 回滚重试期间写入第三份合法配置：必须被消费并启动。
+        stack.server_config.write_text(original, encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 20.0),
+            "supervisor ignored the config change during rollback",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"recover-after-invalid-stage", timeout=1.0
+                ),
+                20.0,
+            ),
+            "proxy did not recover after rollback config event",
+        )
+        self.assertIsNone(parent.poll())
+
     @unittest.skipUnless(os.name == "posix", "SIGKILL test requires POSIX")
     def test_watch_config_parent_sigkill_cleans_child(self) -> None:
         echo = self.tcp_echo()

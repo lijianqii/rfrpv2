@@ -123,7 +123,10 @@ where
         loop {
             iv.tick().await;
             let ts = now_ms();
+            // 先切换到本轮 ts，再清零上一轮的 pong 标记：迟到的旧响应不会
+            // 被当作本轮回应；墙钟回拨也不会让旧 pong_ts 一直“通过”。
             hb_last_sent.store(ts, Ordering::Relaxed);
+            hb_pong_ts.store(0, Ordering::Relaxed);
             // 发送失败（出站通道已关闭，或写任务阻塞超过 CONTROL_SEND_TIMEOUT 导致通道满）
             // 说明控制写路径已不可用：此时等不到 pong，必须判定连接失效并重连。
             // 旧实现此处 `continue` 跳过本轮，会让看门狗在写侧已死时永不触发——

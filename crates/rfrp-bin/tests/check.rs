@@ -93,3 +93,79 @@ fn invalid_config_exits_nonzero() {
     let out = run(&["server", "-c", cfg.to_str().unwrap(), "--check"]);
     assert!(!out.status.success(), "invalid config must fail: {out:?}");
 }
+
+#[test]
+fn check_validates_cli_grace_override() {
+    let cfg = tmp_config(
+        "grace-invalid",
+        r#"
+        [server]
+        bind_addr = "127.0.0.1"
+        bind_port = 7000
+        token = "secret"
+        work_conn_tls = false
+    "#,
+    );
+    let out = run(&[
+        "server",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--grace-secs",
+        "999999",
+        "--check",
+    ]);
+    assert!(
+        !out.status.success(),
+        "invalid --grace-secs must fail --check: {out:?}"
+    );
+}
+
+#[test]
+fn check_reports_effective_cli_grace() {
+    let cfg = tmp_config(
+        "grace-valid",
+        r#"
+        [server]
+        bind_addr = "127.0.0.1"
+        bind_port = 7000
+        token = "secret"
+        work_conn_tls = false
+    "#,
+    );
+    let out = run(&[
+        "server",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--grace-secs",
+        "7",
+        "--check",
+    ]);
+    assert!(out.status.success(), "check must succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("grace_secs: 7"),
+        "summary must show CLI grace: {stdout}"
+    );
+}
+
+#[test]
+fn check_rejects_duplicate_listener_ports() {
+    let cfg = tmp_config(
+        "dup-ports",
+        r#"
+        [server]
+        bind_addr = "127.0.0.1"
+        bind_port = 7000
+        token = "secret"
+        work_conn_tls = false
+
+        [proxy]
+        vhost_http_port = 7000
+    "#,
+    );
+    let out = run(&["server", "-c", cfg.to_str().unwrap(), "--check"]);
+    assert!(
+        !out.status.success(),
+        "duplicate listener ports must fail --check: {out:?}"
+    );
+}

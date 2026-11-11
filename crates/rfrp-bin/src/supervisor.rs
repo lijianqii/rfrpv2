@@ -35,6 +35,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+enum RollbackOutcome {
+    StartedOld {
+        child: Child,
+        config_changed: bool,
+    },
+    StartedNew {
+        child: Child,
+        stage: PathBuf,
+        args: Vec<OsString>,
+    },
+    Shutdown,
+}
+
 /// 启动 supervisor。`config` 用于文件监听，`args` 是完整 argv（含程序名）。
 pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     let exe = match std::env::current_exe() {
@@ -94,11 +107,15 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         "rfrp supervisor: started child pid={}",
         child.id().unwrap_or(0)
     );
+    let mut child_started_at = Instant::now();
 
     let mut backoff = BACKOFF_INITIAL;
     let mut tick = interval(Duration::from_millis(500));
+    // 回滚期间收到配置事件并只恢复了旧配置时，外层需要再处理一次当前配置。
+    let mut pending_reload = false;
     loop {
-        let mut reload_requested = false;
+        let mut reload_requested = pending_reload;
+        pending_reload = false;
         let mut child_status = None;
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -130,12 +147,19 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                 "rfrp supervisor: child exited unexpectedly ({}); restarting",
                 status
             );
+            // 稳定运行过的子进程崩溃不应继承历史退避（最多 30s）。
+            if child_started_at.elapsed()
+                >= Duration::from_secs(rfrp_common::constants::MIN_STABLE_CONNECTION_SECS)
+            {
+                backoff = BACKOFF_INITIAL;
+            }
             if !wait_or_shutdown(backoff, &shutdown).await {
                 break;
             }
             match spawn_child(&exe, &active_args).await {
                 Ok(new_child) => {
                     child = new_child;
+                    child_started_at = Instant::now();
                     eprintln!(
                         "rfrp supervisor: started child pid={}",
                         child.id().unwrap_or(0)
@@ -160,28 +184,14 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         // 先把新配置复制到私有 stage，再校验 stage；子进程只读取这个快照，
         // 用户随后再次保存也不会让“校验的内容”和“实际启动的内容”不一致。
         generation += 1;
-        let new_stage = match stage_config(&config, generation) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!(
-                    "rfrp supervisor: cannot create stage config: {e}; keeping current child"
-                );
-                continue;
-            }
-        };
-        let new_args = match with_config_arg(&base_args, &new_stage) {
-            Ok(args) => args,
-            Err(e) => {
-                eprintln!("rfrp supervisor: cannot build child args: {e}; keeping current child");
-                let _ = fs::remove_file(&new_stage);
-                continue;
-            }
-        };
-        if !validate(&exe, &new_args).await {
-            eprintln!("rfrp supervisor: config invalid; keeping current child");
-            let _ = fs::remove_file(&new_stage);
-            continue;
-        }
+        let (new_stage, new_args) =
+            match stage_and_validate(&exe, &config, &base_args, generation).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("rfrp supervisor: {e}; keeping current child");
+                    continue;
+                }
+            };
         eprintln!("rfrp supervisor: config valid; restarting child");
 
         let old_stage = active_stage.clone();
@@ -191,6 +201,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         match spawn_and_check(&exe, &new_args).await {
             Ok(new_child) => {
                 child = new_child;
+                child_started_at = Instant::now();
                 active_args = new_args;
                 active_stage = new_stage;
                 let _ = fs::remove_file(&old_stage);
@@ -204,9 +215,25 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                 eprintln!("rfrp supervisor: new config child failed to start: {e}; rolling back");
                 let _ = fs::remove_file(&new_stage);
                 // 旧 stage 一直保留到新子进程成功后才删除，因此回滚是确定可用的。
-                match spawn_rollback_with_retry(&exe, &old_args, &shutdown).await {
-                    Some(rollback_child) => {
+                // 回滚重试期间继续消费配置事件：用户改出第三个合法配置时应尝试
+                // 新配置，而不是永远卡在旧配置上。
+                match spawn_rollback_with_retry(
+                    &exe,
+                    &old_args,
+                    &shutdown,
+                    &mut event_rx,
+                    &config,
+                    &base_args,
+                    &mut generation,
+                )
+                .await
+                {
+                    RollbackOutcome::StartedOld {
+                        child: rollback_child,
+                        config_changed,
+                    } => {
                         child = rollback_child;
+                        child_started_at = Instant::now();
                         active_args = old_args;
                         active_stage = old_stage;
                         eprintln!(
@@ -214,8 +241,25 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                             child.id().unwrap_or(0)
                         );
                         backoff = BACKOFF_INITIAL;
+                        pending_reload = config_changed;
                     }
-                    None => {
+                    RollbackOutcome::StartedNew {
+                        child: new_child,
+                        stage,
+                        args,
+                    } => {
+                        child = new_child;
+                        child_started_at = Instant::now();
+                        active_args = args;
+                        active_stage = stage;
+                        let _ = fs::remove_file(&old_stage);
+                        eprintln!(
+                            "rfrp supervisor: started child pid={} with updated config",
+                            child.id().unwrap_or(0)
+                        );
+                        backoff = BACKOFF_INITIAL;
+                    }
+                    RollbackOutcome::Shutdown => {
                         // 回滚重试期间收到退出信号。
                         sig.abort();
                         let _ = fs::remove_file(&old_stage);
@@ -315,24 +359,100 @@ async fn spawn_and_check(
 }
 
 /// 新配置启动失败后，持续用旧 stage 尝试恢复；避免父进程直接退出导致长期离线。
+///
+/// 等待退避期间同时消费配置事件：旧配置也起不来时，用户改出的新配置仍有机会
+/// 被立即尝试，而不是被回滚循环永久忽略。
 async fn spawn_rollback_with_retry(
     exe: &Path,
-    args: &[OsString],
+    old_args: &[OsString],
     shutdown: &CancellationToken,
-) -> Option<Child> {
+    event_rx: &mut mpsc::UnboundedReceiver<()>,
+    config: &Path,
+    base_args: &[OsString],
+    generation: &mut u64,
+) -> RollbackOutcome {
     let mut delay = BACKOFF_INITIAL;
+    let mut event_open = true;
+    let mut config_changed = false;
     loop {
-        match spawn_and_check(exe, args).await {
-            Ok(child) => return Some(child),
+        match spawn_and_check(exe, old_args).await {
+            Ok(child) => {
+                return RollbackOutcome::StartedOld {
+                    child,
+                    config_changed,
+                }
+            }
             Err(e) => {
                 eprintln!("rfrp supervisor: rollback child failed to start: {e}; retrying");
-                if !wait_or_shutdown(delay, shutdown).await {
-                    return None;
-                }
-                delay = (delay * 2).min(BACKOFF_MAX);
             }
         }
+
+        let mut event_seen = false;
+        tokio::select! {
+            _ = sleep(delay) => {}
+            _ = shutdown.cancelled() => return RollbackOutcome::Shutdown,
+            event = event_rx.recv(), if event_open => {
+                match event {
+                    Some(()) => {
+                        event_seen = true;
+                        config_changed = true;
+                    }
+                    None => {
+                        eprintln!("rfrp supervisor: config watcher closed during rollback");
+                        event_open = false;
+                    }
+                }
+            }
+        }
+
+        if event_seen {
+            // 合并编辑器保存产生的连续事件，再尝试当前配置。
+            sleep(DEBOUNCE).await;
+            while event_rx.try_recv().is_ok() {}
+            *generation += 1;
+            match stage_and_validate(exe, config, base_args, *generation).await {
+                Ok((stage, args)) => match spawn_and_check(exe, &args).await {
+                    Ok(child) => {
+                        return RollbackOutcome::StartedNew { child, stage, args };
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "rfrp supervisor: updated config child failed to start: {e}; continuing rollback"
+                        );
+                        let _ = fs::remove_file(&stage);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("rfrp supervisor: updated config invalid: {e}; continuing rollback");
+                }
+            }
+            // 事件处理后立即重试旧配置，不额外等待。
+            continue;
+        }
+        delay = (delay * 2).min(BACKOFF_MAX);
     }
+}
+
+/// 复制当前配置到 stage 并校验；失败时清理 stage。
+async fn stage_and_validate(
+    exe: &Path,
+    config: &Path,
+    base_args: &[OsString],
+    generation: u64,
+) -> std::result::Result<(PathBuf, Vec<OsString>), String> {
+    let stage = stage_config(config, generation)?;
+    let args = match with_config_arg(base_args, &stage) {
+        Ok(args) => args,
+        Err(e) => {
+            let _ = fs::remove_file(&stage);
+            return Err(e);
+        }
+    };
+    if !validate(exe, &args).await {
+        let _ = fs::remove_file(&stage);
+        return Err("config invalid".into());
+    }
+    Ok((stage, args))
 }
 
 async fn spawn_child(exe: &Path, child_args: &[OsString]) -> std::io::Result<Child> {

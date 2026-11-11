@@ -190,6 +190,24 @@ async fn preflight_server_listeners(
         });
     }
 
+    if old.server.bind_addr != new.server.bind_addr {
+        // 端口可能没变，不能靠 old_ports 跳过；用端口 0 验证新地址本地可绑定。
+        TcpListener::bind((new.server.bind_addr.as_str(), 0))
+            .await
+            .map_err(|e| format!("preflight bind address {}: {e}", new.server.bind_addr))?;
+    }
+    let old_dashboard = old.dashboard.as_ref().map(|d| d.addr.as_str());
+    let new_dashboard = new.dashboard.as_ref().map(|d| d.addr.as_str());
+    if old_dashboard != new_dashboard {
+        if let Some(d) = &new.dashboard {
+            if let Ok(addr) = d.addr.parse::<std::net::SocketAddr>() {
+                TcpListener::bind((addr.ip(), 0))
+                    .await
+                    .map_err(|e| format!("preflight bind dashboard address {}: {e}", addr.ip()))?;
+            }
+        }
+    }
+
     for target in targets {
         if target.port_key != 0 && old_ports.contains(&target.port_key) {
             continue;
@@ -323,12 +341,23 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let effective_grace = match args.grace_secs {
+        Some(g) if g > rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS => {
+            eprintln!(
+                "invalid --grace-secs {g}: max is {}",
+                rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS
+            );
+            return ExitCode::FAILURE;
+        }
+        Some(g) => Duration::from_secs(g),
+        None => cfg.server.grace(),
+    };
     if args.check {
-        print_server_config_summary(&args.config, &cfg);
+        print_server_config_summary(&args.config, &cfg, effective_grace);
         return ExitCode::SUCCESS;
     }
     init_logging(&cfg.log, &log);
-    log_server_summary(&cfg);
+    log_server_summary(&cfg, effective_grace);
     rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
         cfg.server.tcp_keepalive_secs,
     ));
@@ -342,19 +371,7 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         }
     };
     // 优雅退出宽限期可由 CLI 覆盖（配置文件为 [server].grace_secs，见 §14.4）。
-    let server = match args.grace_secs {
-        Some(g) => {
-            if g > rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS {
-                eprintln!(
-                    "invalid --grace-secs {g}: max is {}",
-                    rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS
-                );
-                return ExitCode::FAILURE;
-            }
-            server.with_grace(Duration::from_secs(g))
-        }
-        None => server,
-    };
+    let server = server.with_grace(effective_grace);
     let restart_requested = Arc::new(AtomicBool::new(false));
     let exit_watcher = exit_watch.map(|watch| {
         spawn_server_exit_watcher(

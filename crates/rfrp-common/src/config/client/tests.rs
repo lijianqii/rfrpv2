@@ -570,3 +570,17 @@ fn unknown_field_errors() {
     "#;
     assert!(toml::from_str::<ClientConfig>(toml).is_err());
 }
+
+#[test]
+fn status_addr_port_zero_rejected() {
+    let mut cfg = ClientConfig::default();
+    cfg.client.server_addr = "127.0.0.1".into();
+    cfg.client.server_port = 7000;
+    cfg.client.token = "secret".into();
+    cfg.client.work_conn_tls = false;
+    cfg.client.status_addr = Some("127.0.0.1:0".into());
+    assert!(
+        cfg.validate().is_err(),
+        "status_addr port 0 must be rejected"
+    );
+}
