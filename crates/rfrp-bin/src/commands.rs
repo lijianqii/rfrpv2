@@ -98,7 +98,7 @@ fn load_client_cfg(
 
 struct ExitWatch {
     _watcher: ConfigWatcher,
-    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    rx: tokio::sync::mpsc::Receiver<()>,
 }
 
 struct ExitWatcher {
@@ -117,7 +117,7 @@ impl ExitWatcher {
 
 /// 在主配置加载前打开监听，启动期间的变更也会留在队列里。
 fn open_exit_watch(path: &Path) -> std::result::Result<ExitWatch, String> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let watcher = watch_config_file(path, tx).map_err(|e| format!("cannot watch config: {e}"))?;
     Ok(ExitWatch {
         _watcher: watcher,

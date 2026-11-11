@@ -132,7 +132,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
         }
         let work_stream = framed.into_inner();
         state.metrics.inc_work_conn();
-        tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "udp work connection established");
+        tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "udp work connection established");
         return udp_bridge(work_stream, local, &req).await;
     }
 
@@ -193,7 +193,7 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
     let work_stream = framed.into_inner();
 
     state.metrics.inc_work_conn();
-    tracing::info!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "work connection established");
+    tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, tls = use_tls, "work connection established");
     let _ = bridge(work_stream, local).await;
     tracing::debug!(proxy = %req.proxy_name, work_id = req.work_id, "work bridge finished");
     Ok(())

@@ -442,6 +442,38 @@ async fn register_tcp_with_conflicting_domain_rejected() {
 }
 
 #[tokio::test]
+async fn tcp_proxy_does_not_reserve_new_domains() {
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    state
+        .sessions
+        .lock()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    let tcp = NewProxy {
+        proxy_name: "raw".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: Some(vec!["new.example.com".into()]),
+    };
+    assert!(register_proxy(&tcp, &session, &state, &cfg).await.is_ok());
+    assert!(
+        state.session_for_domain("new.example.com").is_none(),
+        "TCP proxy must not reserve a new vhost domain"
+    );
+
+    let web = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["new.example.com".into()]),
+    };
+    assert!(register_proxy(&web, &session, &state, &cfg).await.is_ok());
+    assert!(state.session_for_domain("new.example.com").is_some());
+}
+
+#[tokio::test]
 async fn register_http_duplicate_name_rejected() {
     // 与 TCP/UDP 一致：同名 vhost 代理拒绝，不静默覆盖旧条目（§6.6）。
     let state = ServerState::new();

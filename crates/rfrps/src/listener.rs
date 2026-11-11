@@ -63,7 +63,8 @@ pub async fn register_proxy(
         .into_iter()
         .map(|d| d.to_lowercase())
         .collect();
-    if matches!(np.r#type, ProxyType::Http | ProxyType::Https) && domains.is_empty() {
+    let is_vhost = matches!(np.r#type, ProxyType::Http | ProxyType::Https);
+    if is_vhost && domains.is_empty() {
         return Err(ProxyError::InvalidField);
     }
     // 服务端独立校验域名格式：不能只依赖客户端配置校验（恶意客户端可绕过）。
@@ -102,10 +103,17 @@ pub async fn register_proxy(
         return Err(ProxyError::NameExists);
     }
     // 域名同样在 bind 前原子预留，关闭“查重 → bind → 登记”的 TOCTOU 窗口。
-    if !domains.is_empty() && !state.reserve_domains(&domains, session, &np.proxy_name) {
-        tracing::warn!(proxy = %np.proxy_name, "vhost domain conflict, registration rejected");
-        state.release_proxy(&np.proxy_name, session);
-        return Err(ProxyError::DomainConflict);
+    if !domains.is_empty() {
+        if !state.reserve_domains(&domains, session, &np.proxy_name) {
+            tracing::warn!(proxy = %np.proxy_name, "vhost domain conflict, registration rejected");
+            state.release_proxy(&np.proxy_name, session);
+            return Err(ProxyError::DomainConflict);
+        }
+        if !is_vhost {
+            // TCP/UDP 不路由域名，只做“不得抢占已有 vhost 域名”的冲突校验；
+            // 立即释放临时预留，避免新域名被非 vhost 代理长期占住。
+            state.release_domains(&domains, session, &np.proxy_name);
+        }
     }
 
     let handle = match kind {
@@ -171,7 +179,7 @@ pub async fn register_proxy(
     }
 
     // 登记会话内映射；全局索引已在 bind 前预留，此处不再重复写入。
-    if !domains.is_empty() {
+    if is_vhost && !domains.is_empty() {
         let mut map = session.proxy_domains.lock();
         for d in &domains {
             map.insert(d.clone(), np.proxy_name.clone());
@@ -183,7 +191,11 @@ pub async fn register_proxy(
             handle,
             kind,
             remote_port: np.remote_port,
-            custom_domains: domains.clone(),
+            custom_domains: if is_vhost {
+                domains.clone()
+            } else {
+                Vec::new()
+            },
         },
     );
 

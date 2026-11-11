@@ -201,6 +201,8 @@ pub const MAX_CUSTOM_DOMAINS: usize = 16;
 pub const POOL_SIZE_DEFAULT: u32 = 1;
 /// 池大小告警阈值（超过记警告）。
 pub const POOL_SIZE_WARN_THRESHOLD: u32 = 16;
+/// 客户端预热工作连接的全局并发上限，避免多代理大 pool_size 造成连接风暴。
+pub const PREHEAT_MAX_CONCURRENT: usize = 16;
 /// 客户端 `pool_size` 硬上限（与服务端单代理池上限对齐）。
 ///
 /// 服务端最多保留 [`MAX_POOLED_WORK_CONNS_PER_PROXY`] 条池连接；客户端配置更大

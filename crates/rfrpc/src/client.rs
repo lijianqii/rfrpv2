@@ -10,10 +10,10 @@ use anyhow::Result as AnyResult;
 use rfrp_common::config::{ClientConfig, ClientProxy};
 use rfrp_common::constants::{
     CONNECT_TIMEOUT, LOGIN_TIMEOUT, MAX_RUN_ID_LEN, MIN_STABLE_CONNECTION_SECS, NEW_PROXY_TIMEOUT,
-    POOL_SIZE_MAX, PROTOCOL_VERSION, PROXY_REGISTER_RETRY_INITIAL, PROXY_REGISTER_RETRY_MAX,
-    PROXY_REGISTER_RETRY_MAX_DELAY, PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS,
-    PROXY_REGISTER_RETRY_PERSISTENT_MAX, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX,
-    TLS_HANDSHAKE_TIMEOUT, WORK_ID_POOL_RESERVED,
+    POOL_SIZE_MAX, PREHEAT_MAX_CONCURRENT, PROTOCOL_VERSION, PROXY_REGISTER_RETRY_INITIAL,
+    PROXY_REGISTER_RETRY_MAX, PROXY_REGISTER_RETRY_MAX_DELAY,
+    PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS, PROXY_REGISTER_RETRY_PERSISTENT_MAX,
+    RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, TLS_HANDSHAKE_TIMEOUT, WORK_ID_POOL_RESERVED,
 };
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
@@ -54,6 +54,8 @@ pub struct ClientState {
     /// 服务端在 10s pending 窗口内每 3s 重发 `ReqWorkConn`；客户端必须去重，
     /// 否则本地服务建立慢时会并发创建多条连接，之后多余工作连接被服务端拒绝。
     pub inflight_work: Mutex<HashSet<(String, u64)>>,
+    /// 预热工作连接的全局并发上限。
+    pub preheat_limit: Arc<tokio::sync::Semaphore>,
     /// 进程级运行指标（跨重连累计）。
     pub metrics: Arc<ClientMetrics>,
 }
@@ -354,6 +356,7 @@ impl Client {
             work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
             work_conn_token: Mutex::new(None),
             inflight_work: Mutex::new(HashSet::new()),
+            preheat_limit: Arc::new(tokio::sync::Semaphore::new(PREHEAT_MAX_CONCURRENT)),
             metrics: self.metrics.clone(),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
@@ -397,6 +400,7 @@ impl Client {
                         }
                     };
                     *state.work_conn_tls.lock() = work_tls;
+                    self.metrics.set_work_conn_tls(work_tls);
                     *state.work_conn_token.lock() = resp.work_conn_token.clone();
                     // 协商结果回传（DESIGN §6.4）：旧服务端不填该字段时按“沿用自己声明的版本”处理。
                     let negotiated = resp.protocol_version.unwrap_or(PROTOCOL_VERSION);
@@ -451,11 +455,12 @@ impl Client {
             }
         }
 
-        tracing::info!(count = state.proxies.len(), "registering proxies");
+        tracing::info!(count = self.config.proxies.len(), "registering proxies");
         // 可重试失败的代理（如端口被旧会话占用），交给后台任务退避重试（§6.6）。
         let mut retryable: Vec<ClientProxy> = Vec::new();
         let mut persistent: Vec<ClientProxy> = Vec::new();
-        for p in state.proxies.values() {
+        // 按配置文件声明顺序串行注册（DESIGN §6.6），而不是 HashMap 的随机顺序。
+        for p in &self.config.proxies {
             match register_one_proxy(&tx, &state, p, shutdown).await {
                 RegisterOutcome::Ok => {}
                 RegisterOutcome::Retryable => retryable.push(p.clone()),
@@ -724,21 +729,26 @@ fn spawn_preheat(state: &Arc<ClientState>, p: &ClientProxy) {
     // 服务端当前明确拒绝 UDP 的 work_id=0 池化连接（见 rfrps/src/work.rs）；
     // 预热 UDP 只会建立一条注定被关闭的连接，因此直接跳过。
     // DESIGN §8.2/§9.4 若未来决定支持 UDP 池化，再移除此分支。
-    if p.r#type == ProxyType::Udp {
+    if p.r#type == ProxyType::Udp || p.pool_size == 0 {
         return;
     }
-    // 配置校验已拒绝超过 POOL_SIZE_MAX 的值；这里再兜底，避免绕过校验的调用方
-    // （库使用/测试）触发连接风暴。
-    for _ in 0..p.pool_size.min(POOL_SIZE_MAX) {
-        let req = ReqWorkConn {
-            proxy_name: p.name.clone(),
-            work_id: WORK_ID_POOL_RESERVED,
-        };
-        let st = state.clone();
-        tokio::spawn(async move {
-            let _ = crate::workconn::handle_work_conn(req, st).await;
-        });
-    }
+    let state = state.clone();
+    let p = p.clone();
+    // 每个代理一个预热任务，并在全局 Semaphore 下串行建立连接：
+    // 避免 128 代理 × pool_size=32 时瞬间创建数千条连接/任务。
+    tokio::spawn(async move {
+        for _ in 0..p.pool_size.min(POOL_SIZE_MAX) {
+            let Ok(permit) = state.preheat_limit.clone().acquire_owned().await else {
+                return;
+            };
+            let req = ReqWorkConn {
+                proxy_name: p.name.clone(),
+                work_id: WORK_ID_POOL_RESERVED,
+            };
+            let _ = crate::workconn::handle_work_conn(req, state.clone()).await;
+            drop(permit);
+        }
+    });
 }
 
 /// 后台注册重试。
@@ -856,6 +866,7 @@ pub(crate) fn test_state(
         work_conn_tls: Mutex::new(work_conn_tls),
         work_conn_token: Mutex::new(None),
         inflight_work: Mutex::new(HashSet::new()),
+        preheat_limit: Arc::new(tokio::sync::Semaphore::new(PREHEAT_MAX_CONCURRENT)),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
     })
 }

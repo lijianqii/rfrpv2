@@ -197,7 +197,16 @@ where
                                 let pname = r.proxy_name.clone();
                                 let work_id = r.work_id;
                                 tokio::spawn(async move {
-                                    let _ = workconn::handle_work_conn(r, st.clone()).await;
+                                    if let Err(e) =
+                                        workconn::handle_work_conn(r, st.clone()).await
+                                    {
+                                        tracing::warn!(
+                                            proxy = %pname,
+                                            work_id,
+                                            error = %e,
+                                            "work connection failed"
+                                        );
+                                    }
                                     release_inflight(&st, &pname, work_id);
                                 });
                             }

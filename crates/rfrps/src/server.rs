@@ -443,7 +443,7 @@ async fn handle_connection(
     let handshake_guard = match state.begin_handshake() {
         Some(g) => g,
         None => {
-            tracing::warn!(%peer_ip, "too many pending handshakes; closing");
+            tracing::debug!(%peer_ip, "too many pending handshakes; closing");
             return Ok(());
         }
     };

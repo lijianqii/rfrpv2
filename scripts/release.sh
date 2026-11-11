@@ -3,6 +3,10 @@
 # 产物输出到 dist/，并生成 SHA256SUMS。
 set -euo pipefail
 
+# 固定到仓库根：避免从其他目录执行时 rm -rf 到错误的 dist/。
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
 # 跳过质量门（仅用于本地反复打包；正式发布不应带 SKIP_QUALITY_GATES=1）。
 if [ "${SKIP_QUALITY_GATES:-0}" = "1" ]; then
   echo "==> WARNING: quality gates skipped (SKIP_QUALITY_GATES=1)"
@@ -11,26 +15,26 @@ else
   # 放在交叉编译之前：坏掉的提交不必浪费几分钟去产出产物。
   echo "==> Quality gates: fmt-check / clippy / build / test"
   cargo fmt --all --check
-  cargo clippy --all-targets -- -D warnings
-  cargo build --all
-  cargo test --all
+  cargo clippy --locked --all-targets -- -D warnings
+  cargo build --locked --all
+  cargo test --locked --all
 
   # UDP 突发回收率闸门：release-only 用例（debug 构建下新旧代码都会丢包，
   # 测不出差异），因此必须显式带 --ignored 跑。
   echo "==> Quality gates: udp burst regression (release)"
-  cargo test --release -p rfrpc --test udp_burst -- --ignored --nocapture
+  cargo test --locked --release -p rfrpc --test udp_burst -- --ignored --nocapture
 fi
 
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["packages"][0]["version"])')"
-DIST="dist"
+VERSION="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"] == "rfrp-bin"))')"
+DIST="$ROOT/dist"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
 echo "==> Building linux-gnu"
-cargo build --release --target x86_64-unknown-linux-gnu
+cargo build --locked --release --target x86_64-unknown-linux-gnu
 
 echo "==> Building windows-gnu"
-cargo build --release --target x86_64-pc-windows-gnu
+cargo build --locked --release --target x86_64-pc-windows-gnu
 
 # 打包公共内容：包内 README（替换版本/包名）+ 配置模板 + 许可证
 prepare_common() {

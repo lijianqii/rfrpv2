@@ -19,6 +19,8 @@ pub struct ClientMetrics {
     pub work_conn_failures_total: AtomicU64,
     /// 最近一次控制链路 RTT（毫秒；0 = 尚未测得）。
     pub rtt_ms: AtomicU64,
+    /// 当前会话实际使用的工作连接 TLS（服务端 LoginResp 偏好覆盖后的值）。
+    pub work_conn_tls_actual: AtomicBool,
     /// 代理注册失败次数（含可重试与不可重试）。
     pub proxy_register_failures_total: AtomicU64,
     /// 后台重试后注册成功的代理数。
@@ -40,6 +42,7 @@ impl ClientMetrics {
             work_conns_total: AtomicU64::new(0),
             work_conn_failures_total: AtomicU64::new(0),
             rtt_ms: AtomicU64::new(0),
+            work_conn_tls_actual: AtomicBool::new(false),
             proxy_register_failures_total: AtomicU64::new(0),
             proxy_register_retry_success_total: AtomicU64::new(0),
         }
@@ -66,6 +69,14 @@ impl ClientMetrics {
     /// 最近一次控制链路 RTT（毫秒；0 = 未测得）。
     pub fn rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_work_conn_tls(&self, v: bool) {
+        self.work_conn_tls_actual.store(v, Ordering::Relaxed);
+    }
+
+    pub fn work_conn_tls(&self) -> bool {
+        self.work_conn_tls_actual.load(Ordering::Relaxed)
     }
 
     pub fn inc_reconnect(&self) {

@@ -31,6 +31,20 @@ fn allow_ports_parsing_variants() {
 }
 
 #[test]
+fn allow_ports_empty_segments_do_not_fail_open() {
+    for bad in [",", " , ", ",,,"] {
+        let cfg = ProxySection {
+            allow_ports: bad.into(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.parse_allow_ports().is_err(),
+            "non-empty allow_ports with no valid segments must be rejected: {bad:?}"
+        );
+    }
+}
+
+#[test]
 fn allow_ports_invalid() {
     for bad in ["abc", "7000-", "8000-7000", "7000-abc"] {
         let cfg = ProxySection {

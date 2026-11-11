@@ -10,9 +10,15 @@ WorkingDirectory=/etc/rfrp
 ExecStart=/usr/local/bin/rfrp server -c /etc/rfrp/rfrp-server.toml
 Restart=on-failure
 RestartSec=5
-# run_id 建议指向持久化路径（见 DESIGN §6.2.1）
-# 若配置未指定，默认 ~/.rfrp/run_id（服务账户家目录）
+# 反向代理每条连接占一个 fd；systemd 默认上限常见为 1024。
+LimitNOFILE=65536
+# 自动创建并通过 ReadWritePaths 暴露持久化/日志目录。
+StateDirectory=rfrp
+LogsDirectory=rfrp
 NoNewPrivileges=true
+# 需要绑定 80/443 等 <1024 端口时取消注释；NoNewPrivileges 下 setcap 不会生效。
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/rfrp /var/log/rfrp

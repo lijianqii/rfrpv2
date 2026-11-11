@@ -10,10 +10,17 @@ WorkingDirectory=/etc/rfrp
 ExecStart=/usr/local/bin/rfrp client -c /etc/rfrp/rfrp-client.toml
 Restart=on-failure
 RestartSec=5
+# 大量代理/工作连接需要更多 fd。
+LimitNOFILE=16384
+# 自动创建并通过 ReadWritePaths 暴露持久化/日志目录。
+StateDirectory=rfrp
+LogsDirectory=rfrp
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/rfrp /var/log/rfrp
+# 注意：ProtectHome=true 时默认 ~/.rfrp/run_id 不可写；
+# 请在 rfrp-client.toml 设置 run_id_file = "/var/lib/rfrp/run_id"（见发布说明）。
 
 [Install]
 WantedBy=multi-user.target

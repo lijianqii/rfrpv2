@@ -149,7 +149,16 @@ async fn datagram_forwarded_to_paired_session() {
         },
     );
 
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"hello").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"hello",
+        Instant::now(),
+    )
+    .await;
 
     assert_eq!(&rx.recv().await.unwrap()[..], b"hello");
     // 控制通道不应收到 ReqWorkConn。
@@ -176,7 +185,16 @@ async fn datagram_delivered_to_pending_session() {
     );
     proxy.pending_client.lock().insert(peer, 5);
 
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"again").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"again",
+        Instant::now(),
+    )
+    .await;
 
     assert_eq!(&rx.recv().await.unwrap()[..], b"again");
     assert!(ctl_rx.try_recv().is_err());
@@ -206,7 +224,15 @@ async fn datagram_dropped_when_session_channel_full() {
 
     tokio::time::timeout(
         Duration::from_millis(500),
-        handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop"),
+        handle_datagram(
+            &proxy,
+            "udp-x",
+            &session,
+            &state,
+            peer,
+            b"drop",
+            Instant::now(),
+        ),
     )
     .await
     .expect("must not block on a full session channel");
@@ -245,7 +271,15 @@ async fn datagram_dropped_when_pending_channel_full() {
 
     tokio::time::timeout(
         Duration::from_millis(500),
-        handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop"),
+        handle_datagram(
+            &proxy,
+            "udp-x",
+            &session,
+            &state,
+            peer,
+            b"drop",
+            Instant::now(),
+        ),
     )
     .await
     .expect("must not block on a full pending channel");
@@ -301,7 +335,16 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
     let state = ServerState::new();
     let peer: SocketAddr = "127.0.0.1:1003".parse().unwrap();
 
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"first").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"first",
+        Instant::now(),
+    )
+    .await;
 
     // 触发 ReqWorkConn，携带正确 proxy_name 与 work_id。
     let msg = ctl_rx.recv().await.expect("ReqWorkConn sent");
@@ -369,8 +412,26 @@ async fn udp_metrics_track_pending_paired_and_downstream_bytes() {
     let peer: SocketAddr = "127.0.0.1:1006".parse().unwrap();
 
     // 首包 + pending 窗口期的后续包都要计入上行。
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"first").await;
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"second").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"first",
+        Instant::now(),
+    )
+    .await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"second",
+        Instant::now(),
+    )
+    .await;
     let up = proxy
         .stats
         .bytes_up
@@ -418,7 +479,16 @@ async fn udp_metrics_track_pending_paired_and_downstream_bytes() {
     );
 
     // 已配对会话的上行。
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"paired").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"paired",
+        Instant::now(),
+    )
+    .await;
     assert_eq!(
         proxy
             .stats
@@ -649,7 +719,16 @@ async fn datagram_dropped_when_pending_limit_reached() {
     }
 
     let peer: SocketAddr = "127.0.0.1:65500".parse().unwrap();
-    handle_datagram(&proxy, "udp-x", &session, &state, peer, b"drop-me").await;
+    handle_datagram(
+        &proxy,
+        "udp-x",
+        &session,
+        &state,
+        peer,
+        b"drop-me",
+        Instant::now(),
+    )
+    .await;
 
     assert_eq!(
         proxy.pending_by_id.lock().len(),

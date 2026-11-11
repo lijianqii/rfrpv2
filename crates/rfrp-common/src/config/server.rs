@@ -221,6 +221,11 @@ impl ProxySection {
                 ranges.push((p, p));
             }
         }
+        if ranges.is_empty() && !trimmed.is_empty() {
+            return Err(config(
+                "allow_ports contains no valid port or range (remove the value to allow all)",
+            ));
+        }
         Ok(ranges)
     }
 

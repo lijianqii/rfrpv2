@@ -152,7 +152,8 @@ fn status_json(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> serde_json::
         "rtt_ms": metrics.rtt_ms(),
         "server": format!("{}:{}", cfg.client.server_addr, cfg.client.server_port),
         "tls": cfg.client.tls_enable,
-        "work_conn_tls": cfg.client.work_conn_tls,
+        "work_conn_tls": metrics.work_conn_tls(),
+        "work_conn_tls_configured": cfg.client.work_conn_tls,
         "proxies": proxies,
         "metrics": {
             "reconnects_total": metrics.reconnects_total.load(std::sync::atomic::Ordering::Relaxed),

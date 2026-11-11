@@ -306,8 +306,11 @@ async fn run_udp_listener(
                 match r {
                     Ok((n, peer)) => {
                         recv_retry.record_ok();
-                        handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n]).await;
-                        drain_socket_batch(&proxy, &proxy_name, &session, &state, &mut buf).await;
+                        // 同一批数据处理共用一次时钟读取；UDP 高包速率下避免每包
+                        // 调 Instant::now()（Windows 上尤其明显）。
+                        let now = Instant::now();
+                        handle_datagram(&proxy, &proxy_name, &session, &state, peer, &buf[..n], now).await;
+                        drain_socket_batch(&proxy, &proxy_name, &session, &state, &mut buf, now).await;
                     }
                     Err(e) => {
                         // 瞬时错误（Windows 上此前的 send_to 若引来 ICMP port unreachable，
@@ -352,13 +355,14 @@ async fn handle_datagram(
     state: &Arc<ServerState>,
     peer: SocketAddr,
     data: &[u8],
+    now: Instant,
 ) {
     // 已配对会话：直接转发到工作连接。
     let tx = {
         let mut sessions = proxy.sessions.lock();
         match sessions.get_mut(&peer) {
             Some(s) => {
-                s.last_active = Instant::now();
+                s.last_active = now;
                 Some(s.tx.clone())
             }
             None => None,
@@ -467,7 +471,7 @@ async fn handle_datagram(
             client: peer,
             tx: tx.clone(),
             rx,
-            created: Instant::now(),
+            created: now,
         },
     );
     proxy.pending_client.lock().insert(peer, work_id);
@@ -553,11 +557,12 @@ async fn drain_socket_batch(
     session: &Arc<Session>,
     state: &Arc<ServerState>,
     buf: &mut [u8],
+    now: Instant,
 ) {
     for _ in 1..UDP_RECV_BATCH {
         match proxy.socket.try_recv_from(buf) {
             Ok((n, peer)) => {
-                handle_datagram(proxy, proxy_name, session, state, peer, &buf[..n]).await;
+                handle_datagram(proxy, proxy_name, session, state, peer, &buf[..n], now).await;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -594,7 +599,7 @@ pub async fn handle_udp_work_conn(
         return Ok(());
     }
 
-    tracing::info!(client = %client, work_id, "udp work connection established");
+    tracing::debug!(client = %client, work_id, "udp work connection established");
     let mut rx = rx;
     let mut stream = stream;
     // 上行批量写缓冲 + 批量收集：把"队列里已就绪的多个数据报"合并成一次 write。
@@ -688,8 +693,10 @@ async fn forward_to_client(
         );
         return;
     }
+    // 同一批下行数据报只更新一次全局/每代理计数，降低高 PPS 下的原子争用。
+    let bytes: usize = frames.iter().map(|d| d.len()).sum();
+    record_down(proxy, bytes);
     for d in frames {
-        record_down(proxy, d.len());
         if let Err(e) = proxy.socket.send_to(d, client).await {
             tracing::warn!(work_id, error = %e, "udp send_to client error");
         }

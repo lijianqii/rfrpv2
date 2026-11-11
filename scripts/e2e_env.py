@@ -222,11 +222,11 @@ def udp_probe(port: int) -> bool:
             return False
 
 
-def wait_until(predicate, timeout: float, interval: float = 0.5) -> bool:
+def wait_until(predicate, timeout: float, interval: float = 0.6) -> bool:
     """轮询等待。
 
-    interval 默认 0.5s：Dashboard 对每个来源 IP 限速 100 次/分钟，
-    `/healthz` 也受该限速约束，高频轮询会把自己挡在 429 上。
+    interval 默认 0.6s：Dashboard 对每个来源 IP 限速 100 次/分钟，
+    `/healthz` 也受该限速约束；0.5s 恰好是 120 次/分钟，会把自己挡在 429 上。
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

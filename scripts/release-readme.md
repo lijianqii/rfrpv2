@@ -52,6 +52,9 @@ sudo systemctl enable --now rfrp-server   # 或 rfrp-client
 ```
 
 > 建议在配置中显式设置 `run_id_file = "/var/lib/rfrp/run_id"`，并保持服务用户可写。
+> unit 已设置 `LimitNOFILE`，并通过 `StateDirectory`/`LogsDirectory` 自动创建
+> `/var/lib/rfrp`、`/var/log/rfrp`。需要绑定 <1024 端口时，请使用 unit 中注释的
+> `AmbientCapabilities=CAP_NET_BIND_SERVICE`（`NoNewPrivileges` 下 setcap 不会生效）。
 
 ## 校验
 

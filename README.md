@@ -96,7 +96,7 @@ cargo run -- client -c examples/rfrp-client.toml
 
 服务端示例监听 `0.0.0.0:7000`（`bind_addr` 默认值，可按需改为回环地址），客户端通过 TLS 连接并注册 TCP 代理。
 
-启动前可先用 `--check` 只校验配置并打印生效摘要（不监听端口、不建连，不会打印 token 明文）：
+启动前可先用 `--check` 只校验配置并打印生效摘要（不监听端口、不建连，不会打印 token 明文；会一并校验 `--grace-secs` 等 CLI 覆盖）：
 
 ```bash
 rfrp server -c examples/rfrp-server.toml --check

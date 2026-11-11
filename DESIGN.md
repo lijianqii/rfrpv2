@@ -618,7 +618,8 @@ SUBCOMMANDS:
 
 > 规则：CLI 参数覆盖配置文件同名字段；`-c` 与字段参数可组合（先加载配置文件，再用 CLI 参数覆盖）。
 > 两个子命令均支持 `--check`：只加载、覆盖、校验配置并打印生效摘要（token 不打印明文），
-> 不监听端口 / 不建立连接。`-c` 缺省时打印用法提示并以非零退出码结束。
+> 不监听端口 / 不建立连接。CLI 覆盖（含 `--grace-secs`）也在此阶段校验。
+> `-c` 缺省时打印用法提示并以非零退出码结束。
 >
 > 另有 `rfrp client status [-c <config>] [--addr <host:port>]`（查询本地 `status_addr` 端点）
 > 与 `rfrp completions <shell>`（生成补全脚本）。

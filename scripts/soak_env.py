@@ -209,13 +209,28 @@ def summarize(
         value = sample.get("resources", {}).get(key)
         return value if isinstance(value, int) else None
 
-    first = samples[0] if samples else {}
     last = samples[-1] if samples else {}
-    server_fd_first = resource_value(first, "server_fd")
+    # 计划重启会替换进程：基线必须取“最后一个 server/client 进程的首次样本”，
+    # 不能跨代比较 fd/RSS，否则会误报泄漏或掩盖泄漏。
+    last_server_pid = resource_value(last, "server_pid")
+    last_client_pid = resource_value(last, "client_pid")
+    server_samples = [
+        s for s in samples
+        if last_server_pid is None
+        or resource_value(s, "server_pid") == last_server_pid
+    ]
+    client_samples = [
+        s for s in samples
+        if last_client_pid is None
+        or resource_value(s, "client_pid") == last_client_pid
+    ]
+    server_first = server_samples[0] if server_samples else (samples[0] if samples else {})
+    client_first = client_samples[0] if client_samples else (samples[0] if samples else {})
+    server_fd_first = resource_value(server_first, "server_fd")
     server_fd_last = resource_value(last, "server_fd")
-    client_fd_first = resource_value(first, "client_fd")
+    client_fd_first = resource_value(client_first, "client_fd")
     client_fd_last = resource_value(last, "client_fd")
-    server_rss_first = resource_value(first, "server_rss_kib")
+    server_rss_first = resource_value(server_first, "server_rss_kib")
     server_rss_last = resource_value(last, "server_rss_kib")
 
     # 后半程 RSS 线性斜率（MiB/小时）。短测试只作为参考，不用于强判定。
@@ -223,7 +238,12 @@ def summarize(
     tail = [
         (s["elapsed"], s["resources"]["server_rss_kib"] / 1024.0)
         for s in samples
-        if s["elapsed"] >= half and isinstance(s.get("resources", {}).get("server_rss_kib"), int)
+        if s["elapsed"] >= half
+        and isinstance(s.get("resources", {}).get("server_rss_kib"), int)
+        and (
+            last_server_pid is None
+            or resource_value(s, "server_pid") == last_server_pid
+        )
     ]
     rss_slope_mib_per_hour: Optional[float] = None
     if len(tail) >= 3:
@@ -529,6 +549,8 @@ def main() -> int:
                 "error": str(exc),
             }
         record["resources"] = {
+            "server_pid": stack.server_proc.pid,
+            "client_pid": stack.client_proc.pid,
             "server_fd": base.process_fd_count(stack.server_proc.pid),
             "client_fd": base.process_fd_count(stack.client_proc.pid),
             "server_rss_kib": base.process_rss_kib(stack.server_proc.pid),

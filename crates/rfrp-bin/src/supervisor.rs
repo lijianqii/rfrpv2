@@ -60,7 +60,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     let base_args: Vec<OsString> = args.into_iter().skip(1).collect();
 
     // 监听必须在读取/校验初始配置之前建立，避免启动窗口内的变更被漏掉。
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(1);
     let _watcher = match watch_config_file(&config, event_tx) {
         Ok(watcher) => watcher,
         Err(e) => {
@@ -366,7 +366,7 @@ async fn spawn_rollback_with_retry(
     exe: &Path,
     old_args: &[OsString],
     shutdown: &CancellationToken,
-    event_rx: &mut mpsc::UnboundedReceiver<()>,
+    event_rx: &mut mpsc::Receiver<()>,
     config: &Path,
     base_args: &[OsString],
     generation: &mut u64,

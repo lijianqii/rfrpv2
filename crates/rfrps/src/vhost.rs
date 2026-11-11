@@ -127,7 +127,7 @@ pub async fn run_https_vhost(
                                         .get_ref()
                                         .1
                                         .server_name()
-                                        .map(|s| s.to_string());
+                                        .map(|s| s.to_ascii_lowercase());
                                     let _ = handle_https_connection(sni, tls_stream, state).await;
                                 }
                             }
@@ -182,12 +182,11 @@ async fn route_and_dispatch(
     state: Arc<ServerState>,
 ) -> Result<()> {
     let mut stream = stream;
-    // 域名大小写不敏感，统一小写后路由。
-    let host = host.to_lowercase();
+    // 调用方已把 Host/SNI 统一转为 ASCII 小写；不在这里再次分配。
     let (session, proxy_name) = match state.session_for_domain(&host) {
         Some(x) => x,
         None => {
-            tracing::warn!(host = %host, "no vhost proxy matched, returning 404");
+            tracing::debug!(host = %host, "no vhost proxy matched, returning 404");
             // 返回 404 而不是静默断连：用户/上游 LB 能明确区分"没有这个 vhost"与
             // "链路故障"，也避免浏览器显示连接重置。
             return respond_not_found(&mut stream).await;
@@ -201,7 +200,7 @@ async fn route_and_dispatch(
         .map(|e| e.kind == expected_kind)
         .unwrap_or(false);
     if !kind_ok {
-        tracing::warn!(host = %host, proxy = %proxy_name, "proxy type mismatch, returning 404");
+        tracing::debug!(host = %host, proxy = %proxy_name, "proxy type mismatch, returning 404");
         return respond_not_found(&mut stream).await;
     }
 
@@ -265,13 +264,25 @@ where
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&buf) {
-            Ok(httparse::Status::Complete(_)) => {
-                let host = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("host"))
-                    .and_then(|h| std::str::from_utf8(h.value).ok())
-                    .map(|h| strip_port(h).to_string());
+            Ok(httparse::Status::Complete(header_len)) => {
+                if header_len > 64 * 1024 {
+                    tracing::warn!("vhost request head too large, closing");
+                    return Ok(None);
+                }
+                let mut host = None;
+                for h in req.headers.iter() {
+                    if h.name.eq_ignore_ascii_case("host") {
+                        if host.is_some() {
+                            tracing::warn!("duplicate vhost Host header, closing");
+                            return Ok(None);
+                        }
+                        if let Ok(value) = std::str::from_utf8(h.value) {
+                            // 路由层只接受 ASCII 域名；统一小写，避免 Unicode
+                            // 大小写映射把 Host 路由到另一个注册域名。
+                            host = Some(strip_port(value).to_ascii_lowercase());
+                        }
+                    }
+                }
                 let stream: BoxedStream = Box::new(PrependStream::new(buf, Box::new(stream)));
                 // HTTP/1.1 要求 Host 头；缺失时用空 host 走路由，由路由层回 404，
                 // 而不是静默断连（用户能看到明确原因）。
@@ -374,6 +385,15 @@ mod head_tests {
             .await
             .unwrap();
         drop(a);
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_duplicate_host() {
+        let (mut a, b) = duplex(1024);
+        a.write_all(b"GET / HTTP/1.1\r\nHost: a.example.com\r\nHost: b.example.com\r\n\r\n")
+            .await
+            .unwrap();
         assert!(read_request_head(b).await.unwrap().is_none());
     }
 

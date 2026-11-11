@@ -122,7 +122,7 @@ where
         }
     };
 
-    tracing::info!(%proxy_name, work_id, "work connection established");
+    tracing::debug!(%proxy_name, work_id, "work connection established");
     // stream 已越过 StartWorkConn 首帧，剩余为透传字节；直接桥接。
     let _ = bridge(user, stream).await;
     tracing::debug!(%proxy_name, work_id, "work bridge finished");

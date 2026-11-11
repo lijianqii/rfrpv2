@@ -38,7 +38,7 @@ soak: build
 # 1 小时 release 标准档；8 小时：make soak-long SOAK_LONG_SECS=28800
 soak-long:
 	cargo build --release --all
-	E2E_SOAK_SECS=$(SOAK_LONG_SECS) E2E_SOAK_TCP_INTERVAL_MS=100 E2E_SOAK_UDP_INTERVAL_MS=50 RFRP_BIN=target/release/rfrp python3 scripts/soak_env.py
+	E2E_SOAK_SECS=$(SOAK_LONG_SECS) E2E_SOAK_TCP_INTERVAL_MS=100 E2E_SOAK_UDP_INTERVAL_MS=50 E2E_SOAK_STRICT=1 RFRP_BIN=target/release/rfrp python3 scripts/soak_env.py
 
 # CI 等价流程：格式化检查 + Clippy 严格 + 构建 + 测试
 ci: fmt-check clippy build test
