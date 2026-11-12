@@ -135,8 +135,31 @@ pub async fn write_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::time::timeout(
+    write_response_with_timeout(
+        stream,
+        status,
+        content_type,
+        body,
+        extra_header,
         Duration::from_secs(crate::constants::HTTP_RESPONSE_TIMEOUT),
+    )
+    .await
+}
+
+/// 与 [`write_response`] 相同，但响应写超时可注入（测试用）。
+async fn write_response_with_timeout<W>(
+    stream: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra_header: Option<&str>,
+    timeout: Duration,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(
+        timeout,
         write_response_inner(stream, status, content_type, body, extra_header),
     )
     .await
@@ -273,6 +296,48 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(text.contains("WWW-Authenticate: Basic realm=\"x\"\r\n"));
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn response_write_times_out_on_stalled_client() {
+        let mut writer = PendingWriter;
+        let err = write_response_with_timeout(
+            &mut writer,
+            200,
+            "text/plain",
+            "hello",
+            None,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("stalled writer must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]

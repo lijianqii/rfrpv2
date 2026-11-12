@@ -852,6 +852,29 @@ mod global_limit_tests {
     }
 
     #[test]
+    fn repeated_proxy_reservation_is_idempotent() {
+        let state = ServerState::new();
+        let session = test_session("r1");
+        assert!(state.reserve_proxy("web", &session).is_ok());
+        assert!(
+            state.reserve_proxy("web", &session).is_ok(),
+            "same owner must be allowed to re-reserve"
+        );
+    }
+
+    #[test]
+    fn repeated_domain_reservation_is_idempotent() {
+        let state = ServerState::new();
+        let session = test_session("r1");
+        let domains = vec!["a.example.com".to_string()];
+        assert!(state.reserve_domains(&domains, &session, "web").is_ok());
+        assert!(
+            state.reserve_domains(&domains, &session, "web").is_ok(),
+            "same owner/proxy must be allowed to re-reserve"
+        );
+    }
+
+    #[test]
     fn pooled_slots_are_saturated() {
         let state = ServerState::new();
         state

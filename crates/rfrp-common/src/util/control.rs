@@ -52,9 +52,25 @@ pub async fn send_with_timeout_reserved(
     msg: Message,
     reserve: usize,
 ) -> bool {
+    send_with_timeout_reserved_with_timeout(
+        tx,
+        msg,
+        reserve,
+        Duration::from_secs(CONTROL_SEND_TIMEOUT),
+    )
+    .await
+}
+
+/// 与 [`send_with_timeout_reserved`] 相同，但等待超时可注入（测试用）。
+async fn send_with_timeout_reserved_with_timeout(
+    tx: &mpsc::Sender<Message>,
+    msg: Message,
+    reserve: usize,
+    timeout: Duration,
+) -> bool {
     // 小容量测试通道/自定义通道不能被 reserve 卡死：保留至多 max_capacity-1 个槽位。
     let reserve = reserve.min(tx.max_capacity().saturating_sub(1));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(CONTROL_SEND_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if tx.capacity() > reserve {
             return send_with_timeout(tx, msg).await;
@@ -159,6 +175,24 @@ mod reserved_tests {
                 .await
                 .unwrap()
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_send_times_out_when_channel_stays_full() {
+        let (tx, _rx) = mpsc::channel::<Message>(4);
+        for ts in 0..4 {
+            tx.try_send(Message::Heartbeat(Heartbeat { ts })).unwrap();
+        }
+        assert!(
+            !send_with_timeout_reserved_with_timeout(
+                &tx,
+                Message::Heartbeat(Heartbeat { ts: 9 }),
+                4,
+                std::time::Duration::from_millis(100),
+            )
+            .await,
+            "must give up after the injected timeout"
         );
     }
 }

@@ -153,3 +153,45 @@ async fn status_endpoint_rate_limits_excess_requests() {
     srv.abort();
     cli.abort();
 }
+
+#[tokio::test]
+async fn status_healthz_reports_unhealthy_without_control_connection() {
+    // 控制连接尚未建立时，/healthz 必须返回 503，供守护进程/负载均衡判断不可用。
+    let status_port = free_port();
+    let server_port = free_port();
+    let run_id = std::env::temp_dir().join(format!(
+        "rfrp-status-runid-{}-{}",
+        std::process::id(),
+        status_port
+    ));
+    let mut cfg = client_config(
+        (std::net::Ipv4Addr::LOCALHOST, server_port).into(),
+        vec![],
+        Some(run_id.to_string_lossy().into_owned()),
+    );
+    cfg.client.status_addr = Some(format!("127.0.0.1:{status_port}"));
+    let cli = start_client(cfg).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok((status, body)) = http_get(status_port, "/healthz").await {
+            assert_eq!(
+                status, 503,
+                "unconnected client must report unhealthy: {body}"
+            );
+            assert!(
+                body.contains("control connection down"),
+                "unexpected health body: {body}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "status endpoint did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cli.stop().await;
+    let _ = std::fs::remove_file(&run_id);
+}

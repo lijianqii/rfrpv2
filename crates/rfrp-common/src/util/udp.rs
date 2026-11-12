@@ -227,6 +227,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_header_returns_unexpected_eof() {
+        let (mut a, mut b) = duplex(16);
+        a.write_all(&[0, 0, 0]).await.unwrap();
+        drop(a);
+        let mut data = Vec::new();
+        let err = read_udp_frame_into(&mut b, &mut data)
+            .await
+            .expect_err("partial header must not look like clean EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
     async fn read_into_reuses_buffer() {
         // 复用缓冲：第二次读取覆盖第一次内容，不残留旧数据。
         let (mut a, mut b) = duplex(1024);

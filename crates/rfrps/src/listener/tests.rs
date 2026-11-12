@@ -740,3 +740,93 @@ async fn register_rejects_beyond_proxy_limit() {
         .unwrap_err();
     assert_eq!(err, ProxyError::TooManyProxies);
 }
+
+#[tokio::test]
+async fn register_rejects_global_proxy_limit() {
+    // 全局代理总数达到配置上限后，新名字必须返回 TooManyProxies，
+    // 而不是只报 NameExists 或继续占用端口。
+    let state = ServerState::new();
+    state
+        .max_total_proxies
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+
+    let first = NewProxy {
+        proxy_name: "global-a".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert!(register_proxy(&first, &session, &state, &cfg).await.is_ok());
+
+    let second = NewProxy {
+        proxy_name: "global-b".into(),
+        r#type: ProxyType::Tcp,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert_eq!(
+        register_proxy(&second, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::TooManyProxies
+    );
+}
+
+#[tokio::test]
+async fn register_rejects_global_domain_limit() {
+    // 全局域名索引达到配置上限后，新域名必须返回 TooManyDomains。
+    let state = ServerState::new();
+    state
+        .max_total_domains
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+
+    let first = NewProxy {
+        proxy_name: "web-a".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["a.example.com".into()]),
+    };
+    assert!(register_proxy(&first, &session, &state, &cfg).await.is_ok());
+
+    let second = NewProxy {
+        proxy_name: "web-b".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["b.example.com".into()]),
+    };
+    assert_eq!(
+        register_proxy(&second, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::TooManyDomains
+    );
+}
+
+#[tokio::test]
+async fn register_udp_occupied_port_returns_port_occupied() {
+    // UDP 端口占用必须映射为可重试的 PortOccupied，而不是笼统的 Internal。
+    let blocker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let occupied = blocker.local_addr().unwrap().port();
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+    let np = NewProxy {
+        proxy_name: "udp-occupied".into(),
+        r#type: ProxyType::Udp,
+        remote_port: Some(occupied),
+        custom_domains: None,
+    };
+    assert_eq!(
+        register_proxy(&np, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::PortOccupied
+    );
+}

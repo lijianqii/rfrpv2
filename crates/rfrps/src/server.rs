@@ -552,6 +552,7 @@ enum MaybeTls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn silent_connection_is_dropped_by_peek_timeout() {
@@ -580,5 +581,121 @@ mod tests {
             "must not hang: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_before_first_byte_is_clean() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        drop(client);
+        let res = handle_connection(
+            server,
+            ServerState::new(),
+            Arc::new(ServerConfig::default()),
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(res.is_ok(), "EOF before first byte must be a clean close");
+    }
+
+    #[tokio::test]
+    async fn unexpected_first_frame_is_closed_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        // 合法版本 + 未知消息类型：应被识别为“非 rfrp 客户端”并安静关闭。
+        let mut bytes = vec![rfrp_common::constants::PROTOCOL_VERSION, 0x7f];
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        client.write_all(&bytes).await.unwrap();
+
+        let res = handle_connection(
+            server,
+            ServerState::new(),
+            Arc::new(ServerConfig::default()),
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn plaintext_work_connection_rejected_when_tls_required() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let frame = rfrp_common::protocol::msg::Message::StartWorkConn(
+            rfrp_common::protocol::msg::StartWorkConn {
+                proxy_name: "web".into(),
+                work_id: 1,
+                work_conn_token: None,
+            },
+        )
+        .to_frame()
+        .unwrap();
+        let mut bytes = vec![frame.version, frame.msg_type];
+        bytes.extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&frame.payload);
+        client.write_all(&bytes).await.unwrap();
+
+        let mut cfg = ServerConfig::default();
+        cfg.server.tls_enable = false;
+        cfg.server.work_conn_tls = true;
+        let res = handle_connection(
+            server,
+            ServerState::new(),
+            Arc::new(cfg),
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handshake_limit_rejects_before_reading_frame() {
+        let state = ServerState::new();
+        let guards: Vec<_> = (0..rfrp_common::constants::MAX_UNAUTHENTICATED_CONNECTIONS)
+            .map(|_| state.begin_handshake().expect("under limit"))
+            .collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let res = handle_connection(
+            server,
+            state.clone(),
+            Arc::new(ServerConfig::default()),
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(res.is_ok(), "over-limit handshake must be dropped cleanly");
+        drop(guards);
+    }
+
+    #[test]
+    fn classifies_expected_peer_errors() {
+        use std::io::ErrorKind;
+        assert!(is_expected_peer_error(&Error::Io(std::io::Error::new(
+            ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(is_expected_peer_error(&Error::Protocol("bad frame".into())));
+        assert!(!is_expected_peer_error(&Error::Config("bad config".into())));
     }
 }

@@ -384,11 +384,21 @@ async fn spawn_and_check(
     child_args: &[OsString],
     ready: &Path,
 ) -> std::result::Result<(Child, Duration), String> {
+    spawn_and_check_with_timeout(exe, child_args, ready, STARTUP_TIMEOUT).await
+}
+
+/// 与 [`spawn_and_check`] 相同，但启动超时可注入，便于单测覆盖超时分支。
+async fn spawn_and_check_with_timeout(
+    exe: &Path,
+    child_args: &[OsString],
+    ready: &Path,
+    startup_timeout: Duration,
+) -> std::result::Result<(Child, Duration), String> {
     let _ = fs::remove_file(ready);
     let mut child = spawn_child(exe, child_args, ready)
         .await
         .map_err(|e| format!("spawn failed: {e}"))?;
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let deadline = Instant::now() + startup_timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -546,12 +556,17 @@ async fn wait_or_shutdown(backoff: Duration, shutdown: &CancellationToken) -> bo
 }
 
 async fn stop_child(child: &mut Child, grace: Duration) {
+    stop_child_with_margin(child, grace, STOP_MARGIN).await;
+}
+
+/// 与 [`stop_child`] 相同，但停止余量可注入，便于单测覆盖 kill 兜底。
+async fn stop_child_with_margin(child: &mut Child, grace: Duration, margin: Duration) {
     if let Some(stdin) = child.stdin.as_mut() {
         let _ = stdin.write_all(b"shutdown\n").await;
         let _ = stdin.flush().await;
     }
     // 子进程会按 effective grace 排空在途连接；这里只做硬上限兜底。
-    let wait = grace.saturating_add(STOP_MARGIN);
+    let wait = grace.saturating_add(margin);
     match timeout(wait, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
@@ -701,5 +716,79 @@ mod tests {
         assert_eq!(path.parent(), config.parent());
         assert!(path.to_string_lossy().contains("stage"));
         assert!(path.to_string_lossy().contains(".7."));
+    }
+
+    #[cfg(unix)]
+    fn temp_ready_path(label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rfrp-supervisor-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("child.ready");
+        (dir, ready)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_check_reports_child_exit() {
+        let (dir, ready) = temp_ready_path("exit");
+        let err = spawn_and_check_with_timeout(
+            Path::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("exit 7")],
+            &ready,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("child exited during startup"), "{err}");
+        assert!(!ready.exists(), "failed startup must clean ready file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_check_times_out_without_ready_file() {
+        let (dir, ready) = temp_ready_path("timeout");
+        let started = Instant::now();
+        let err = spawn_and_check_with_timeout(
+            Path::new("/bin/sleep"),
+            &[OsString::from("5")],
+            &ready,
+            Duration::from_millis(150),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("startup timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait for the child's natural exit"
+        );
+        assert!(!ready.exists(), "timed-out startup must clean ready file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_child_kills_after_margin_expires() {
+        let (dir, ready) = temp_ready_path("stop");
+        let mut child = spawn_child(Path::new("/bin/sleep"), &[OsString::from("5")], &ready)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        stop_child_with_margin(&mut child, Duration::ZERO, Duration::from_millis(150)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "kill fallback must not wait indefinitely"
+        );
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "child must be killed when grace expires"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

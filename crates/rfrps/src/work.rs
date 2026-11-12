@@ -329,4 +329,29 @@ mod global_pool_tests {
         assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 1);
         drop((keep1, keep2));
     }
+
+    #[tokio::test]
+    async fn cancelled_session_releases_pooled_slot() {
+        // 拿到全局名额后会话已停止：连接不得入池，名额必须归还。
+        let (state, session) = super::tests::state_with_session("tok");
+        session.stop.cancel();
+        let (keep, server) = tokio::io::duplex(8);
+        assert!(handle_work_connection(
+            super::tests::start_frame("ssh", WORK_ID_POOL_RESERVED, Some("tok")),
+            server,
+            state.clone()
+        )
+        .await
+        .is_ok());
+        assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 0);
+        assert!(
+            session
+                .pools
+                .lock()
+                .get("ssh")
+                .map_or(true, |p| p.is_empty()),
+            "cancelled session must not keep pooled connections"
+        );
+        drop(keep);
+    }
 }

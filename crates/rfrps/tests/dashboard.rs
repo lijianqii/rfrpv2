@@ -86,6 +86,33 @@ async fn dashboard_rate_limits_excess_requests() {
 }
 
 #[tokio::test]
+async fn dashboard_auth_failures_are_rate_limited() {
+    // 连续输错 Basic 凭据后，同一 IP 的后续请求（即使凭据正确）也应先收到 429，
+    // 防止密码爆破；Retry-After 必须可被标准 HTTP 客户端读取。
+    let port = free_port();
+    let (srv, _addr) = start_server(dashboard_config(port)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let bad = basic_auth("admin", "wrong-password");
+    for i in 0..5 {
+        let (status, _) = http_get(port, "/api/status", Some(&bad)).await;
+        assert_eq!(status, 401, "failure #{i} must still be a normal 401");
+    }
+
+    let (status, resp) = http_get(port, "/api/status", Some(&bad)).await;
+    assert_eq!(status, 429, "6th failure must be rate limited: {resp}");
+    assert!(
+        resp.to_ascii_lowercase().contains("retry-after:"),
+        "429 must include Retry-After: {resp}"
+    );
+
+    let (status, _) = http_get(port, "/api/status", Some(&basic_auth("admin", "secret123"))).await;
+    assert_eq!(status, 429, "blocked IP must not bypass the limiter");
+
+    srv.abort();
+}
+
+#[tokio::test]
 async fn dashboard_browser_gets_login_page() {
     // 浏览器直接访问 ip:port 时应拿到可填写的登录表单，而不是干巴巴的 Unauthorized。
     let port = free_port();
