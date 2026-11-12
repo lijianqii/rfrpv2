@@ -345,7 +345,7 @@ Windows 说明：混沌测试在 Windows 上使用 `GenerateConsoleCtrlEvent(CTR
 
 ## 注意事项
 
-- **Windows 杀毒软件误报**：rfrp 是内网穿透/反代工具，与 frp、nps、ngrok 等同类，Windows 安全软件可能将其归类为 `HackTool`/`RiskWare` 风险工具。二进制已嵌入版本信息/清单/图标以降低启发式误报，但无法消除功能特征归类；加入信任区或代码签名可解决，详见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md)。
+- **Windows 杀毒软件误报**：rfrp 是内网穿透/反代工具，与 frp、nps、ngrok 等同类，Windows 安全软件可能将其归类为 `HackTool`/`RiskWare` 风险工具。二进制已嵌入版本信息/清单/图标以降低启发式误报，但无法消除功能特征归类；加入信任区或代码签名可解决，详见 [docs/WINDOWS_ANTIVIRUS.md](docs/WINDOWS_ANTIVIRUS.md)。Windows 发布前运行时验证项目见 [docs/WINDOWS_VERIFICATION.md](docs/WINDOWS_VERIFICATION.md)。
 - **`pool_size` 与有状态服务**：预热会建立一条空闲本地连接，sshd/RDP 等服务可能将其超时踢除。服务端出池前会探活并跳过死连接（自动回退按需建立），因此 `pool_size = 1` 可安全使用；若日志频繁出现 `discarded dead pooled work connection`，说明本地服务踢除较快，预热收益有限但不影响功能。
 - **短连接密集 + `work_conn_tls` 时建议 `pool_size = 4`**：实测（见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)）
   每连接"建连 + 首字节"耗时在 `pool_size=1` 下约 314 µs，提到 4 后降到约 215 µs（−32%）——
