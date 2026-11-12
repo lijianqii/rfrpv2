@@ -18,7 +18,7 @@ use rfrp_common::constants::{
 use rfrp_common::crypto::ClientTls;
 use rfrp_common::error::Result as RfrpResult;
 use rfrp_common::protocol::msg::*;
-use rfrp_common::util::control::send_with_timeout;
+use rfrp_common::util::control::{send_with_timeout_reserved, CONTROL_HEARTBEAT_RESERVE};
 use rfrp_common::util::platform::default_run_id_path;
 use rfrp_common::util::signal::spawn_signal_watcher;
 use rfrp_common::util::stream::BoxedStream;
@@ -502,9 +502,9 @@ impl Client {
     /// 生成或复用 run_id 并持久化（§6.6 / §8.3 重连身份）。
     fn load_or_create_run_id(&self) -> String {
         let path = resolve_run_id_path(&self.config.client.run_id_file);
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            let s = s.trim().to_string();
+        if let Some(s) = read_run_id_limited(&path) {
             if !s.is_empty() && s.len() <= MAX_RUN_ID_LEN && uuid::Uuid::parse_str(&s).is_ok() {
+                set_file_mode_0600(&path);
                 return s;
             }
         }
@@ -512,25 +512,20 @@ impl Client {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // 先写同目录临时文件，设置 0600 后再原子 rename，避免写到一半留下
+        // 先写同目录临时文件，设置 0600 后原子 rename，避免写到一半留下
         // 空/截断的 run_id 文件，也避免权限设置在明文写入之后才生效。
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("run_id");
         let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-        let written = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            std::io::Write::write_all(&mut f, rid.as_bytes())
-        })();
-        match written {
+        match write_run_id_temp(&tmp, &rid) {
             Ok(()) => {
                 set_file_mode_0600(&tmp);
-                if let Err(e) = std::fs::rename(&tmp, &path) {
-                    // Windows 上目标已存在时 rename 可能失败；退化为先删后改名。
-                    let _ = std::fs::remove_file(&path);
-                    if let Err(e2) = std::fs::rename(&tmp, &path) {
-                        tracing::warn!(error = %e2, first_error = %e, "failed to persist run_id");
+                match replace_run_id_file(&tmp, &path) {
+                    Ok(()) => sync_parent_dir(&path),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to persist run_id");
                         let _ = std::fs::remove_file(&tmp);
                     }
                 }
@@ -543,6 +538,82 @@ impl Client {
         rid
     }
 }
+
+/// 只读取有限长度，避免指向超大文件时无界分配。
+fn read_run_id_limited(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take((MAX_RUN_ID_LEN + 1) as u64)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text.trim().to_string())
+}
+
+fn write_run_id_temp(path: &std::path::Path, rid: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, rid.as_bytes())?;
+    file.sync_all()
+}
+
+/// 优先原子替换；Windows 目标已存在时先备份旧文件，失败则恢复。
+fn replace_run_id_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("run_id");
+            let backup = path.with_file_name(format!(".{name}.{}.bak", uuid::Uuid::new_v4()));
+            let had_old = path.exists();
+            if had_old {
+                std::fs::rename(path, &backup)?;
+            }
+            match std::fs::rename(tmp, path) {
+                Ok(()) => {
+                    if had_old {
+                        let _ = std::fs::remove_file(&backup);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if had_old {
+                        if let Err(restore) = std::fs::rename(&backup, path) {
+                            tracing::warn!(
+                                first_error = %first,
+                                restore_error = %restore,
+                                "failed to restore run_id backup"
+                            );
+                        }
+                    }
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(error = %e, "failed to sync run_id directory");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) {}
 
 /// 解析配置中的 `run_id_file`。
 ///
@@ -616,7 +687,9 @@ fn login_rejection_is_fatal(resp: &LoginResp) -> bool {
 #[cfg(unix)]
 fn set_file_mode_0600(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to set run_id permissions");
+    }
 }
 #[cfg(not(unix))]
 fn set_file_mode_0600(_path: &std::path::Path) {}
@@ -646,7 +719,11 @@ async fn register_one_proxy(
     state.resps.lock().insert(p.name.clone(), otx);
     let sent = tokio::select! {
         _ = shutdown.cancelled() => false,
-        ok = send_with_timeout(tx, Message::NewProxy(new_proxy_from_config(p))) => ok,
+        ok = send_with_timeout_reserved(
+            tx,
+            Message::NewProxy(new_proxy_from_config(p)),
+            CONTROL_HEARTBEAT_RESERVE,
+        ) => ok,
     };
     if !sent {
         // 控制连接已断或正在退出：清理未消费的响应通道。

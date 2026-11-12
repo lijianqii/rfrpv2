@@ -18,7 +18,7 @@ use rfrp_common::constants::{
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::accept::AcceptRetry;
-use rfrp_common::util::control::send_with_timeout;
+use rfrp_common::util::control::{send_with_timeout_reserved, CONTROL_HEARTBEAT_RESERVE};
 use rfrp_common::util::udp::{enlarge_recv_buffer, write_udp_frames_buffered, UdpFrameBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -484,12 +484,13 @@ async fn handle_datagram(
     let proxy_cleanup = proxy.clone();
     let tracker = state.data_tasks.clone();
     tracker.spawn(async move {
-        if !send_with_timeout(
+        if !send_with_timeout_reserved(
             &tx_ctl,
             Message::ReqWorkConn(ReqWorkConn {
                 proxy_name: pname,
                 work_id,
             }),
+            CONTROL_HEARTBEAT_RESERVE,
         )
         .await
         {

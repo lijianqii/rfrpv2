@@ -95,6 +95,8 @@ cargo run -- client -c examples/rfrp-client.toml
 ```
 
 服务端示例监听 `0.0.0.0:7000`（`bind_addr` 默认值，可按需改为回环地址），客户端通过 TLS 连接并注册 TCP 代理。
+低内存部署应显式设置 `[server].max_active_connections`（如 2048~4096）；全局代理/域名/预热池
+数量分别由 `max_total_proxies`、`max_total_domains`、`max_total_pooled_work_conns` 限制。
 
 启动前可先用 `--check` 只校验配置并打印生效摘要（不监听端口、不建连，不会打印 token 明文；会一并校验 `--grace-secs` 等 CLI 覆盖）：
 

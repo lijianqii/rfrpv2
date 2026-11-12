@@ -399,7 +399,13 @@ where
                             }
                             Message::Heartbeat(h) => {
                                 tracing::debug!(session = %session_id, ts = h.ts, "heartbeat received");
-                                try_send(&tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts }));
+                                if !try_send(&tx, Message::HeartbeatResp(HeartbeatResp { ts: h.ts })) {
+                                    state.metrics.inc_heartbeat_resp_dropped();
+                                    tracing::debug!(
+                                        session = %session_id,
+                                        "heartbeat response dropped: control channel full"
+                                    );
+                                }
                             }
                             Message::HeartbeatResp(h) => {
                                 let sent = last_sent_ts.load(Ordering::Relaxed);

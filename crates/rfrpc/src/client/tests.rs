@@ -209,3 +209,22 @@ fn backoff_resets_only_after_stable_connection() {
     ));
     assert!(should_reset_backoff(true, Duration::from_secs(3600)));
 }
+
+#[cfg(unix)]
+#[test]
+fn run_id_file_is_private_and_oversized_read_is_limited() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("rfrp-test-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("run_id");
+    let rid = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+    assert!(uuid::Uuid::parse_str(&rid).is_ok());
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "run_id must be private");
+
+    // 超大文件只读取有限前缀，不应阻塞或按文件大小分配。
+    let huge = "x".repeat(1024 * 1024);
+    std::fs::write(&path, huge).unwrap();
+    let rid2 = Client::new(cfg_for(&path)).unwrap().load_or_create_run_id();
+    assert!(uuid::Uuid::parse_str(&rid2).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -855,6 +855,10 @@ heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
 udp_session_timeout_secs = 300   # UDP 会话空闲超时（秒，默认 300；RDP-UDP 建议 300-600）
 grace_secs = 30                  # 优雅退出宽限期（秒，默认 30，上限 3600）
+max_active_connections = 65536   # 并发用户连接上限；低内存机器建议 2048-4096
+max_total_proxies = 8192         # 全局代理总数上限
+max_total_domains = 16384        # 全局 vhost 域名总数上限
+max_total_pooled_work_conns = 8192 # 全局预热工作连接总数上限
 
 # TLS 分层说明（避免混淆）：
 #   1) 控制链路 TLS：tls_enable + tls_cert/tls_key，加密 rfrps↔rfrpc 控制连接

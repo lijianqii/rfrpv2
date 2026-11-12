@@ -21,7 +21,7 @@ use tokio::time::Duration;
 
 use crate::control::{ProxyEntry, Session};
 use crate::state::{PendingWork, ReserveError, ServerState};
-use rfrp_common::util::control::{send_with_timeout, try_send};
+use rfrp_common::util::control::{send_with_timeout_reserved, try_send, CONTROL_HEARTBEAT_RESERVE};
 
 /// 端口是否在 `allow_ports` 允许范围内（fail-closed：配置解析失败视为不允许）。
 fn port_allowed(config: &ServerConfig, port: u16) -> bool {
@@ -446,14 +446,17 @@ pub(crate) fn dispatch_user_connection<S>(
             let _ = bridge(user, work).await;
             tracing::debug!(proxy = %pname, "pooled work bridge finished");
         });
-        // 立即请求补充预热连接（无需等待本次用户断开）；通道满时跳过本次补充。
-        try_send(
-            &session.tx,
-            Message::ReqWorkConn(ReqWorkConn {
-                proxy_name,
-                work_id: WORK_ID_POOL_RESERVED,
-            }),
-        );
+        // 立即请求补充预热连接（无需等待本次用户断开）；为心跳保留槽位后
+        // 容量不足时跳过本次补充。
+        if session.tx.capacity() > CONTROL_HEARTBEAT_RESERVE {
+            try_send(
+                &session.tx,
+                Message::ReqWorkConn(ReqWorkConn {
+                    proxy_name,
+                    work_id: WORK_ID_POOL_RESERVED,
+                }),
+            );
+        }
         return;
     }
 
@@ -479,12 +482,13 @@ pub(crate) fn dispatch_user_connection<S>(
         // 瞬时不可用、建连抖动）时，单次请求会让用户连接白等超时被关闭。
         let deadline = std::time::Instant::now() + Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS);
         loop {
-            if !send_with_timeout(
+            if !send_with_timeout_reserved(
                 &tx,
                 Message::ReqWorkConn(ReqWorkConn {
                     proxy_name: proxy_name.clone(),
                     work_id,
                 }),
+                CONTROL_HEARTBEAT_RESERVE,
             )
             .await
             {

@@ -421,6 +421,7 @@ async fn spawn_and_check(
 ///
 /// 等待退避期间同时消费配置事件：旧配置也起不来时，用户改出的新配置仍有机会
 /// 被立即尝试，而不是被回滚循环永久忽略。
+#[allow(clippy::too_many_arguments)] // 状态机参数较多，拆结构体反而降低可读性
 async fn spawn_rollback_with_retry(
     exe: &Path,
     old_args: &[OsString],

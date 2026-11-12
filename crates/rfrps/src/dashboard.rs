@@ -24,6 +24,81 @@ use crate::state::ServerState;
 const SESSION_COOKIE: &str = "rfrp_dashboard";
 /// 登录表单请求体上限（防大体积 POST 占用任务与内存）。
 const MAX_LOGIN_BODY: usize = 4096;
+/// 认证失败窗口内允许的失败次数。
+const AUTH_FAILURE_LIMIT: u32 = 5;
+/// 认证失败窗口。
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// 首次封禁时长；连续失败按 2 倍增长。
+const AUTH_BLOCK_INITIAL: Duration = Duration::from_secs(30);
+/// 单次封禁上限。
+const AUTH_BLOCK_MAX: Duration = Duration::from_secs(300);
+/// 认证失败表上限，防止大量来源 IP 撑爆内存。
+const MAX_AUTH_ENTRIES: usize = 4096;
+
+struct AuthFailure {
+    failures: u32,
+    window_start: Instant,
+    blocked_until: Instant,
+    block: Duration,
+}
+
+/// 独立的认证失败限速器：只影响登录/Basic 认证失败，不影响 `/healthz` 与正常请求。
+struct AuthFailureLimiter {
+    inner: Mutex<HashMap<std::net::IpAddr, AuthFailure>>,
+}
+
+impl AuthFailureLimiter {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn blocked(&self, ip: std::net::IpAddr, now: Instant) -> Option<Duration> {
+        let inner = self.inner.lock();
+        let entry = inner.get(&ip)?;
+        (entry.blocked_until > now).then(|| entry.blocked_until.saturating_duration_since(now))
+    }
+
+    fn record_failure(&self, ip: std::net::IpAddr, now: Instant) {
+        let mut inner = self.inner.lock();
+        if inner.len() >= MAX_AUTH_ENTRIES && !inner.contains_key(&ip) {
+            inner.retain(|_, e| {
+                e.blocked_until > now || now.duration_since(e.window_start) < AUTH_FAILURE_WINDOW
+            });
+            if inner.len() >= MAX_AUTH_ENTRIES {
+                if let Some(oldest) = inner
+                    .iter()
+                    .min_by_key(|(_, e)| e.window_start)
+                    .map(|(ip, _)| *ip)
+                {
+                    inner.remove(&oldest);
+                }
+            }
+        }
+        let entry = inner.entry(ip).or_insert(AuthFailure {
+            failures: 0,
+            window_start: now,
+            blocked_until: now,
+            block: AUTH_BLOCK_INITIAL,
+        });
+        if now.duration_since(entry.window_start) >= AUTH_FAILURE_WINDOW {
+            entry.failures = 0;
+            entry.window_start = now;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= AUTH_FAILURE_LIMIT {
+            entry.failures = 0;
+            entry.window_start = now;
+            entry.blocked_until = now + entry.block;
+            entry.block = (entry.block * 2).min(AUTH_BLOCK_MAX);
+        }
+    }
+
+    fn record_success(&self, ip: std::net::IpAddr) {
+        self.inner.lock().remove(&ip);
+    }
+}
 
 /// Dashboard 服务端会话表：Cookie 只保存随机会话 ID，不再保存 base64(user:pass)。
 ///
@@ -81,6 +156,7 @@ pub async fn run_dashboard(
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
     let sessions = Arc::new(DashboardSessions::new(cfg.session_ttl()));
+    let auth_failures = Arc::new(AuthFailureLimiter::new());
     // 单监听口并发上限：请求头读取和响应写都有超时，但慢连接仍可能堆积任务。
     let concurrent = Arc::new(tokio::sync::Semaphore::new(
         DASHBOARD_MAX_CONCURRENT_CONNECTIONS,
@@ -103,6 +179,7 @@ pub async fn run_dashboard(
                         let state = state.clone();
                         let limiter = limiter.clone();
                         let sessions = sessions.clone();
+                        let auth_failures = auth_failures.clone();
                         let tracker = state.data_tasks.clone();
                         tracker.spawn(async move {
                             let _permit = permit;
@@ -111,6 +188,7 @@ pub async fn run_dashboard(
                                 &cfg,
                                 &state,
                                 &limiter,
+                                &auth_failures,
                                 &sessions,
                                 peer,
                             )
@@ -143,6 +221,7 @@ async fn handle_request(
     cfg: &DashboardSection,
     state: &Arc<ServerState>,
     limiter: &RateLimiter,
+    auth_failures: &AuthFailureLimiter,
     sessions: &DashboardSessions,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
@@ -168,7 +247,22 @@ async fn handle_request(
         return write_response(&mut stream, status, "text/plain", body, None).await;
     }
 
+    if let Some(wait) = auth_failures.blocked(peer.ip(), Instant::now()) {
+        let retry_after = format!("Retry-After: {}\r\n", wait.as_secs().max(1));
+        return write_response(
+            &mut stream,
+            429,
+            "text/plain",
+            "Too Many Requests\n",
+            Some(&retry_after),
+        )
+        .await;
+    }
+
     let authenticated = authorized(&req, cfg, sessions);
+    if authenticated {
+        auth_failures.record_success(peer.ip());
+    }
 
     // 表单登录：POST /login 校验凭据，成功后下发会话 Cookie 并跳转首页。
     if req.method.eq_ignore_ascii_case("POST") && req.path == "/login" {
@@ -188,6 +282,7 @@ async fn handle_request(
         };
         let (user, pass) = parse_login_form(&body);
         if verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass) {
+            auth_failures.record_success(peer.ip());
             // Cookie 只保存随机、可撤销的服务端会话 ID，不保存凭据本身。
             let value = sessions.create();
             let headers = format!(
@@ -196,11 +291,16 @@ async fn handle_request(
             );
             return write_response(&mut stream, 302, "text/plain", "", Some(&headers)).await;
         }
+        auth_failures.record_failure(peer.ip(), Instant::now());
         tracing::warn!(%peer, "dashboard login failed");
         return write_login_page(&mut stream, Some("用户名或密码错误")).await;
     }
 
     if !authenticated {
+        // Basic 认证失败计数用于独立限速；无凭据的浏览器导航不计数。
+        if req.authorization.is_some() {
+            auth_failures.record_failure(peer.ip(), Instant::now());
+        }
         // 浏览器导航请求（Accept: text/html）返回登录页；其余（curl/脚本）返回标准
         // 401 + WWW-Authenticate，保留 Basic Auth 客户端的兼容性。
         if req.accept_html || req.path == "/login" {
@@ -836,5 +936,44 @@ mod metrics_tests {
         assert_eq!(by_run("rttB")["rtt_ms"], 80);
         // 顶层为最差会话。
         assert_eq!(json["rtt_ms"], 80);
+    }
+}
+
+#[cfg(test)]
+mod auth_failure_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_after_failures_and_success_clears() {
+        let limiter = AuthFailureLimiter::new();
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            assert!(limiter.blocked(ip, now).is_none());
+            limiter.record_failure(ip, now);
+        }
+        assert!(
+            limiter.blocked(ip, now).is_some(),
+            "limit must trigger a temporary block"
+        );
+        limiter.record_success(ip);
+        assert!(limiter.blocked(ip, now).is_none());
+    }
+
+    #[test]
+    fn failure_window_expires() {
+        let limiter = AuthFailureLimiter::new();
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..(AUTH_FAILURE_LIMIT - 1) {
+            limiter.record_failure(ip, now);
+        }
+        limiter.record_failure(ip, now + AUTH_FAILURE_WINDOW + Duration::from_secs(1));
+        assert!(
+            limiter
+                .blocked(ip, now + AUTH_FAILURE_WINDOW + Duration::from_secs(1))
+                .is_none(),
+            "old failures must not contribute after the window"
+        );
     }
 }

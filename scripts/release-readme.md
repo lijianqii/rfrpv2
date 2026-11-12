@@ -55,6 +55,8 @@ sudo systemctl enable --now rfrp-server   # 或 rfrp-client
 > unit 已设置 `LimitNOFILE`，并通过 `StateDirectory`/`LogsDirectory` 自动创建
 > `/var/lib/rfrp`、`/var/log/rfrp`。需要绑定 <1024 端口时，请使用 unit 中注释的
 > `AmbientCapabilities=CAP_NET_BIND_SERVICE`（`NoNewPrivileges` 下 setcap 不会生效）。
+> 使用 `file:` 日志输出时，可将 `logrotate/rfrp` 安装到 `/etc/logrotate.d/rfrp`；
+> 它使用 `copytruncate`，轮转瞬间可能丢失极少量日志行。
 
 ## 校验
 

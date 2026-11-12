@@ -50,6 +50,8 @@ mkdir -p "$DIST/linux-gnu"
 cp target/x86_64-unknown-linux-gnu/release/rfrp "$DIST/linux-gnu/rfrp"
 prepare_common "$DIST/linux-gnu" "x86_64-linux-gnu"
 cp deploy/systemd/rfrp-server.service deploy/systemd/rfrp-client.service "$DIST/linux-gnu/"
+mkdir -p "$DIST/linux-gnu/logrotate"
+cp deploy/logrotate/rfrp "$DIST/linux-gnu/logrotate/rfrp"
 tar -C "$DIST/linux-gnu" -czf "$DIST/rfrp-${VERSION}-x86_64-linux-gnu.tar.gz" .
 
 # Windows gnu（zip 内含 exe + 配置模板 + 许可证 + 说明）

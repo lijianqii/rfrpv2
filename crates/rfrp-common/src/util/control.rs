@@ -11,6 +11,9 @@ use crate::protocol::msg::{Close, Message};
 
 /// 控制消息发送超时（秒）：socket 写阻塞超过该时间视为控制连接异常。
 pub const CONTROL_SEND_TIMEOUT: u64 = 5;
+/// 为心跳响应预留的控制通道槽位。批量消息不得用满通道，否则高峰时
+/// `HeartbeatResp` 的 `try_send` 会静默失败并触发客户端误超时。
+pub const CONTROL_HEARTBEAT_RESERVE: usize = 16;
 
 /// 发送 Close 帧并关闭底层写端（发 close_notify）。
 ///
@@ -41,6 +44,31 @@ pub async fn send_with_timeout(tx: &mpsc::Sender<Message>, msg: Message) -> bool
         tokio::time::timeout(Duration::from_secs(CONTROL_SEND_TIMEOUT), tx.send(msg)).await,
         Ok(Ok(()))
     )
+}
+
+/// 批量控制消息发送：通道容量不足 `reserve` 时等待，给心跳响应留出槽位。
+pub async fn send_with_timeout_reserved(
+    tx: &mpsc::Sender<Message>,
+    msg: Message,
+    reserve: usize,
+) -> bool {
+    // 小容量测试通道/自定义通道不能被 reserve 卡死：保留至多 max_capacity-1 个槽位。
+    let reserve = reserve.min(tx.max_capacity().saturating_sub(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(CONTROL_SEND_TIMEOUT);
+    loop {
+        if tx.capacity() > reserve {
+            return send_with_timeout(tx, msg).await;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let wait = remaining.min(Duration::from_millis(10));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tx.closed() => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +130,35 @@ mod tests {
         // 首字节应为协议版本，随后 msg_type 应为 MSG_CLOSE（见 protocol::frame）。
         assert_eq!(buf[0], crate::constants::PROTOCOL_VERSION);
         assert_eq!(buf[1], crate::protocol::msg::MSG_CLOSE);
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::*;
+    use crate::protocol::msg::Heartbeat;
+
+    #[tokio::test]
+    async fn reserved_send_waits_for_headroom() {
+        let (tx, mut rx) = mpsc::channel::<Message>(4);
+        tx.send(Message::Heartbeat(Heartbeat { ts: 1 }))
+            .await
+            .unwrap();
+        tx.send(Message::Heartbeat(Heartbeat { ts: 2 }))
+            .await
+            .unwrap();
+        let tx2 = tx.clone();
+        let task = tokio::spawn(async move {
+            send_with_timeout_reserved(&tx2, Message::Heartbeat(Heartbeat { ts: 3 }), 2).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "sender must leave reserved capacity");
+        let _ = rx.recv().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 }

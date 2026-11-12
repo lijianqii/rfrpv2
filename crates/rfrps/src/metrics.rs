@@ -17,6 +17,8 @@ pub struct Metrics {
     pub accept_errors_total: AtomicU64,
     /// UDP 因待配对会话达到上限而丢弃的包数。
     pub udp_dropped_total: AtomicU64,
+    /// 控制通道满导致心跳响应被丢弃的次数。
+    pub heartbeat_resp_dropped_total: AtomicU64,
     /// 累计建立的 UDP 会话数（跨代理、跨会话清理保留）。
     pub udp_sessions_total: AtomicU64,
     /// accept 循环当前是否正常（连续失败后置 false，恢复后置 true）。
@@ -65,6 +67,7 @@ impl Default for Metrics {
             accepted_total: AtomicU64::new(0),
             accept_errors_total: AtomicU64::new(0),
             udp_dropped_total: AtomicU64::new(0),
+            heartbeat_resp_dropped_total: AtomicU64::new(0),
             udp_sessions_total: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             total_connections: Arc::new(AtomicU64::new(0)),
@@ -95,6 +98,12 @@ impl Metrics {
     /// 记录一次因 UDP pending 上限而丢弃的包。
     pub fn inc_udp_dropped(&self) {
         self.udp_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记录一次控制通道满导致心跳响应被丢弃。
+    pub fn inc_heartbeat_resp_dropped(&self) {
+        self.heartbeat_resp_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// accept 循环是否正常（供 /healthz 与指标使用）。
@@ -135,6 +144,9 @@ impl Metrics {
              # HELP rfrp_udp_dropped_total UDP datagrams dropped (pending session limit or session backpressure).\n\
              # TYPE rfrp_udp_dropped_total counter\n\
              rfrp_udp_dropped_total {}\n\
+             # HELP rfrp_heartbeat_resp_dropped_total Heartbeat responses dropped because the control channel was full.\n\
+             # TYPE rfrp_heartbeat_resp_dropped_total counter\n\
+             rfrp_heartbeat_resp_dropped_total {}\n\
              # HELP rfrp_udp_sessions_total Total established UDP sessions.\n\
              # TYPE rfrp_udp_sessions_total counter\n\
              rfrp_udp_sessions_total {}\n\
@@ -149,6 +161,7 @@ impl Metrics {
             self.accepted_total.load(Ordering::Relaxed),
             self.accept_errors_total.load(Ordering::Relaxed),
             self.udp_dropped_total.load(Ordering::Relaxed),
+            self.heartbeat_resp_dropped_total.load(Ordering::Relaxed),
             self.udp_sessions_total.load(Ordering::Relaxed),
             u8::from(self.is_accepting()),
         )

@@ -36,6 +36,24 @@
 
 ### Changed
 
+- **资源上限可配置**：`[server]` 新增 `max_active_connections`、`max_total_proxies`、
+  `max_total_domains`、`max_total_pooled_work_conns`，用于低内存/多租户部署限制 fd 与内存；
+  默认值保持较高以兼容现有部署。
+- **supervisor 就绪/停止语义**：restart 模式等待子进程写入 `pid + effective grace` 的
+  私有 ready 文件后才判定启动成功，停止时按该 grace + 5s 余量等待，不再固定 3s/10s。
+- **`allow_ports` fail-closed**：非空字符串必须至少包含一个有效端口/范围；`","`、`" , "`
+  等此前会被解释为“不限制”的配置现在启动失败。空字符串仍表示不限制。
+- **TCP/UDP 域名预留调整**：非 vhost 代理仍会检查已有 vhost 域名冲突，但不再预留新域名，
+  避免占用全局域名命名空间。
+- **Dashboard 认证失败限速**：连续登录/Basic 失败按 IP 短时封禁，成功登录后清除；
+  `/healthz` 不受影响。
+- **控制通道为心跳响应保留槽位**：批量 `ReqWorkConn`/注册消息在容量不足时等待，
+  避免高峰时挤掉 `HeartbeatResp`；新增 `rfrp_heartbeat_resp_dropped_total`。
+- **watch-config 加固**：事件通道改为有界，配置为符号链接时同时监听链接与目标目录；
+  Windows 文件名比较改为大小写不敏感。
+- **systemd/release/日志**：unit 增加 `LimitNOFILE`/`StateDirectory`/`LogsDirectory`；
+  release 脚本固定仓库根并使用 `--locked`；新增可选 logrotate 配置（`copytruncate`）。
+
 - **服务端连接错误日志分级**：对端行为（RST/EOF/协议不符、非 rfrp 客户端首帧）降为
   `debug`，不再按 `warn` 刷屏；其余异常仍为 `warn`。
 - **数据面 / 渲染路径的分配与锁优化**：
