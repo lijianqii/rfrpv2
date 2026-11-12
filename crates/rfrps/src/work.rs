@@ -80,11 +80,27 @@ where
 
     // work_id=0：预热池连接，归入所属会话的池，等待用户连接命中（§8.2）。
     if work_id == WORK_ID_POOL_RESERVED {
+        // 先占全局名额，再检查单代理池上限；失败路径必须归还。
+        if !state.try_acquire_pooled_slot() {
+            tracing::warn!(
+                %proxy_name,
+                limit = state.max_total_pooled_work_conns.load(std::sync::atomic::Ordering::Relaxed),
+                "pooled work connection rejected: global pool limit"
+            );
+            return Ok(()); // 关闭该连接（stream 在此 drop）
+        }
         let mut pools = session.pools.lock();
+        if session.stop.is_cancelled() {
+            drop(pools);
+            state.release_pooled_slots(1);
+            return Ok(());
+        }
         let pool = pools.entry(proxy_name.clone()).or_default();
         // 池上限：`pool_size` 是客户端本地配置、不上送协议，服务端必须自设上限，
         // 否则持有合法 token 的连接可以把池子灌满（每条都是常驻 socket + 内存）。
         if pool.len() >= MAX_POOLED_WORK_CONNS_PER_PROXY {
+            drop(pools);
+            state.release_pooled_slots(1);
             tracing::warn!(
                 %proxy_name,
                 limit = MAX_POOLED_WORK_CONNS_PER_PROXY,
@@ -140,7 +156,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
 
-    fn start_frame(proxy_name: &str, work_id: u64, token: Option<&str>) -> Frame {
+    pub(super) fn start_frame(proxy_name: &str, work_id: u64, token: Option<&str>) -> Frame {
         Message::StartWorkConn(StartWorkConn {
             proxy_name: proxy_name.into(),
             work_id,
@@ -151,11 +167,11 @@ mod tests {
     }
 
     /// 构造"已登录且已注册 ssh 代理"的状态：`session_for_proxy` 需要它才能校验工作连接。
-    fn state_with_session(token: &str) -> (Arc<ServerState>, Arc<Session>) {
+    pub(super) fn state_with_session(token: &str) -> (Arc<ServerState>, Arc<Session>) {
         let state = ServerState::new();
         let session = crate::control::test_session_with_token("r1", token).0;
         state.sessions.lock().insert("r1".into(), session.clone());
-        assert!(state.reserve_proxy("ssh", &session));
+        assert!((state.reserve_proxy("ssh", &session)).is_ok());
         (state, session)
     }
 
@@ -276,5 +292,41 @@ mod tests {
         .await
         .is_ok());
         assert!(session.pools.lock().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod global_pool_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn pooled_work_conn_respects_global_limit() {
+        let (state, session) = super::tests::state_with_session("tok");
+        state
+            .max_total_pooled_work_conns
+            .store(1, Ordering::Relaxed);
+        let (keep1, server1) = tokio::io::duplex(8);
+        assert!(handle_work_connection(
+            super::tests::start_frame("ssh", WORK_ID_POOL_RESERVED, Some("tok")),
+            server1,
+            state.clone()
+        )
+        .await
+        .is_ok());
+        assert_eq!(session.pools.lock()["ssh"].len(), 1);
+        assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 1);
+
+        let (keep2, server2) = tokio::io::duplex(8);
+        assert!(handle_work_connection(
+            super::tests::start_frame("ssh", WORK_ID_POOL_RESERVED, Some("tok")),
+            server2,
+            state.clone()
+        )
+        .await
+        .is_ok());
+        assert_eq!(session.pools.lock()["ssh"].len(), 1);
+        assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 1);
+        drop((keep1, keep2));
     }
 }

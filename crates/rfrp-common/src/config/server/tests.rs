@@ -442,3 +442,39 @@ fn dashboard_port_zero_rejected() {
     };
     assert!(d.validate().is_err(), "dashboard port 0 must be rejected");
 }
+
+#[test]
+fn resource_limit_defaults_and_validation() {
+    let mut cfg = ServerConfig::default();
+    assert_eq!(
+        cfg.server.max_active_connections,
+        crate::constants::MAX_ACTIVE_CONNECTIONS
+    );
+    assert_eq!(
+        cfg.server.max_total_proxies,
+        crate::constants::MAX_TOTAL_PROXIES
+    );
+    cfg.server.token = "secret".into();
+    cfg.server.work_conn_tls = false;
+    if let Err(e) = cfg.validate() {
+        panic!("default config should validate: {e}");
+    }
+
+    let mut cfg = ServerConfig::default();
+    cfg.server.token = "secret".into();
+    cfg.server.work_conn_tls = false;
+    cfg.server.max_active_connections = 0;
+    assert!(cfg.validate().is_err());
+
+    let mut cfg = ServerConfig::default();
+    cfg.server.token = "secret".into();
+    cfg.server.work_conn_tls = false;
+    cfg.server.max_total_domains = 0;
+    assert!(cfg.validate().is_err());
+
+    let mut cfg = ServerConfig::default();
+    cfg.server.token = "secret".into();
+    cfg.server.work_conn_tls = false;
+    cfg.server.max_total_pooled_work_conns = 0;
+    assert!(cfg.validate().is_err());
+}

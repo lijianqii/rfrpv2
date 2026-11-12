@@ -558,8 +558,9 @@ fn cleanup(session: &Session, state: &ServerState) {
         }
     }
     session.proxy_domains.lock().clear();
-    // 关闭并丢弃所有预热的工作连接池（§8.2）。
+    // 关闭并丢弃所有预热的工作连接池（§8.2），同时归还全局池连接名额。
     for (_, mut v) in session.pools.lock().drain() {
+        state.release_pooled_slots(v.len());
         for _s in v.drain(..) {
             // 丢弃 TcpStream 即关闭连接。
         }

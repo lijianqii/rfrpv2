@@ -97,6 +97,8 @@ pub enum ProxyError {
     NameExists,
     /// 会话内代理数超过上限。
     TooManyProxies,
+    /// 全局域名索引超过上限。
+    TooManyDomains,
     /// `remote_port` 超出 `allow_ports`。
     PortNotAllowed,
     /// `remote_port` 被占用（**可重试**：如旧会话尚未释放端口）。
@@ -115,6 +117,7 @@ impl ProxyError {
             Self::InvalidField => "invalid field",
             Self::NameExists => "proxy_name exists",
             Self::TooManyProxies => "too many proxies",
+            Self::TooManyDomains => "too many domains",
             Self::PortNotAllowed => "port not allowed",
             Self::PortOccupied => "port occupied",
             Self::DomainConflict => "domain conflict",
@@ -143,6 +146,7 @@ impl ProxyError {
             Self::InvalidField,
             Self::NameExists,
             Self::TooManyProxies,
+            Self::TooManyDomains,
             Self::PortNotAllowed,
             Self::PortOccupied,
             Self::DomainConflict,
@@ -418,6 +422,7 @@ mod proxy_error_tests {
         assert_eq!(ProxyError::InvalidField.as_str(), "invalid field");
         assert_eq!(ProxyError::NameExists.as_str(), "proxy_name exists");
         assert_eq!(ProxyError::TooManyProxies.as_str(), "too many proxies");
+        assert_eq!(ProxyError::TooManyDomains.as_str(), "too many domains");
         assert_eq!(ProxyError::PortNotAllowed.as_str(), "port not allowed");
         assert_eq!(ProxyError::PortOccupied.as_str(), "port occupied");
         assert_eq!(ProxyError::DomainConflict.as_str(), "domain conflict");
@@ -450,6 +455,7 @@ mod proxy_error_tests {
             ProxyError::InvalidField,
             ProxyError::NameExists,
             ProxyError::TooManyProxies,
+            ProxyError::TooManyDomains,
             ProxyError::PortOccupied,
             ProxyError::DomainConflict,
         ] {
@@ -464,6 +470,7 @@ mod proxy_error_tests {
             ProxyError::InvalidField,
             ProxyError::NameExists,
             ProxyError::TooManyProxies,
+            ProxyError::TooManyDomains,
             ProxyError::PortNotAllowed,
             ProxyError::PortOccupied,
             ProxyError::DomainConflict,

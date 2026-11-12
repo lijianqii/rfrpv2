@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio::time::Duration;
 
 use crate::control::{ProxyEntry, Session};
-use crate::state::{PendingWork, ServerState};
+use crate::state::{PendingWork, ReserveError, ServerState};
 use rfrp_common::util::control::{send_with_timeout, try_send};
 
 /// 端口是否在 `allow_ports` 允许范围内（fail-closed：配置解析失败视为不允许）。
@@ -98,16 +98,33 @@ pub async fn register_proxy(
     };
 
     // 全局 proxy_name 唯一（DESIGN §6.6）：在 bind 之前原子预留，失败路径负责回滚。
-    if !state.reserve_proxy(&np.proxy_name, session) {
-        tracing::warn!(proxy = %np.proxy_name, "proxy name already registered in another session");
-        return Err(ProxyError::NameExists);
+    if let Err(e) = state.reserve_proxy(&np.proxy_name, session) {
+        tracing::warn!(
+            proxy = %np.proxy_name,
+            reason = ?e,
+            "proxy name reservation failed"
+        );
+        return Err(match e {
+            ReserveError::Conflict => ProxyError::NameExists,
+            ReserveError::Limit => ProxyError::TooManyProxies,
+        });
     }
     // 域名同样在 bind 前原子预留，关闭“查重 → bind → 登记”的 TOCTOU 窗口。
     if !domains.is_empty() {
-        if !state.reserve_domains(&domains, session, &np.proxy_name) {
-            tracing::warn!(proxy = %np.proxy_name, "vhost domain conflict, registration rejected");
-            state.release_proxy(&np.proxy_name, session);
-            return Err(ProxyError::DomainConflict);
+        match state.reserve_domains(&domains, session, &np.proxy_name) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    proxy = %np.proxy_name,
+                    reason = ?e,
+                    "vhost domain reservation failed"
+                );
+                state.release_proxy(&np.proxy_name, session);
+                return Err(match e {
+                    ReserveError::Conflict => ProxyError::DomainConflict,
+                    ReserveError::Limit => ProxyError::TooManyDomains,
+                });
+            }
         }
         if !is_vhost {
             // TCP/UDP 不路由域名，只做“不得抢占已有 vhost 域名”的冲突校验；
@@ -314,12 +331,18 @@ async fn proxy_accept_loop(
 ///
 /// 本地服务常对空闲连接做超时踢除（sshd/RDP 均如此），池中预连接因此可能已死；
 /// 直接使用会让用户连接立即被重置（表现为 Connection reset by peer）。
-fn pop_live_pooled(session: &Session, proxy_name: &str) -> Option<BoxedStream> {
+fn pop_live_pooled(
+    session: &Session,
+    proxy_name: &str,
+    state: &ServerState,
+) -> Option<BoxedStream> {
     loop {
         let work = {
             let mut pools = session.pools.lock();
             pools.get_mut(proxy_name).and_then(|v| v.pop())
         }?;
+        // 出池即不再占用全局池连接名额；探活失败丢弃也不例外。
+        state.release_pooled_slots(1);
         match probe_alive(work) {
             Ok(work) => return Some(work),
             Err(()) => {
@@ -414,7 +437,7 @@ pub(crate) fn dispatch_user_connection<S>(
 
     // 优先命中预热池（§8.2）。池中连接可能已被本地服务（sshd/RDP 等）
     // 在空闲时关闭，出池前先探活，避免用户连接被死连接立即重置。
-    let pooled = pop_live_pooled(&session, &proxy_name);
+    let pooled = pop_live_pooled(&session, &proxy_name, &state);
     if let Some(work) = pooled {
         tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
         let pname = proxy_name.clone();

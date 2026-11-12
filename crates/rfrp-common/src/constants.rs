@@ -264,6 +264,12 @@ pub const BRIDGE_BUF_SIZE: usize = 64 * 1024;
 
 /// 服务端最大并发用户连接数（防 DoS 兜底）。
 pub const MAX_ACTIVE_CONNECTIONS: i64 = 65536;
+/// 全局代理注册总数上限（所有会话合计）。
+pub const MAX_TOTAL_PROXIES: usize = 8192;
+/// 全局 vhost 域名索引总数上限（所有会话合计）。
+pub const MAX_TOTAL_DOMAINS: usize = 16384;
+/// 全局预热工作连接总数上限（所有会话合计）。
+pub const MAX_TOTAL_POOLED_WORK_CONNS: usize = 8192;
 
 /// 服务端同时处于首帧握手阶段（peek/TLS/首帧读取）的连接上限。
 ///

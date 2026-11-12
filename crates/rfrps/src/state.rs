@@ -27,9 +27,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS, MAX_SESSIONS,
-    MAX_SESSIONS_PER_IP, MAX_UNAUTHENTICATED_CONNECTIONS, WORK_CONN_REQUEST_INTERVAL_MS,
+    MAX_SESSIONS_PER_IP, MAX_TOTAL_DOMAINS, MAX_TOTAL_POOLED_WORK_CONNS, MAX_TOTAL_PROXIES,
+    MAX_UNAUTHENTICATED_CONNECTIONS, WORK_CONN_REQUEST_INTERVAL_MS,
 };
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tasks::TaskGroup;
@@ -64,6 +66,13 @@ impl ResourceOwner {
             session_id: session.session_id.clone(),
         }
     }
+}
+
+/// 全局资源预留失败原因：名称/域名冲突，或总量上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveError {
+    Conflict,
+    Limit,
 }
 
 /// 首帧握手阶段的并发许可；drop 时归还计数。
@@ -123,6 +132,14 @@ pub struct ServerState {
     pub metrics: Arc<Metrics>,
     /// 最大并发用户连接数（防 DoS 兜底，测试可调小）。
     pub max_active: AtomicI64,
+    /// 全局代理总数上限。
+    pub max_total_proxies: AtomicUsize,
+    /// 全局域名索引总数上限。
+    pub max_total_domains: AtomicUsize,
+    /// 全局预热工作连接总数上限。
+    pub max_total_pooled_work_conns: AtomicUsize,
+    /// 当前已入池的预热工作连接总数。
+    pub pooled_work_conns: AtomicUsize,
     /// 全局并发控制会话上限（测试可调小）。
     pub max_sessions: AtomicUsize,
     /// 单来源 IP 的并发控制会话上限（测试可调小）。
@@ -152,6 +169,10 @@ impl ServerState {
             proxy_stats: Mutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
             max_active: AtomicI64::new(MAX_ACTIVE_CONNECTIONS),
+            max_total_proxies: AtomicUsize::new(MAX_TOTAL_PROXIES),
+            max_total_domains: AtomicUsize::new(MAX_TOTAL_DOMAINS),
+            max_total_pooled_work_conns: AtomicUsize::new(MAX_TOTAL_POOLED_WORK_CONNS),
+            pooled_work_conns: AtomicUsize::new(0),
             max_sessions: AtomicUsize::new(MAX_SESSIONS),
             max_sessions_per_ip: AtomicUsize::new(MAX_SESSIONS_PER_IP),
             pending_request_interval_ms: AtomicU64::new(WORK_CONN_REQUEST_INTERVAL_MS),
@@ -159,6 +180,20 @@ impl ServerState {
             data_tasks: TaskGroup::new(),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// 从服务端配置注入资源上限；直接构造 `ServerState` 的测试保持默认值。
+    pub fn configure_limits(&self, cfg: &ServerConfig) {
+        self.max_active
+            .store(cfg.server.max_active_connections.max(1), Ordering::Relaxed);
+        self.max_total_proxies
+            .store(cfg.server.max_total_proxies.max(1), Ordering::Relaxed);
+        self.max_total_domains
+            .store(cfg.server.max_total_domains.max(1), Ordering::Relaxed);
+        self.max_total_pooled_work_conns.store(
+            cfg.server.max_total_pooled_work_conns.max(1),
+            Ordering::Relaxed,
+        );
     }
 
     /// 取（或创建）某代理的统计计数器（测试/无 owner 场景）。
@@ -281,6 +316,37 @@ impl ServerState {
         self.work_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// 尝试占用一个全局预热工作连接名额。
+    pub fn try_acquire_pooled_slot(&self) -> bool {
+        let max = self.max_total_pooled_work_conns.load(Ordering::Relaxed);
+        // 保持 MSRV 1.75：新工具链的 try_update 更晚引入。
+        #[allow(deprecated)]
+        self.pooled_work_conns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (cur < max).then_some(cur + 1)
+            })
+            .is_ok()
+    }
+
+    /// 归还预热工作连接名额；饱和到 0，避免异常路径把计数减成负数。
+    pub fn release_pooled_slots(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut cur = self.pooled_work_conns.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(count);
+            if self
+                .pooled_work_conns
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            cur = self.pooled_work_conns.load(Ordering::Relaxed);
+        }
+    }
+
     /// 重发 `ReqWorkConn` 的间隔（下限 1ms，避免被误配成 0 造成热循环）。
     pub fn pending_request_interval(&self) -> Duration {
         Duration::from_millis(
@@ -294,17 +360,27 @@ impl ServerState {
     ///
     /// DESIGN §6.6 要求 proxy_name 全局唯一；预留发生在 bind 之前，失败路径必须
     /// 调用 [`Self::release_proxy`] 回滚，避免名字被永久占用。
-    pub fn reserve_proxy(&self, proxy_name: &str, session: &crate::control::Session) -> bool {
+    pub fn reserve_proxy(
+        &self,
+        proxy_name: &str,
+        session: &crate::control::Session,
+    ) -> std::result::Result<(), ReserveError> {
         let owner = ResourceOwner::of(session);
         let mut idx = self.proxy_index.lock();
+        // 新 key 才占全局名额；同名预留/陈旧接管不增加条目数。
+        if !idx.contains_key(proxy_name)
+            && idx.len() >= self.max_total_proxies.load(Ordering::Relaxed)
+        {
+            return Err(ReserveError::Limit);
+        }
         match idx.entry(proxy_name.to_string()) {
             Entry::Vacant(e) => {
                 e.insert(owner);
-                true
+                Ok(())
             }
             Entry::Occupied(mut e) => {
                 if e.get() == &owner {
-                    true
+                    Ok(())
                 } else {
                     // 旧会话在 bind 期间被重连替换时可能留下“陈旧预留”。只有确认
                     // 旧 owner 已不是当前会话，才允许接管；否则仍是真正的名称冲突。
@@ -315,10 +391,10 @@ impl ServerState {
                         .get(&existing.run_id)
                         .is_some_and(|s| s.session_id == existing.session_id);
                     if still_current {
-                        false
+                        Err(ReserveError::Conflict)
                     } else {
                         e.insert(owner);
-                        true
+                        Ok(())
                     }
                 }
             }
@@ -375,31 +451,41 @@ impl ServerState {
         domains: &[String],
         session: &crate::control::Session,
         proxy_name: &str,
-    ) -> bool {
+    ) -> std::result::Result<(), ReserveError> {
         let owner = ResourceOwner::of(session);
         let mut idx = self.domain_index.lock();
+        let mut new_keys = std::collections::HashSet::new();
         for d in domains {
-            if let Some((existing_owner, existing_proxy)) = idx.get(d) {
-                if existing_owner == &owner && existing_proxy == proxy_name {
-                    continue;
+            match idx.get(d) {
+                None => {
+                    new_keys.insert(d.as_str());
                 }
-                // 同 proxy_name 预留：旧会话已失效的域名条目可以被新会话接管，
-                // 否则 cleanup 漏删/在途注册会让新会话永久 DomainConflict。
-                let existing = existing_owner.clone();
-                let still_current = self
-                    .sessions
-                    .lock()
-                    .get(&existing.run_id)
-                    .is_some_and(|s| s.session_id == existing.session_id);
-                if still_current {
-                    return false;
+                Some((existing_owner, existing_proxy)) => {
+                    if existing_owner == &owner && existing_proxy == proxy_name {
+                        continue;
+                    }
+                    // 同 proxy_name 预留：旧会话已失效的域名条目可以被新会话接管，
+                    // 否则 cleanup 漏删/在途注册会让新会话永久 DomainConflict。
+                    let existing = existing_owner.clone();
+                    let still_current = self
+                        .sessions
+                        .lock()
+                        .get(&existing.run_id)
+                        .is_some_and(|s| s.session_id == existing.session_id);
+                    if still_current {
+                        return Err(ReserveError::Conflict);
+                    }
                 }
             }
+        }
+        if idx.len().saturating_add(new_keys.len()) > self.max_total_domains.load(Ordering::Relaxed)
+        {
+            return Err(ReserveError::Limit);
         }
         for d in domains {
             idx.insert(d.clone(), (owner.clone(), proxy_name.to_string()));
         }
-        true
+        Ok(())
     }
 
     /// 条件释放一组域名：仅删除仍属于本会话/本代理的条目。
@@ -535,8 +621,8 @@ mod tests {
         // 未注册时查不到。
         assert!(state.session_for_proxy("web").is_none());
 
-        assert!(state.reserve_proxy("web", &s));
-        assert!(state.reserve_proxy("udp-x", &s));
+        assert!((state.reserve_proxy("web", &s)).is_ok());
+        assert!((state.reserve_proxy("udp-x", &s)).is_ok());
         let found = state.session_for_proxy("web").expect("indexed");
         assert_eq!(found.run_id, "r1");
         assert!(state.session_for_proxy("udp-x").is_some());
@@ -556,13 +642,13 @@ mod tests {
         state.sessions.lock().insert("ra".into(), a.clone());
         state.sessions.lock().insert("rb".into(), b.clone());
 
-        assert!(state.reserve_proxy("web", &a));
-        assert!(!state.reserve_proxy("web", &b));
+        assert!((state.reserve_proxy("web", &a)).is_ok());
+        assert!((state.reserve_proxy("web", &b)).is_err());
         assert!(Arc::ptr_eq(&state.session_for_proxy("web").unwrap(), &a));
 
         // A 清理后 B 才能注册。
         state.unindex_proxies(vec!["web".into()], &a);
-        assert!(state.reserve_proxy("web", &b));
+        assert!((state.reserve_proxy("web", &b)).is_ok());
         assert!(Arc::ptr_eq(&state.session_for_proxy("web").unwrap(), &b));
     }
 
@@ -600,9 +686,9 @@ mod tests {
         // 旧会话在 bind 中被替换、cleanup 漏掉预留时，新会话应能接管而不是永久 NameExists。
         let state = ServerState::new();
         let old = test_session("r1");
-        assert!(state.reserve_proxy("web", &old));
+        assert!((state.reserve_proxy("web", &old)).is_ok());
         let domain = vec!["web.example.com".to_string()];
-        assert!(state.reserve_domains(&domain, &old, "web"));
+        assert!((state.reserve_domains(&domain, &old, "web")).is_ok());
 
         let mut new = test_session("r1");
         Arc::get_mut(&mut new)
@@ -611,11 +697,11 @@ mod tests {
         state.sessions.lock().insert("r1".into(), new.clone());
 
         assert!(
-            state.reserve_proxy("web", &new),
+            state.reserve_proxy("web", &new).is_ok(),
             "stale name must be stealable"
         );
         assert!(
-            state.reserve_domains(&domain, &new, "web"),
+            state.reserve_domains(&domain, &new, "web").is_ok(),
             "stale domain must be stealable"
         );
         assert!(Arc::ptr_eq(&state.session_for_proxy("web").unwrap(), &new));
@@ -631,8 +717,8 @@ mod tests {
         state.sessions.lock().insert("rb".into(), b.clone());
 
         let domain = vec!["web.example.com".to_string()];
-        assert!(state.reserve_domains(&domain, &a, "web-a"));
-        assert!(!state.reserve_domains(&domain, &b, "web-b"));
+        assert!((state.reserve_domains(&domain, &a, "web-a")).is_ok());
+        assert!((state.reserve_domains(&domain, &b, "web-b")).is_err());
         assert!(state.session_for_domain("web.example.com").is_some());
 
         // A 的 cleanup 不会删除 B 的条目（B 没抢到，但条件删除仍应安全）。
@@ -683,7 +769,7 @@ mod tests {
             .expect("new session not shared yet")
             .session_id = "new-session".into();
         state.sessions.lock().insert("r1".into(), old.clone());
-        assert!(state.reserve_proxy("web", &old));
+        assert!((state.reserve_proxy("web", &old)).is_ok());
 
         // 替换会话（真实登录路径会先 cleanup(old)，这里验证条件删除本身）。
         state.sessions.lock().insert("r1".into(), new.clone());
@@ -691,7 +777,7 @@ mod tests {
         // 旧 owner 的索引不再匹配当前 session，查询应为 None。
         assert!(state.session_for_proxy("web").is_none());
         // 新会话可重新预留。
-        assert!(state.reserve_proxy("web", &new));
+        assert!((state.reserve_proxy("web", &new)).is_ok());
 
         let found = state.session_for_proxy("web").expect("re-indexed");
         assert!(Arc::ptr_eq(&found, &new));
@@ -712,5 +798,70 @@ mod tests {
             state.begin_handshake().is_some(),
             "permits must be returned on drop"
         );
+    }
+}
+
+#[cfg(test)]
+mod global_limit_tests {
+    use super::*;
+    use crate::control::test_session;
+
+    #[test]
+    fn proxy_global_limit_is_enforced_and_released() {
+        let state = ServerState::new();
+        let session = test_session("r1");
+        state.max_total_proxies.store(1, Ordering::Relaxed);
+        assert!(state.reserve_proxy("a", &session).is_ok());
+        assert_eq!(state.reserve_proxy("b", &session), Err(ReserveError::Limit));
+        state.release_proxy("a", &session);
+        assert!(state.reserve_proxy("b", &session).is_ok());
+    }
+
+    #[test]
+    fn domain_global_limit_is_enforced_and_released() {
+        let state = ServerState::new();
+        let session = test_session("r1");
+        state.max_total_domains.store(1, Ordering::Relaxed);
+        let a = vec!["a.example.com".to_string()];
+        let b = vec!["b.example.com".to_string()];
+        assert!(state.reserve_domains(&a, &session, "web-a").is_ok());
+        assert_eq!(
+            state.reserve_domains(&b, &session, "web-b"),
+            Err(ReserveError::Limit)
+        );
+        state.release_domains(&a, &session, "web-a");
+        assert!(state.reserve_domains(&b, &session, "web-b").is_ok());
+    }
+
+    #[test]
+    fn configure_limits_sets_all_resource_fields() {
+        let state = ServerState::new();
+        let mut cfg = ServerConfig::default();
+        cfg.server.max_active_connections = 123;
+        cfg.server.max_total_proxies = 456;
+        cfg.server.max_total_domains = 789;
+        cfg.server.max_total_pooled_work_conns = 321;
+        state.configure_limits(&cfg);
+        assert_eq!(state.max_active.load(Ordering::Relaxed), 123);
+        assert_eq!(state.max_total_proxies.load(Ordering::Relaxed), 456);
+        assert_eq!(state.max_total_domains.load(Ordering::Relaxed), 789);
+        assert_eq!(
+            state.max_total_pooled_work_conns.load(Ordering::Relaxed),
+            321
+        );
+    }
+
+    #[test]
+    fn pooled_slots_are_saturated() {
+        let state = ServerState::new();
+        state
+            .max_total_pooled_work_conns
+            .store(1, Ordering::Relaxed);
+        assert!(state.try_acquire_pooled_slot());
+        assert!(!state.try_acquire_pooled_slot());
+        state.release_pooled_slots(1);
+        assert!(state.try_acquire_pooled_slot());
+        state.release_pooled_slots(100);
+        assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 0);
     }
 }

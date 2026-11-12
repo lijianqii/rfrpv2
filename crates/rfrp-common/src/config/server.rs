@@ -15,6 +15,18 @@ fn default_bind_port() -> u16 {
 fn default_true() -> bool {
     true
 }
+fn default_max_active_connections() -> i64 {
+    crate::constants::MAX_ACTIVE_CONNECTIONS
+}
+fn default_max_total_proxies() -> usize {
+    crate::constants::MAX_TOTAL_PROXIES
+}
+fn default_max_total_domains() -> usize {
+    crate::constants::MAX_TOTAL_DOMAINS
+}
+fn default_max_total_pooled_work_conns() -> usize {
+    crate::constants::MAX_TOTAL_POOLED_WORK_CONNS
+}
 
 /// `[server]` 控制监听与鉴权。
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +66,18 @@ pub struct ServerSection {
     /// 也可由 CLI `--grace-secs` 覆盖。
     #[serde(default)]
     pub grace_secs: Option<u64>,
+    /// 并发用户连接上限；低内存机器应显式调低。
+    #[serde(default = "default_max_active_connections")]
+    pub max_active_connections: i64,
+    /// 全局代理注册总数上限。
+    #[serde(default = "default_max_total_proxies")]
+    pub max_total_proxies: usize,
+    /// 全局 vhost 域名索引总数上限。
+    #[serde(default = "default_max_total_domains")]
+    pub max_total_domains: usize,
+    /// 全局预热工作连接总数上限。
+    #[serde(default = "default_max_total_pooled_work_conns")]
+    pub max_total_pooled_work_conns: usize,
 }
 
 impl Default for ServerSection {
@@ -71,6 +95,10 @@ impl Default for ServerSection {
             heartbeat_timeout_secs: None,
             udp_session_timeout_secs: None,
             grace_secs: None,
+            max_active_connections: default_max_active_connections(),
+            max_total_proxies: default_max_total_proxies(),
+            max_total_domains: default_max_total_domains(),
+            max_total_pooled_work_conns: default_max_total_pooled_work_conns(),
         }
     }
 }
@@ -334,6 +362,30 @@ impl ServerConfig {
                     "grace_secs {secs} out of range 0-{}",
                     crate::constants::GRACEFUL_SHUTDOWN_TIMEOUT_MAX_SECS
                 )));
+            }
+        }
+        if !(1..=1_000_000).contains(&self.server.max_active_connections) {
+            return Err(config("max_active_connections must be 1-1000000"));
+        }
+        for (name, value, max) in [
+            (
+                "max_total_proxies",
+                self.server.max_total_proxies,
+                1_000_000,
+            ),
+            (
+                "max_total_domains",
+                self.server.max_total_domains,
+                10_000_000,
+            ),
+            (
+                "max_total_pooled_work_conns",
+                self.server.max_total_pooled_work_conns,
+                1_000_000,
+            ),
+        ] {
+            if !(1..=max).contains(&value) {
+                return Err(config(format!("{name} must be 1-{max}")));
             }
         }
         self.validate_heartbeat()?;

@@ -718,6 +718,9 @@ fn registration_hint(code: Option<ProxyError>) -> &'static str {
             "[[proxy]] 字段缺失或格式错误：检查 remote_port / custom_domains 等"
         }
         Some(ProxyError::TooManyProxies) => "单会话代理数超过服务端上限：减少 [[proxy]] 条目",
+        Some(ProxyError::TooManyDomains) => {
+            "服务端 vhost 域名总数超过上限：减少域名或提高 max_total_domains"
+        }
         Some(ProxyError::DomainConflict) => "域名与其他代理冲突（通常可重试）",
         Some(ProxyError::PortOccupied) => "端口被占用（通常可重试）",
         Some(ProxyError::Internal) | None => "查看服务端日志获取详细原因",

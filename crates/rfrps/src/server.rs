@@ -66,10 +66,12 @@ impl Server {
         let heartbeat_interval = config.server.heartbeat_interval();
         let heartbeat_timeout = config.server.heartbeat_timeout();
         let grace = config.server.grace();
+        let state = ServerState::new();
+        state.configure_limits(&config);
         Ok(Self {
             config: Arc::new(config),
             listener,
-            state: ServerState::new(),
+            state,
             grace,
             heartbeat_interval,
             heartbeat_timeout,
