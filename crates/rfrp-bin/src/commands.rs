@@ -321,6 +321,30 @@ fn spawn_supervised_stdin(shutdown: CancellationToken) {
     });
 }
 
+/// 向 supervisor 报告“已完成初始化”及 effective grace；普通启动时 no-op。
+fn write_ready_file(grace_secs: u64) -> std::io::Result<()> {
+    let Some(path) = std::env::var_os("RFRP_READY_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    use std::io::Write as _;
+    write!(
+        file,
+        "pid={}\ngrace_secs={}\n",
+        std::process::id(),
+        grace_secs
+    )?;
+    file.sync_all()
+}
+
 /// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
 pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     let exit_watch = if args.watch_exit && !args.check {
@@ -372,6 +396,10 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
     };
     // 优雅退出宽限期可由 CLI 覆盖（配置文件为 [server].grace_secs，见 §14.4）。
     let server = server.with_grace(effective_grace);
+    if let Err(e) = write_ready_file(effective_grace.as_secs()) {
+        eprintln!("failed to write supervisor ready file: {e}");
+        return ExitCode::FAILURE;
+    }
     let restart_requested = Arc::new(AtomicBool::new(false));
     let exit_watcher = exit_watch.map(|watch| {
         spawn_server_exit_watcher(
@@ -436,6 +464,10 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = write_ready_file(0) {
+        tracing::error!(error = %e, "failed to write supervisor ready file");
+        return ExitCode::FAILURE;
+    }
     let restart_requested = Arc::new(AtomicBool::new(false));
     let exit_watcher = exit_watch.map(|watch| {
         spawn_client_exit_watcher(

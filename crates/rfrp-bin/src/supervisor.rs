@@ -30,8 +30,8 @@ use rfrp_common::util::signal::spawn_signal_watcher;
 use crate::watch::watch_config_file;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
-const STARTUP_GRACE: Duration = Duration::from_secs(3);
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_MARGIN: Duration = Duration::from_secs(5);
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -39,11 +39,13 @@ enum RollbackOutcome {
     StartedOld {
         child: Child,
         config_changed: bool,
+        grace: Duration,
     },
     StartedNew {
         child: Child,
         stage: PathBuf,
         args: Vec<OsString>,
+        grace: Duration,
     },
     Shutdown,
 }
@@ -94,15 +96,18 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     let shutdown = CancellationToken::new();
     let sig = spawn_signal_watcher(shutdown.clone());
 
-    let mut child = match spawn_child(&exe, &active_args).await {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("rfrp supervisor: cannot start child: {e}");
-            sig.abort();
-            let _ = fs::remove_file(&active_stage);
-            return ExitCode::FAILURE;
-        }
-    };
+    let active_ready = ready_path(&active_stage);
+    let (mut child, mut child_grace) =
+        match spawn_and_check(&exe, &active_args, &active_ready).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rfrp supervisor: cannot start child: {e}");
+                sig.abort();
+                let _ = fs::remove_file(&active_stage);
+                let _ = fs::remove_file(&active_ready);
+                return ExitCode::FAILURE;
+            }
+        };
     eprintln!(
         "rfrp supervisor: started child pid={}",
         child.id().unwrap_or(0)
@@ -156,7 +161,8 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             if !wait_or_shutdown(backoff, &shutdown).await {
                 break;
             }
-            match spawn_child(&exe, &active_args).await {
+            let restart_ready = ready_path(&active_stage);
+            match spawn_child(&exe, &active_args, &restart_ready).await {
                 Ok(new_child) => {
                     child = new_child;
                     child_started_at = Instant::now();
@@ -196,15 +202,19 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
 
         let old_stage = active_stage.clone();
         let old_args = active_args.clone();
-        stop_child(&mut child).await;
+        let old_ready = ready_path(&old_stage);
+        let new_ready = ready_path(&new_stage);
+        stop_child(&mut child, child_grace).await;
 
-        match spawn_and_check(&exe, &new_args).await {
-            Ok(new_child) => {
+        match spawn_and_check(&exe, &new_args, &new_ready).await {
+            Ok((new_child, grace)) => {
                 child = new_child;
+                child_grace = grace;
                 child_started_at = Instant::now();
                 active_args = new_args;
                 active_stage = new_stage;
                 let _ = fs::remove_file(&old_stage);
+                let _ = fs::remove_file(&old_ready);
                 eprintln!(
                     "rfrp supervisor: started child pid={}",
                     child.id().unwrap_or(0)
@@ -214,12 +224,14 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             Err(e) => {
                 eprintln!("rfrp supervisor: new config child failed to start: {e}; rolling back");
                 let _ = fs::remove_file(&new_stage);
+                let _ = fs::remove_file(&new_ready);
                 // 旧 stage 一直保留到新子进程成功后才删除，因此回滚是确定可用的。
                 // 回滚重试期间继续消费配置事件：用户改出第三个合法配置时应尝试
                 // 新配置，而不是永远卡在旧配置上。
                 match spawn_rollback_with_retry(
                     &exe,
                     &old_args,
+                    &old_ready,
                     &shutdown,
                     &mut event_rx,
                     &config,
@@ -231,8 +243,10 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                     RollbackOutcome::StartedOld {
                         child: rollback_child,
                         config_changed,
+                        grace,
                     } => {
                         child = rollback_child;
+                        child_grace = grace;
                         child_started_at = Instant::now();
                         active_args = old_args;
                         active_stage = old_stage;
@@ -247,12 +261,15 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                         child: new_child,
                         stage,
                         args,
+                        grace,
                     } => {
                         child = new_child;
+                        child_grace = grace;
                         child_started_at = Instant::now();
                         active_args = args;
                         active_stage = stage;
                         let _ = fs::remove_file(&old_stage);
+                        let _ = fs::remove_file(&old_ready);
                         eprintln!(
                             "rfrp supervisor: started child pid={} with updated config",
                             child.id().unwrap_or(0)
@@ -263,6 +280,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                         // 回滚重试期间收到退出信号。
                         sig.abort();
                         let _ = fs::remove_file(&old_stage);
+                        let _ = fs::remove_file(&old_ready);
                         return ExitCode::SUCCESS;
                     }
                 }
@@ -270,8 +288,9 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         }
     }
 
-    stop_child(&mut child).await;
+    stop_child(&mut child, child_grace).await;
     let _ = fs::remove_file(&active_stage);
+    let _ = fs::remove_file(ready_path(&active_stage));
     sig.abort();
     ExitCode::SUCCESS
 }
@@ -293,6 +312,31 @@ fn stage_path(config: &Path, generation: u64) -> PathBuf {
         ".{name}.stage.{}.{generation}.toml",
         std::process::id()
     ))
+}
+
+fn ready_path(stage: &Path) -> PathBuf {
+    stage.with_extension("ready")
+}
+
+/// 读取子进程写入的就绪标记，校验 pid 并取出 effective grace。
+fn read_ready(path: &Path, pid: Option<u32>) -> Option<Duration> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut pid_ok = pid.is_none();
+    let mut grace = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("pid=") {
+            if let Some(expected) = pid {
+                pid_ok = value.trim().parse::<u32>().ok() == Some(expected);
+            }
+        } else if let Some(value) = line.strip_prefix("grace_secs=") {
+            grace = value.trim().parse::<u64>().ok().map(Duration::from_secs);
+        }
+    }
+    if pid_ok {
+        grace
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -338,23 +382,38 @@ async fn validate(exe: &Path, child_args: &[OsString]) -> bool {
 async fn spawn_and_check(
     exe: &Path,
     child_args: &[OsString],
-) -> std::result::Result<Child, String> {
-    let mut child = spawn_child(exe, child_args)
+    ready: &Path,
+) -> std::result::Result<(Child, Duration), String> {
+    let _ = fs::remove_file(ready);
+    let mut child = spawn_child(exe, child_args, ready)
         .await
         .map_err(|e| format!("spawn failed: {e}"))?;
-    let deadline = Instant::now() + STARTUP_GRACE;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let _ = fs::remove_file(ready);
                 return Err(format!("child exited during startup: {status}"));
             }
             Ok(None) => {}
-            Err(e) => return Err(format!("try_wait failed: {e}")),
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = fs::remove_file(ready);
+                return Err(format!("try_wait failed: {e}"));
+            }
+        }
+        if let Some(grace) = read_ready(ready, child.id()) {
+            let _ = fs::remove_file(ready);
+            return Ok((child, grace));
         }
         if Instant::now() >= deadline {
-            return Ok(child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = fs::remove_file(ready);
+            return Err("child did not become ready before startup timeout".into());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -365,6 +424,7 @@ async fn spawn_and_check(
 async fn spawn_rollback_with_retry(
     exe: &Path,
     old_args: &[OsString],
+    old_ready: &Path,
     shutdown: &CancellationToken,
     event_rx: &mut mpsc::Receiver<()>,
     config: &Path,
@@ -375,11 +435,12 @@ async fn spawn_rollback_with_retry(
     let mut event_open = true;
     let mut config_changed = false;
     loop {
-        match spawn_and_check(exe, old_args).await {
-            Ok(child) => {
+        match spawn_and_check(exe, old_args, old_ready).await {
+            Ok((child, grace)) => {
                 return RollbackOutcome::StartedOld {
                     child,
                     config_changed,
+                    grace,
                 }
             }
             Err(e) => {
@@ -411,17 +472,26 @@ async fn spawn_rollback_with_retry(
             while event_rx.try_recv().is_ok() {}
             *generation += 1;
             match stage_and_validate(exe, config, base_args, *generation).await {
-                Ok((stage, args)) => match spawn_and_check(exe, &args).await {
-                    Ok(child) => {
-                        return RollbackOutcome::StartedNew { child, stage, args };
+                Ok((stage, args)) => {
+                    let ready = ready_path(&stage);
+                    match spawn_and_check(exe, &args, &ready).await {
+                        Ok((child, grace)) => {
+                            return RollbackOutcome::StartedNew {
+                                child,
+                                stage,
+                                args,
+                                grace,
+                            };
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "rfrp supervisor: updated config child failed to start: {e}; continuing rollback"
+                            );
+                            let _ = fs::remove_file(&stage);
+                            let _ = fs::remove_file(&ready);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "rfrp supervisor: updated config child failed to start: {e}; continuing rollback"
-                        );
-                        let _ = fs::remove_file(&stage);
-                    }
-                },
+                }
                 Err(e) => {
                     eprintln!("rfrp supervisor: updated config invalid: {e}; continuing rollback");
                 }
@@ -455,11 +525,12 @@ async fn stage_and_validate(
     Ok((stage, args))
 }
 
-async fn spawn_child(exe: &Path, child_args: &[OsString]) -> std::io::Result<Child> {
+async fn spawn_child(exe: &Path, child_args: &[OsString], ready: &Path) -> std::io::Result<Child> {
     Command::new(exe)
         .args(child_args)
         .env("RFRP_WATCH_CHILD", "1")
         .env("RFRP_SUPERVISOR_PIPE", "1")
+        .env("RFRP_READY_FILE", ready)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -473,15 +544,20 @@ async fn wait_or_shutdown(backoff: Duration, shutdown: &CancellationToken) -> bo
     }
 }
 
-async fn stop_child(child: &mut Child) {
+async fn stop_child(child: &mut Child, grace: Duration) {
     if let Some(stdin) = child.stdin.as_mut() {
         let _ = stdin.write_all(b"shutdown\n").await;
         let _ = stdin.flush().await;
     }
-    match timeout(STOP_TIMEOUT, child.wait()).await {
+    // 子进程会按 effective grace 排空在途连接；这里只做硬上限兜底。
+    let wait = grace.saturating_add(STOP_MARGIN);
+    match timeout(wait, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
-            eprintln!("rfrp supervisor: child did not stop in time; killing");
+            eprintln!(
+                "rfrp supervisor: child did not stop within {}s; killing",
+                wait.as_secs()
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -568,6 +644,32 @@ mod tests {
         assert_eq!(replaced[1], "-c/tmp/new-config.toml");
 
         assert!(with_config_arg(&[OsString::from("server")], path).is_err());
+    }
+
+    #[test]
+    fn ready_path_is_sibling_of_stage() {
+        let stage = Path::new("/etc/rfrp/.server.toml.stage.1.2.toml");
+        let ready = ready_path(stage);
+        assert_eq!(ready.parent(), stage.parent());
+        assert!(ready.to_string_lossy().ends_with(".ready"));
+    }
+
+    #[test]
+    fn reads_ready_pid_and_grace() {
+        let dir = std::env::temp_dir().join(format!(
+            "rfrp-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ready");
+        std::fs::write(&path, "pid=123\ngrace_secs=42\n").unwrap();
+        assert_eq!(read_ready(&path, Some(123)), Some(Duration::from_secs(42)));
+        assert_eq!(read_ready(&path, Some(124)), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
