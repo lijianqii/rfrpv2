@@ -93,10 +93,21 @@ pub(crate) fn test_session_with_token(
     run_id: &str,
     token: &str,
 ) -> (Arc<Session>, mpsc::Receiver<Message>) {
+    test_session_with_id(run_id, "s", token)
+}
+
+/// 同 [`test_session_with_token`]，但可指定 `session_id`，
+/// 用于模拟同一 `run_id` 重连后旧会话被新会话替换的场景。
+#[cfg(test)]
+pub(crate) fn test_session_with_id(
+    run_id: &str,
+    session_id: &str,
+    token: &str,
+) -> (Arc<Session>, mpsc::Receiver<Message>) {
     let (tx, rx) = mpsc::channel(8);
     let session = Arc::new(Session {
         run_id: run_id.to_string(),
-        session_id: "s".to_string(),
+        session_id: session_id.to_string(),
         peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         work_conn_token: token.to_string(),
         tx,

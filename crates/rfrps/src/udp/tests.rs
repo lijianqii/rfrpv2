@@ -19,6 +19,10 @@ async fn test_proxy(session_timeout: Duration, pending_timeout: Duration) -> Arc
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         queue_bytes: Arc::new(AtomicUsize::new(0)),
+        global_queue_bytes: Arc::new(AtomicUsize::new(0)),
+        global_queue_max: UDP_GLOBAL_QUEUE_MAX_BYTES,
+        global_sessions: Arc::new(AtomicUsize::new(0)),
+        global_sessions_max: MAX_TOTAL_UDP_SESSIONS,
         session_timeout,
         pending_timeout,
         owner_session_id: "test-session".into(),
@@ -210,7 +214,7 @@ async fn datagram_dropped_when_session_channel_full() {
     let peer: SocketAddr = "127.0.0.1:1004".parse().unwrap();
 
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
-    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None).unwrap())
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None, None, 0).unwrap())
         .expect("fill channel");
     proxy.sessions.lock().insert(
         peer,
@@ -256,7 +260,7 @@ async fn datagram_dropped_when_pending_channel_full() {
     let peer: SocketAddr = "127.0.0.1:1005".parse().unwrap();
 
     let (tx, _keep_rx) = mpsc::channel::<UdpPacket>(1);
-    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None).unwrap())
+    tx.try_send(alloc_udp_packet(&proxy.packet_pool, &[0u8], None, None, 0).unwrap())
         .expect("fill channel");
     proxy.pending_by_id.lock().insert(
         7,
@@ -301,7 +305,14 @@ async fn queue_byte_budget_rejects_and_releases() {
     proxy.queue_bytes.store(near_limit, Ordering::Relaxed);
 
     assert!(
-        alloc_udp_packet(&proxy.packet_pool, &[0u8; 16], Some(&proxy.queue_bytes)).is_none(),
+        alloc_udp_packet(
+            &proxy.packet_pool,
+            &[0u8; 16],
+            Some(&proxy.queue_bytes),
+            None,
+            0,
+        )
+        .is_none(),
         "packet exceeding the proxy queue budget must be rejected"
     );
     assert_eq!(
@@ -310,8 +321,14 @@ async fn queue_byte_budget_rejects_and_releases() {
         "rejected packet must not leak budget"
     );
 
-    let packet = alloc_udp_packet(&proxy.packet_pool, &[0u8; 8], Some(&proxy.queue_bytes))
-        .expect("packet under the remaining budget");
+    let packet = alloc_udp_packet(
+        &proxy.packet_pool,
+        &[0u8; 8],
+        Some(&proxy.queue_bytes),
+        None,
+        0,
+    )
+    .expect("packet under the remaining budget");
     assert_eq!(
         proxy.queue_bytes.load(Ordering::Relaxed),
         UDP_PROXY_QUEUE_MAX_BYTES,
@@ -379,6 +396,10 @@ async fn first_datagram_creates_pending_and_requests_work_conn() {
 async fn register_udp_proxy_wires_per_proxy_stats() {
     let state = ServerState::new();
     let (session, _ctl_rx) = test_session();
+    state
+        .sessions
+        .lock()
+        .insert(session.run_id.clone(), session.clone());
     let handle = register_udp_proxy(
         "udp-stats".into(),
         0,
@@ -750,4 +771,52 @@ async fn datagram_dropped_when_pending_limit_reached() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
+}
+
+#[tokio::test]
+async fn global_udp_session_budget_is_enforced_and_released() {
+    let mut proxy = test_proxy(Duration::from_secs(60), Duration::from_secs(60)).await;
+    Arc::get_mut(&mut proxy).unwrap().global_sessions_max = 1;
+    let (tx1, _rx1) = mpsc::channel(4);
+    let client1: SocketAddr = "127.0.0.1:30001".parse().unwrap();
+    assert!(register_session(
+        &proxy,
+        client1,
+        tx1,
+        1,
+        CancellationToken::new()
+    ));
+    let (tx2, _rx2) = mpsc::channel(4);
+    let client2: SocketAddr = "127.0.0.1:30002".parse().unwrap();
+    assert!(
+        !register_session(&proxy, client2, tx2, 2, CancellationToken::new()),
+        "global session budget must reject a second proxy session"
+    );
+    remove_session_if_owner(&proxy, client1, 1);
+    let (tx3, _rx3) = mpsc::channel(4);
+    assert!(register_session(
+        &proxy,
+        client2,
+        tx3,
+        3,
+        CancellationToken::new()
+    ));
+    remove_session_if_owner(&proxy, client2, 3);
+    assert_eq!(proxy.global_sessions.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn global_udp_queue_budget_rejects_and_releases() {
+    let global = Arc::new(AtomicUsize::new(0));
+    let pool = Arc::new(Mutex::new(Vec::new()));
+    assert!(
+        alloc_udp_packet(&pool, &[0u8; 8], None, Some(&global), 4).is_none(),
+        "global queue budget must reject an oversized packet"
+    );
+    assert_eq!(global.load(Ordering::Relaxed), 0);
+    let packet = alloc_udp_packet(&pool, &[0u8; 4], None, Some(&global), 4)
+        .expect("packet under global budget");
+    assert_eq!(global.load(Ordering::Relaxed), 4);
+    drop(packet);
+    assert_eq!(global.load(Ordering::Relaxed), 0);
 }

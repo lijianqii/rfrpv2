@@ -13,17 +13,32 @@ use crate::error::{config, Result};
 /// - 端口范围为 1-65535。
 pub fn split_host_port(s: &str) -> Result<(String, u16)> {
     let s = s.trim();
-    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
-        rest.split_once("]:")
-            .ok_or_else(|| config(format!("invalid address '{s}': expected [IPv6]:PORT")))?
+    let (host, port, bracketed) = if let Some(rest) = s.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .ok_or_else(|| config(format!("invalid address '{s}': expected [IPv6]:PORT")))?;
+        (host, port, true)
     } else {
-        s.rsplit_once(':')
-            .ok_or_else(|| config(format!("invalid address '{s}': expected HOST:PORT")))?
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| config(format!("invalid address '{s}': expected HOST:PORT")))?;
+        (host, port, false)
     };
     let host = host.trim();
     if host.is_empty() {
         return Err(config(format!(
             "invalid address '{s}': host must not be empty"
+        )));
+    }
+    if bracketed {
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            config(format!(
+                "invalid address '{s}': bracketed host must be IPv6"
+            ))
+        })?;
+    } else if host.contains(':') {
+        return Err(config(format!(
+            "invalid address '{s}': bare IPv6 or host:port must be bracketed/without extra colon"
         )));
     }
     let port: u16 = port
@@ -71,6 +86,10 @@ mod tests {
             "host:0",
             "host:70000",
             "[::1]",
+            "::1",
+            "2001:db8::1",
+            "[example.com]:7000",
+            "host:7000:8000",
         ] {
             assert!(split_host_port(bad).is_err(), "{bad} must be rejected");
         }

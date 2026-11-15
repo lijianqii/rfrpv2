@@ -34,6 +34,16 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// 新配置子进程 ready 后的观察期；期间退出则回滚旧 stage。
+const PROBATION: Duration = Duration::from_secs(rfrp_common::constants::MIN_STABLE_CONNECTION_SECS);
+
+/// 新配置已启动但尚未稳定的旧配置快照。
+struct Probation {
+    old_stage: PathBuf,
+    old_args: Vec<OsString>,
+    old_ready: PathBuf,
+    started: Instant,
+}
 
 enum RollbackOutcome {
     StartedOld {
@@ -118,6 +128,8 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     let mut tick = interval(Duration::from_millis(500));
     // 回滚期间收到配置事件并只恢复了旧配置时，外层需要再处理一次当前配置。
     let mut pending_reload = false;
+    // 新配置子进程通过 ready 后保留旧 stage 的观察期。
+    let mut probation: Option<Probation> = None;
     loop {
         let mut reload_requested = pending_reload;
         pending_reload = false;
@@ -147,11 +159,94 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             }
         }
 
+        if let Some(p) = probation.as_ref() {
+            if p.started.elapsed() >= PROBATION {
+                let p = probation.take().expect("checked above");
+                let _ = fs::remove_file(&p.old_stage);
+                let _ = fs::remove_file(&p.old_ready);
+                eprintln!("rfrp supervisor: new config passed probation");
+            }
+        }
+
         if let Some(status) = child_status {
             eprintln!(
                 "rfrp supervisor: child exited unexpectedly ({}); restarting",
                 status
             );
+            // 新配置在观察期内退出：回滚到旧 stage，而不是继续重启新配置。
+            if let Some(p) = probation.take() {
+                if p.started.elapsed() < PROBATION {
+                    eprintln!("rfrp supervisor: child failed during probation; rolling back");
+                    let failed_stage = active_stage.clone();
+                    let failed_ready = ready_path(&failed_stage);
+                    match spawn_rollback_with_retry(
+                        &exe,
+                        &p.old_args,
+                        &p.old_ready,
+                        &shutdown,
+                        &mut event_rx,
+                        &config,
+                        &base_args,
+                        &mut generation,
+                    )
+                    .await
+                    {
+                        RollbackOutcome::StartedOld {
+                            child: rollback_child,
+                            config_changed,
+                            grace,
+                        } => {
+                            child = rollback_child;
+                            child_grace = grace;
+                            child_started_at = Instant::now();
+                            active_args = p.old_args;
+                            active_stage = p.old_stage;
+                            let _ = fs::remove_file(&failed_stage);
+                            let _ = fs::remove_file(&failed_ready);
+                            eprintln!(
+                                "rfrp supervisor: rollback child pid={} (probation failure)",
+                                child.id().unwrap_or(0)
+                            );
+                            backoff = BACKOFF_INITIAL;
+                            pending_reload = config_changed;
+                            continue;
+                        }
+                        RollbackOutcome::StartedNew {
+                            child: new_child,
+                            stage,
+                            args,
+                            grace,
+                        } => {
+                            child = new_child;
+                            child_grace = grace;
+                            child_started_at = Instant::now();
+                            active_args = args;
+                            active_stage = stage;
+                            let _ = fs::remove_file(&p.old_stage);
+                            let _ = fs::remove_file(&p.old_ready);
+                            let _ = fs::remove_file(&failed_stage);
+                            let _ = fs::remove_file(&failed_ready);
+                            eprintln!(
+                                "rfrp supervisor: started child pid={} with newer config during probation rollback",
+                                child.id().unwrap_or(0)
+                            );
+                            backoff = BACKOFF_INITIAL;
+                            continue;
+                        }
+                        RollbackOutcome::Shutdown => {
+                            sig.abort();
+                            let _ = fs::remove_file(&p.old_stage);
+                            let _ = fs::remove_file(&p.old_ready);
+                            let _ = fs::remove_file(&failed_stage);
+                            let _ = fs::remove_file(&failed_ready);
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                }
+                // 观察期已过：清掉旧 stage 后走普通崩溃重启。
+                let _ = fs::remove_file(&p.old_stage);
+                let _ = fs::remove_file(&p.old_ready);
+            }
             // 稳定运行过的子进程崩溃不应继承历史退避（最多 30s）。
             if child_started_at.elapsed()
                 >= Duration::from_secs(rfrp_common::constants::MIN_STABLE_CONNECTION_SECS)
@@ -183,6 +278,11 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         if !reload_requested {
             continue;
         }
+        // 新的重载以当前运行配置为回滚目标；上一代 probation 的旧 stage 不再需要。
+        if let Some(prev) = probation.take() {
+            let _ = fs::remove_file(&prev.old_stage);
+            let _ = fs::remove_file(&prev.old_ready);
+        }
         // 合并编辑器保存产生的连续事件。
         sleep(DEBOUNCE).await;
         while event_rx.try_recv().is_ok() {}
@@ -213,8 +313,13 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                 child_started_at = Instant::now();
                 active_args = new_args;
                 active_stage = new_stage;
-                let _ = fs::remove_file(&old_stage);
-                let _ = fs::remove_file(&old_ready);
+                // 旧 stage 保留到新子进程通过观察期；期间退出可回滚。
+                probation = Some(Probation {
+                    old_stage,
+                    old_args,
+                    old_ready,
+                    started: Instant::now(),
+                });
                 eprintln!(
                     "rfrp supervisor: started child pid={}",
                     child.id().unwrap_or(0)
@@ -289,6 +394,10 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     }
 
     stop_child(&mut child, child_grace).await;
+    if let Some(p) = probation.take() {
+        let _ = fs::remove_file(&p.old_stage);
+        let _ = fs::remove_file(&p.old_ready);
+    }
     let _ = fs::remove_file(&active_stage);
     let _ = fs::remove_file(ready_path(&active_stage));
     sig.abort();

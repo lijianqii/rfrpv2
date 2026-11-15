@@ -1,6 +1,8 @@
 //! HTTP/HTTPS vhost 代理：按 Host/SNI 路由到对应代理，
 //! 把已读请求头连同剩余流一起桥接。
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ use rfrp_common::crypto::ServerTls;
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::ProxyType;
 use rfrp_common::util::accept::AcceptRetry;
+use rfrp_common::util::ratelimit::rate_limit_key;
 use rfrp_common::util::stream::{BoxedStream, PrependStream};
 use rfrp_common::util::tcp::configure_tcp_stream;
 use tokio::io::AsyncReadExt;
@@ -19,6 +22,51 @@ use tokio_util::sync::CancellationToken;
 
 use crate::listener::dispatch_user_connection;
 use crate::state::ServerState;
+
+/// 同一来源（IPv4 单地址 / IPv6 /64）的 vhost 认证前并发上限。
+///
+/// 与主控制口的握手配额分开：vhost 洪泛不得挤占控制登录名额；单来源配额
+/// 保证一个 IP 无法占满 `VHOST_MAX_PREAUTH_CONNECTIONS`。
+const VHOST_MAX_PREAUTH_CONNECTIONS_PER_IP: usize = 64;
+
+/// 按来源统计 vhost 认证前连接数；guard drop 时归还。
+#[derive(Default)]
+struct VhostPreauth {
+    counts: parking_lot::Mutex<HashMap<IpAddr, usize>>,
+}
+
+struct VhostPreauthGuard {
+    owner: Arc<VhostPreauth>,
+    key: IpAddr,
+}
+
+impl Drop for VhostPreauthGuard {
+    fn drop(&mut self) {
+        let mut counts = self.owner.counts.lock();
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl VhostPreauth {
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<VhostPreauthGuard> {
+        let key = rate_limit_key(ip);
+        let mut counts = self.counts.lock();
+        let n = counts.entry(key).or_insert(0);
+        if *n >= VHOST_MAX_PREAUTH_CONNECTIONS_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(VhostPreauthGuard {
+            owner: self.clone(),
+            key,
+        })
+    }
+}
 
 /// HTTP vhost accept 循环：读取请求头取 Host，路由到对应代理。
 pub async fn run_http_vhost(
@@ -31,6 +79,7 @@ pub async fn run_http_vhost(
     let mut retry = AcceptRetry::new();
     // 认证前并发上限：请求头/TLS 握手阶段每个连接最多占 10s，必须在 spawn 前限流。
     let preauth = Arc::new(tokio::sync::Semaphore::new(VHOST_MAX_PREAUTH_CONNECTIONS));
+    let preauth_by_ip = Arc::new(VhostPreauth::default());
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -40,6 +89,11 @@ pub async fn run_http_vhost(
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TCP stream");
                         }
+                        let Some(ip_guard) = preauth_by_ip.try_acquire(peer.ip()) else {
+                            tracing::debug!(%peer, "vhost http per-source preauth limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let Ok(permit) = preauth.clone().try_acquire_owned() else {
                             tracing::debug!(%peer, "vhost http preauth limit reached; dropping connection");
                             drop(stream);
@@ -49,6 +103,7 @@ pub async fn run_http_vhost(
                         let tracker = state.data_tasks.clone();
                         tracker.spawn(async move {
                             let _permit = permit;
+                            let _ip_guard = ip_guard;
                             let _ = handle_http_connection(stream, state).await;
                         });
                     }
@@ -91,6 +146,7 @@ pub async fn run_https_vhost(
     let mut retry = AcceptRetry::new();
     // 认证前并发上限：TLS 握手 + 请求头阶段可各占 10s，必须在 spawn 前限流。
     let preauth = Arc::new(tokio::sync::Semaphore::new(VHOST_MAX_PREAUTH_CONNECTIONS));
+    let preauth_by_ip = Arc::new(VhostPreauth::default());
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -100,6 +156,11 @@ pub async fn run_https_vhost(
                         if let Err(e) = configure_tcp_stream(&stream) {
                             tracing::warn!(%peer, error = %e, "failed to configure vhost TLS TCP stream");
                         }
+                        let Some(ip_guard) = preauth_by_ip.try_acquire(peer.ip()) else {
+                            tracing::debug!(%peer, "vhost https per-source preauth limit reached; dropping connection");
+                            drop(stream);
+                            continue;
+                        };
                         let Ok(permit) = preauth.clone().try_acquire_owned() else {
                             tracing::debug!(%peer, "vhost https preauth limit reached; dropping connection");
                             drop(stream);
@@ -110,6 +171,7 @@ pub async fn run_https_vhost(
                         let tracker = state.data_tasks.clone();
                         tracker.spawn(async move {
                             let _permit = permit;
+                            let _ip_guard = ip_guard;
                             let accepted = tokio::time::timeout(
                                 Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
                                 tls.accept(stream),
@@ -270,18 +332,41 @@ where
                     return Ok(None);
                 }
                 let mut host = None;
+                let mut host_seen = false;
+                let mut content_length_seen = false;
+                let mut transfer_encoding_seen = false;
                 for h in req.headers.iter() {
                     if h.name.eq_ignore_ascii_case("host") {
-                        if host.is_some() {
+                        if host_seen {
                             tracing::warn!("duplicate vhost Host header, closing");
                             return Ok(None);
                         }
-                        if let Ok(value) = std::str::from_utf8(h.value) {
-                            // 路由层只接受 ASCII 域名；统一小写，避免 Unicode
-                            // 大小写映射把 Host 路由到另一个注册域名。
-                            host = Some(strip_port(value).to_ascii_lowercase());
+                        host_seen = true;
+                        let Ok(value) = std::str::from_utf8(h.value) else {
+                            tracing::warn!("invalid UTF-8 vhost Host header, closing");
+                            return Ok(None);
+                        };
+                        // 路由层只接受 ASCII 域名；统一小写，避免 Unicode
+                        // 大小写映射把 Host 路由到另一个注册域名。
+                        host = Some(strip_port(value).to_ascii_lowercase());
+                    } else if h.name.eq_ignore_ascii_case("content-length") {
+                        if content_length_seen {
+                            tracing::warn!("duplicate vhost Content-Length header, closing");
+                            return Ok(None);
                         }
+                        content_length_seen = true;
+                    } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        if transfer_encoding_seen {
+                            tracing::warn!("duplicate vhost Transfer-Encoding header, closing");
+                            return Ok(None);
+                        }
+                        transfer_encoding_seen = true;
                     }
+                }
+                if content_length_seen && transfer_encoding_seen {
+                    // 同一请求同时出现 CL 与 TE 会让前后端对消息边界产生不同解释。
+                    tracing::warn!("ambiguous vhost request framing (Content-Length + Transfer-Encoding), closing");
+                    return Ok(None);
                 }
                 let stream: BoxedStream = Box::new(PrependStream::new(buf, Box::new(stream)));
                 // HTTP/1.1 要求 Host 头；缺失时用空 host 走路由，由路由层回 404，
@@ -371,6 +456,45 @@ mod tests {
 }
 
 #[cfg(test)]
+mod preauth_tests {
+    use super::*;
+
+    #[test]
+    fn vhost_preauth_enforces_per_source_limit() {
+        let limiter = Arc::new(VhostPreauth::default());
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let guards: Vec<_> = (0..VHOST_MAX_PREAUTH_CONNECTIONS_PER_IP)
+            .map(|_| limiter.try_acquire(ip).expect("under limit"))
+            .collect();
+        assert!(limiter.try_acquire(ip).is_none());
+        assert!(
+            limiter
+                .try_acquire("203.0.113.10".parse().unwrap())
+                .is_some(),
+            "different IPv4 source must be independent"
+        );
+        drop(guards);
+        assert!(limiter.try_acquire(ip).is_some());
+    }
+
+    #[test]
+    fn vhost_preauth_aggregates_ipv6_by_64() {
+        let limiter = Arc::new(VhostPreauth::default());
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let guards: Vec<_> = (0..VHOST_MAX_PREAUTH_CONNECTIONS_PER_IP)
+            .map(|_| limiter.try_acquire(a).expect("under limit"))
+            .collect();
+        assert!(
+            limiter.try_acquire(b).is_none(),
+            "same IPv6 /64 must share the quota"
+        );
+        drop(guards);
+        assert!(limiter.try_acquire(b).is_some());
+    }
+}
+
+#[cfg(test)]
 mod head_tests {
     use super::*;
     use crate::control::test_entry;
@@ -394,6 +518,51 @@ mod head_tests {
         a.write_all(b"GET / HTTP/1.1\r\nHost: a.example.com\r\nHost: b.example.com\r\n\r\n")
             .await
             .unwrap();
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_invalid_utf8_host_before_duplicate_check() {
+        // 第一个 Host 非法 UTF-8 时不能把 seen 标记留空，否则第二个 Host 会被接受，
+        // 导致 rfrps 按第二个 Host 路由、后端却可能按第一个 Host 解析。
+        let (mut a, b) = duplex(1024);
+        a.write_all(b"GET / HTTP/1.1\r\nHost: \x80\r\nHost: victim.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_duplicate_content_length() {
+        let (mut a, b) = duplex(1024);
+        a.write_all(
+            b"POST / HTTP/1.1\r\nHost: dev.example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_content_length_with_transfer_encoding() {
+        // CL + TE 并存会让 rfrps 与后端的消息边界解释不一致（请求走私面）。
+        let (mut a, b) = duplex(1024);
+        a.write_all(
+            b"POST / HTTP/1.1\r\nHost: dev.example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(read_request_head(b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_request_head_rejects_duplicate_transfer_encoding() {
+        let (mut a, b) = duplex(1024);
+        a.write_all(
+            b"POST / HTTP/1.1\r\nHost: dev.example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n",
+        )
+        .await
+        .unwrap();
         assert!(read_request_head(b).await.unwrap().is_none());
     }
 

@@ -584,12 +584,15 @@ class Stack:
         self.case.processes.append((proc, log))
         return proc
 
-    def _health_ok(self) -> bool:
+    def _health_on(self, port: int) -> bool:
         try:
-            status, _ = http_get(self.dashboard_port, "/healthz", auth=False)
+            status, _ = http_get(port, "/healthz", auth=False)
             return status == 200
-        except OSError:
+        except Exception:
             return False
+
+    def _health_ok(self) -> bool:
+        return self._health_on(self.dashboard_port)
 
     def _wait_proxies_ready(self, timeout: float) -> bool:
         if self.tcp_local is not None:
@@ -1060,6 +1063,67 @@ class E2E(unittest.TestCase):
                 20.0,
             ),
             "proxy did not recover after restoring config",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")
+    def test_watch_config_probation_rolls_back_after_ready(self) -> None:
+        # 新配置通过 ready 后在 probation 内崩溃：必须回滚旧 stage，而不是继续重启新配置。
+        echo = self.tcp_echo()
+        stack = self.make_stack(
+            tcp_local=echo.port,
+            log_level="info",
+            server_extra_args=["--watch-config=restart"],
+        )
+        parent = stack.server_proc
+        original = stack.server_config.read_text(encoding="utf-8")
+        self.assertTrue(
+            wait_until(lambda: len(server_child_pids(parent.pid)) == 1, 10.0),
+            "supervisor did not start a child",
+        )
+        old_child = server_child_pids(parent.pid)[0]
+        new_dashboard = free_tcp_port()
+        stack.server_config.write_text(
+            original.replace(
+                f'addr = "127.0.0.1:{stack.dashboard_port}"',
+                f'addr = "127.0.0.1:{new_dashboard}"',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != old_child,
+                20.0,
+            ),
+            "supervisor did not start a new config child",
+        )
+        new_child = server_child_pids(parent.pid)[0]
+        self.assertTrue(
+            wait_until(lambda: stack._health_on(new_dashboard), 15.0),
+            "new config dashboard did not become healthy",
+        )
+        os.kill(new_child, signal.SIGKILL)
+        self.assertTrue(
+            wait_until(
+                lambda: len(server_child_pids(parent.pid)) == 1
+                and server_child_pids(parent.pid)[0] != new_child,
+                20.0,
+            ),
+            "supervisor did not start a rollback child",
+        )
+        self.assertTrue(
+            wait_until(lambda: stack._health_on(stack.dashboard_port), 15.0),
+            "old dashboard did not recover after probation rollback",
+        )
+        self.assertIsNone(parent.poll(), "supervisor exited during probation rollback")
+        self.assertTrue(
+            wait_until(
+                lambda: tcp_roundtrip(
+                    stack.remote_tcp, b"probation-rollback", timeout=1.0
+                ),
+                15.0,
+            ),
+            "proxy did not recover after probation rollback",
         )
 
     @unittest.skipUnless(os.name == "posix", "supervisor child inspection requires pgrep")

@@ -114,6 +114,20 @@ impl Server {
         let vhost_https = self.vhost_https;
         let dashboard = self.dashboard;
         let dashboard_cfg = self.config.dashboard.clone();
+        let trusted_proxies: Arc<Vec<std::net::IpAddr>> = Arc::new(
+            self.config
+                .server
+                .trusted_proxies
+                .iter()
+                .filter_map(|p| match p.parse() {
+                    Ok(ip) => Some(ip),
+                    Err(_) => {
+                        tracing::warn!(value = %p, "ignoring invalid trusted_proxies entry");
+                        None
+                    }
+                })
+                .collect(),
+        );
         let config = self.config.clone();
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_timeout = self.heartbeat_timeout;
@@ -133,7 +147,8 @@ impl Server {
             let state = self.state.clone();
             let shutdown = shutdown.clone();
             tasks.spawn(async move {
-                crate::dashboard::run_dashboard(listener, cfg, state, shutdown).await;
+                crate::dashboard::run_dashboard(listener, cfg, trusted_proxies, state, shutdown)
+                    .await;
             });
         }
         // HTTPS vhost 监听循环（可选）。
@@ -402,6 +417,16 @@ fn load_control_tls(config: &ServerConfig) -> Result<Option<ServerTls>> {
     if !(config.server.tls_enable || config.server.work_conn_tls) {
         return Ok(None);
     }
+    if config.server.work_conn_tls
+        && !config.server.tls_enable
+        && !config.server.allow_plaintext_control
+    {
+        return Err(Error::Config(
+            "work_conn_tls=true with tls_enable=false sends tokens over plaintext; \
+             set tls_enable=true, or set allow_plaintext_control=true to explicitly accept the risk"
+                .into(),
+        ));
+    }
     let missing = |field: &str| {
         Error::Config(format!(
             "{field} is required when tls_enable or work_conn_tls is set"
@@ -442,7 +467,7 @@ async fn handle_connection(
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     // 首帧握手阶段（peek/TLS/首帧读取）尚未认证，单独限流：
     // 防止大量半开连接在该阶段长时间占用任务/套接字。
-    let handshake_guard = match state.begin_handshake() {
+    let handshake_guard = match state.begin_handshake(peer_ip) {
         Some(g) => g,
         None => {
             tracing::debug!(%peer_ip, "too many pending handshakes; closing");
@@ -667,7 +692,10 @@ mod tests {
     async fn handshake_limit_rejects_before_reading_frame() {
         let state = ServerState::new();
         let guards: Vec<_> = (0..rfrp_common::constants::MAX_UNAUTHENTICATED_CONNECTIONS)
-            .map(|_| state.begin_handshake().expect("under limit"))
+            .map(|i| {
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(i as u32 + 1));
+                state.begin_handshake(ip).expect("under limit")
+            })
             .collect();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -31,8 +31,10 @@ use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, MAX_ACTIVE_CONNECTIONS, MAX_SESSIONS,
     MAX_SESSIONS_PER_IP, MAX_TOTAL_DOMAINS, MAX_TOTAL_POOLED_WORK_CONNS, MAX_TOTAL_PROXIES,
-    MAX_UNAUTHENTICATED_CONNECTIONS, WORK_CONN_REQUEST_INTERVAL_MS,
+    MAX_UNAUTHENTICATED_CONNECTIONS, MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP,
+    WORK_CONN_REQUEST_INTERVAL_MS,
 };
+use rfrp_common::util::ratelimit::rate_limit_key;
 use rfrp_common::util::stream::BoxedStream;
 use rfrp_common::util::tasks::TaskGroup;
 use tokio_util::sync::CancellationToken;
@@ -75,14 +77,22 @@ pub enum ReserveError {
     Limit,
 }
 
-/// 首帧握手阶段的并发许可；drop 时归还计数。
+/// 首帧握手阶段的并发许可；drop 时归还全局与来源计数。
 pub struct HandshakeGuard {
     state: Arc<ServerState>,
+    key: IpAddr,
 }
 
 impl Drop for HandshakeGuard {
     fn drop(&mut self) {
         self.state.handshakes_active.fetch_sub(1, Ordering::Relaxed);
+        let mut by_ip = self.state.handshakes_by_ip.lock();
+        if let Some(n) = by_ip.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                by_ip.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -140,6 +150,10 @@ pub struct ServerState {
     pub max_total_pooled_work_conns: AtomicUsize,
     /// 当前已入池的预热工作连接总数。
     pub pooled_work_conns: AtomicUsize,
+    /// 所有 UDP 代理共享的待发送队列字节数。
+    pub udp_queue_bytes: Arc<AtomicUsize>,
+    /// 所有 UDP 代理当前活跃会话总数。
+    pub udp_sessions_active: Arc<AtomicUsize>,
     /// 全局并发控制会话上限（测试可调小）。
     pub max_sessions: AtomicUsize,
     /// 单来源 IP 的并发控制会话上限（测试可调小）。
@@ -148,6 +162,8 @@ pub struct ServerState {
     pub pending_request_interval_ms: AtomicU64,
     /// 当前处于首帧握手阶段的连接数。
     pub handshakes_active: AtomicUsize,
+    /// 按来源（IPv4 单地址 / IPv6 /64）统计的握手阶段连接数。
+    handshakes_by_ip: Mutex<HashMap<IpAddr, usize>>,
     /// 数据面与监听任务跟踪器：池命中的用户桥接、vhost/Dashboard 每连接任务、
     /// 代理监听和 UDP 监听都在这里登记，退出时按 grace 统一等待。
     pub data_tasks: TaskGroup,
@@ -173,10 +189,13 @@ impl ServerState {
             max_total_domains: AtomicUsize::new(MAX_TOTAL_DOMAINS),
             max_total_pooled_work_conns: AtomicUsize::new(MAX_TOTAL_POOLED_WORK_CONNS),
             pooled_work_conns: AtomicUsize::new(0),
+            udp_queue_bytes: Arc::new(AtomicUsize::new(0)),
+            udp_sessions_active: Arc::new(AtomicUsize::new(0)),
             max_sessions: AtomicUsize::new(MAX_SESSIONS),
             max_sessions_per_ip: AtomicUsize::new(MAX_SESSIONS_PER_IP),
             pending_request_interval_ms: AtomicU64::new(WORK_CONN_REQUEST_INTERVAL_MS),
             handshakes_active: AtomicUsize::new(0),
+            handshakes_by_ip: Mutex::new(HashMap::new()),
             data_tasks: TaskGroup::new(),
             shutdown: CancellationToken::new(),
         })
@@ -553,8 +572,11 @@ impl ServerState {
             .is_some_and(|s| s.session_id == session.session_id)
     }
 
-    /// 获取一个首帧握手许可；达到 [`MAX_UNAUTHENTICATED_CONNECTIONS`] 时返回 None。
-    pub fn begin_handshake(self: &Arc<Self>) -> Option<HandshakeGuard> {
+    /// 获取一个首帧握手许可；达到全局或单来源上限时返回 None。
+    ///
+    /// 来源按 [`rate_limit_key`] 聚合（IPv6 到 /64），避免轮换地址绕过配额。
+    pub fn begin_handshake(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakeGuard> {
+        let key = rate_limit_key(ip);
         loop {
             let n = self.handshakes_active.load(Ordering::Relaxed);
             if n >= MAX_UNAUTHENTICATED_CONNECTIONS {
@@ -565,8 +587,17 @@ impl ServerState {
                 .compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                let mut by_ip = self.handshakes_by_ip.lock();
+                let count = by_ip.entry(key).or_insert(0);
+                if *count >= MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP {
+                    // 来源已满：归还刚占用的全局名额，不给该来源发放许可。
+                    self.handshakes_active.fetch_sub(1, Ordering::Relaxed);
+                    return None;
+                }
+                *count += 1;
                 return Some(HandshakeGuard {
                     state: self.clone(),
+                    key,
                 });
             }
         }
@@ -787,16 +818,55 @@ mod tests {
     fn handshake_guard_enforces_limit() {
         let state = ServerState::new();
         let guards: Vec<_> = (0..MAX_UNAUTHENTICATED_CONNECTIONS)
-            .map(|_| state.begin_handshake().expect("under limit"))
+            .map(|i| {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::from(i as u32 + 1));
+                state.begin_handshake(ip).expect("under limit")
+            })
             .collect();
         assert!(
-            state.begin_handshake().is_none(),
-            "must reject beyond limit"
+            state
+                .begin_handshake("127.0.0.1".parse().unwrap())
+                .is_none(),
+            "must reject beyond global limit"
         );
         drop(guards);
         assert!(
-            state.begin_handshake().is_some(),
+            state
+                .begin_handshake("127.0.0.1".parse().unwrap())
+                .is_some(),
             "permits must be returned on drop"
+        );
+    }
+
+    #[test]
+    fn handshake_guard_enforces_per_source_limit() {
+        let state = ServerState::new();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let guards: Vec<_> = (0..MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP)
+            .map(|_| state.begin_handshake(ip).expect("under per-source limit"))
+            .collect();
+        assert!(
+            state.begin_handshake(ip).is_none(),
+            "one source must not exceed its handshake quota"
+        );
+        // 不同 IPv4 来源互不影响。
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(state.begin_handshake(other).is_some());
+        // 同一 IPv6 /64 内的地址轮换不能绕过配额。
+        let v6a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let v6b: IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let v6_guards: Vec<_> = (0..MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP)
+            .map(|_| state.begin_handshake(v6a).expect("under /64 limit"))
+            .collect();
+        assert!(
+            state.begin_handshake(v6b).is_none(),
+            "IPv6 addresses in the same /64 share the quota"
+        );
+        drop(v6_guards);
+        drop(guards);
+        assert!(
+            state.begin_handshake(ip).is_some(),
+            "per-source count must be released"
         );
     }
 }

@@ -25,14 +25,22 @@ fn login_run_id(run_id: &str) -> String {
     uuid::Uuid::from_bytes(b).to_string()
 }
 
+const TEST_TOKEN: &str = "test-token";
+
 fn login_frame(run_id: &str) -> Frame {
     Message::Login(Login {
         run_id: login_run_id(run_id),
-        token: String::new(),
+        token: TEST_TOKEN.into(),
         version: PROTOCOL_VERSION,
     })
     .to_frame()
     .unwrap()
+}
+
+fn test_config() -> ServerConfig {
+    let mut cfg = ServerConfig::default();
+    cfg.server.token = TEST_TOKEN.into();
+    cfg
 }
 
 #[tokio::test]
@@ -57,6 +65,10 @@ async fn cleanup_clears_proxy_domains() {
         stats: Arc::new(crate::metrics::ProxyStats::default()),
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         queue_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        global_queue_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        global_queue_max: rfrp_common::constants::UDP_GLOBAL_QUEUE_MAX_BYTES,
+        global_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        global_sessions_max: rfrp_common::constants::MAX_TOTAL_UDP_SESSIONS,
         session_timeout: std::time::Duration::from_secs(60),
         pending_timeout: std::time::Duration::from_secs(10),
         owner_session_id: session.session_id.clone(),
@@ -85,7 +97,7 @@ async fn cleanup_clears_proxy_domains() {
 async fn newproxy_heartbeat_close_flow() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
 
     let task = tokio::spawn(handle_control_login(
         login_frame("r1"),
@@ -135,7 +147,7 @@ async fn newproxy_heartbeat_close_flow() {
 async fn heartbeat_timeout_disconnects() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
 
     // 极小间隔/超时；客户端不回应 Heartbeat，应触发超时断开。
     let task = tokio::spawn(handle_control_login(
@@ -169,7 +181,7 @@ async fn future_heartbeat_ts_does_not_suppress_timeout() {
         server_end,
         "127.0.0.1".parse().unwrap(),
         ServerState::new(),
-        ServerConfig::default(),
+        test_config(),
         Duration::from_millis(30),
         Duration::from_millis(80),
     ));
@@ -205,7 +217,7 @@ async fn heartbeat_keeps_alive_when_client_responds() {
     // 进而触发重连去重、回收代理监听与在途工作连接。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("hbAlive"),
         server_end,
@@ -246,7 +258,7 @@ async fn dead_write_side_triggers_heartbeat_disconnect() {
         rfrp_common::testutil::DeadWriteStream,
         "127.0.0.1".parse().unwrap(),
         state.clone(),
-        ServerConfig::default(),
+        test_config(),
         Duration::from_millis(30), // interval
         Duration::from_millis(60), // timeout
     ));
@@ -281,7 +293,7 @@ async fn session_limit_rejects_new_login() {
         server_end,
         "127.0.0.1".parse().unwrap(),
         state,
-        ServerConfig::default(),
+        test_config(),
         Duration::from_secs(30),
         Duration::from_secs(10),
     ));
@@ -312,7 +324,7 @@ async fn session_limit_allows_same_run_id_reconnect() {
         server_end,
         "127.0.0.1".parse().unwrap(),
         state,
-        ServerConfig::default(),
+        test_config(),
         Duration::from_secs(30),
         Duration::from_secs(10),
     ));
@@ -343,7 +355,7 @@ async fn per_ip_session_limit_rejects_new_login() {
         server_end,
         "127.0.0.1".parse().unwrap(),
         state,
-        ServerConfig::default(),
+        test_config(),
         Duration::from_secs(30),
         Duration::from_secs(10),
     ));
@@ -360,7 +372,7 @@ async fn per_ip_session_limit_rejects_new_login() {
 async fn non_login_first_frame_errors() {
     let (server_end, _client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let bad = Message::Heartbeat(Heartbeat { ts: 1 }).to_frame().unwrap();
     let res = handle_control_login(
         bad,
@@ -378,7 +390,7 @@ async fn non_login_first_frame_errors() {
 #[tokio::test]
 async fn reconnect_same_run_id_replaces_old_session() {
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
 
     // 首个同名 run_id 会话登录。
     let (s1, c1) = duplex(8192);
@@ -432,10 +444,10 @@ async fn login_version_mismatch_rejected() {
     // 协议版本不匹配：服务端回 LoginResp{ok=false, "version mismatch"} 并直接结束（§6.6）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let bad = Message::Login(Login {
         run_id: "x".into(),
-        token: String::new(),
+        token: TEST_TOKEN.into(),
         version: PROTOCOL_VERSION + 1,
     })
     .to_frame()
@@ -475,7 +487,7 @@ async fn login_echoes_negotiated_protocol_version() {
     // 客户端据此确认双方语义一致。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rVer"),
         server_end,
@@ -506,7 +518,7 @@ async fn auth_failure_rejects_without_echo() {
     // token 错误时返回 LoginResp{ok=false, error=None}，不建立会话（DESIGN §10.2）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let mut config = ServerConfig::default();
+    let mut config = test_config();
     config.server.token = "secret".into();
 
     let bad = Message::Login(Login {
@@ -544,7 +556,7 @@ async fn control_loop_exits_on_shutdown() {
     // 退出令牌被取消时，控制循环应立即退出（§14.4）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let shutdown = state.shutdown.clone();
     let task = tokio::spawn(handle_control_login(
         login_frame("rsd"),
@@ -577,7 +589,7 @@ async fn login_ok_returns_session_id_and_registers() {
     // 正常登录：LoginResp{ok=true, session_id=Some}，且会话写入 registry（§8.1）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rOk"),
         server_end,
@@ -607,7 +619,7 @@ async fn newproxy_rejection_routed_to_resp() {
     // NewProxy 被拒（端口不在允许范围）应经控制循环回 NewProxyResp{ok=false}（§8.1）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let mut config = ServerConfig::default();
+    let mut config = test_config();
     config.proxy.allow_ports = "5000-5001".into();
     let task = tokio::spawn(handle_control_login(
         login_frame("rRej"),
@@ -649,7 +661,7 @@ async fn unknown_control_msg_ignored_keeps_loop_alive() {
     // 控制循环不处理 StartWorkConn：忽略后循环仍存活（§8.2 控制/工作连接分离）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rIgn"),
         server_end,
@@ -687,7 +699,7 @@ async fn malformed_frame_breaks_control_loop() {
     // 版本不符的帧导致解码错误：控制循环应断开（Ok 返回，§6.1）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rBad"),
         server_end,
@@ -718,7 +730,7 @@ async fn eof_closes_control_loop() {
     // 客户端两端关闭 -> 服务端读到 EOF -> 控制循环断开（Ok 返回）。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rEof"),
         server_end,
@@ -749,7 +761,7 @@ async fn teardown_after_peer_eof_is_prompt() {
     // 这 1 秒里会话资源（公网端口、代理监听、预热池）都还占着。
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let task = tokio::spawn(handle_control_login(
         login_frame("rPrompt"),
         server_end,
@@ -790,10 +802,10 @@ async fn teardown_after_peer_eof_is_prompt() {
 async fn login_invalid_run_id_rejected() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let bad = Message::Login(Login {
         run_id: "not-a-uuid".into(),
-        token: String::new(),
+        token: TEST_TOKEN.into(),
         version: PROTOCOL_VERSION,
     })
     .to_frame()
@@ -823,7 +835,7 @@ async fn login_invalid_run_id_rejected() {
 async fn login_oversize_token_rejected() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let bad = Message::Login(Login {
         run_id: uuid::Uuid::new_v4().to_string(),
         token: "x".repeat(MAX_TOKEN_LEN + 1),
@@ -853,10 +865,10 @@ async fn login_oversize_token_rejected() {
 async fn newproxy_invalid_name_rejected() {
     let (server_end, client_end) = duplex(8192);
     let state = ServerState::new();
-    let config = ServerConfig::default();
+    let config = test_config();
     let login = Message::Login(Login {
         run_id: uuid::Uuid::new_v4().to_string(),
-        token: String::new(),
+        token: TEST_TOKEN.into(),
         version: PROTOCOL_VERSION,
     })
     .to_frame()
@@ -905,7 +917,7 @@ async fn heartbeat_resp_updates_rtt_metric() {
         server_end,
         "127.0.0.1".parse().unwrap(),
         state.clone(),
-        ServerConfig::default(),
+        test_config(),
         Duration::from_millis(20),  // interval
         Duration::from_millis(200), // timeout
     ));

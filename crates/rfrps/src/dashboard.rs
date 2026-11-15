@@ -12,7 +12,7 @@ use rfrp_common::config::DashboardSection;
 use rfrp_common::constants::DASHBOARD_MAX_CONCURRENT_CONNECTIONS;
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
-use rfrp_common::util::ratelimit::RateLimiter;
+use rfrp_common::util::ratelimit::{rate_limit_key, RateLimiter};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -34,6 +34,8 @@ const AUTH_BLOCK_INITIAL: Duration = Duration::from_secs(30);
 const AUTH_BLOCK_MAX: Duration = Duration::from_secs(300);
 /// 认证失败表上限，防止大量来源 IP 撑爆内存。
 const MAX_AUTH_ENTRIES: usize = 4096;
+/// 已认证/健康检查响应不得被浏览器或共享缓存保存。
+const NO_STORE: &str = "Cache-Control: no-store";
 
 struct AuthFailure {
     failures: u32,
@@ -147,16 +149,36 @@ impl DashboardSessions {
     }
 }
 
+/// 每连接共享的处理上下文：集中持有避免 `handle_request` 参数过多，
+/// 也省去每个请求重复 clone 六个 `Arc`。
+struct DashboardContext {
+    cfg: DashboardSection,
+    state: Arc<ServerState>,
+    limiter: Arc<RateLimiter>,
+    auth_failures: Arc<AuthFailureLimiter>,
+    sessions: Arc<DashboardSessions>,
+    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+}
+
 /// Dashboard HTTP 服务主循环。
 pub async fn run_dashboard(
     listener: TcpListener,
     cfg: DashboardSection,
+    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) {
     let limiter = Arc::new(RateLimiter::new(100, Duration::from_secs(60)));
     let sessions = Arc::new(DashboardSessions::new(cfg.session_ttl()));
     let auth_failures = Arc::new(AuthFailureLimiter::new());
+    let ctx = Arc::new(DashboardContext {
+        cfg,
+        state,
+        limiter,
+        auth_failures,
+        sessions,
+        trusted_proxies,
+    });
     // 单监听口并发上限：请求头读取和响应写都有超时，但慢连接仍可能堆积任务。
     let concurrent = Arc::new(tokio::sync::Semaphore::new(
         DASHBOARD_MAX_CONCURRENT_CONNECTIONS,
@@ -175,24 +197,11 @@ pub async fn run_dashboard(
                             drop(stream);
                             continue;
                         };
-                        let cfg = cfg.clone();
-                        let state = state.clone();
-                        let limiter = limiter.clone();
-                        let sessions = sessions.clone();
-                        let auth_failures = auth_failures.clone();
-                        let tracker = state.data_tasks.clone();
+                        let ctx = ctx.clone();
+                        let tracker = ctx.state.data_tasks.clone();
                         tracker.spawn(async move {
                             let _permit = permit;
-                            let _ = handle_request(
-                                stream,
-                                &cfg,
-                                &state,
-                                &limiter,
-                                &auth_failures,
-                                &sessions,
-                                peer,
-                            )
-                            .await;
+                            let _ = handle_request(stream, &ctx, peer).await;
                         });
                     }
                     Err(e) => {
@@ -216,13 +225,37 @@ pub async fn run_dashboard(
     }
 }
 
+/// 解析 Dashboard 的客户端来源 IP。
+///
+/// 仅当 TCP 对端本身在 `trusted_proxies` 中时才读取 `X-Forwarded-For`：
+/// 从右向左逐跳信任，遇到非可信地址即停止。这样直连客户端伪造的 XFF 不会
+/// 生效，多级反向代理也能得到真实客户端地址（用于限流与失败封禁）。
+fn resolve_client_ip(
+    req: &RequestHead,
+    peer: std::net::IpAddr,
+    trusted_proxies: &[std::net::IpAddr],
+) -> std::net::IpAddr {
+    if trusted_proxies.is_empty() || !trusted_proxies.contains(&peer) {
+        return peer;
+    }
+    let mut current = peer;
+    for raw in req.x_forwarded_for.iter().rev() {
+        for part in raw.rsplit(',') {
+            if !trusted_proxies.contains(&current) {
+                return current;
+            }
+            match part.trim().parse::<std::net::IpAddr>() {
+                Ok(ip) => current = ip,
+                Err(_) => return current,
+            }
+        }
+    }
+    current
+}
+
 async fn handle_request(
     mut stream: TcpStream,
-    cfg: &DashboardSection,
-    state: &Arc<ServerState>,
-    limiter: &RateLimiter,
-    auth_failures: &AuthFailureLimiter,
-    sessions: &DashboardSessions,
+    ctx: &DashboardContext,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     let head = match read_request_head(
@@ -235,20 +268,28 @@ async fn handle_request(
         None => return Ok(()),
     };
 
-    if !limiter.allow(peer.ip(), Instant::now()) {
+    let req = RequestHead::parse(&head);
+    if req.framing_error {
+        return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await;
+    }
+    let client_key = rate_limit_key(resolve_client_ip(
+        &req,
+        peer.ip(),
+        ctx.trusted_proxies.as_slice(),
+    ));
+
+    if !ctx.limiter.allow(client_key, Instant::now()) {
         return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
     }
 
-    let req = RequestHead::parse(&head);
-
     // /healthz 免鉴权（仅暴露 up/down，供监控/负载均衡探活）。
     if req.path == "/healthz" {
-        let (status, body) = health_response(state);
-        return write_response(&mut stream, status, "text/plain", body, None).await;
+        let (status, body) = health_response(&ctx.state);
+        return write_response(&mut stream, status, "text/plain", body, Some(NO_STORE)).await;
     }
 
-    if let Some(wait) = auth_failures.blocked(peer.ip(), Instant::now()) {
-        let retry_after = format!("Retry-After: {}\r\n", wait.as_secs().max(1));
+    if let Some(wait) = ctx.auth_failures.blocked(client_key, Instant::now()) {
+        let retry_after = format!("Retry-After: {}\r\n{}", wait.as_secs().max(1), NO_STORE);
         return write_response(
             &mut stream,
             429,
@@ -259,9 +300,9 @@ async fn handle_request(
         .await;
     }
 
-    let authenticated = authorized(&req, cfg, sessions);
+    let authenticated = authorized(&req, &ctx.cfg, &ctx.sessions);
     if authenticated {
-        auth_failures.record_success(peer.ip());
+        ctx.auth_failures.record_success(client_key);
     }
 
     // 表单登录：POST /login 校验凭据，成功后下发会话 Cookie 并跳转首页。
@@ -281,17 +322,18 @@ async fn handle_request(
             }
         };
         let (user, pass) = parse_login_form(&body);
-        if verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass) {
-            auth_failures.record_success(peer.ip());
+        if verify_token(&ctx.cfg.user, &user) && verify_token(&ctx.cfg.password, &pass) {
+            ctx.auth_failures.record_success(client_key);
             // Cookie 只保存随机、可撤销的服务端会话 ID，不保存凭据本身。
-            let value = sessions.create();
+            let value = ctx.sessions.create();
             let headers = format!(
-                "Location: /\r\nSet-Cookie: {}\r\n",
-                session_cookie(&value, cfg)
+                "Location: /\r\nSet-Cookie: {}\r\n{}",
+                session_cookie(&value, &ctx.cfg),
+                NO_STORE
             );
             return write_response(&mut stream, 302, "text/plain", "", Some(&headers)).await;
         }
-        auth_failures.record_failure(peer.ip(), Instant::now());
+        ctx.auth_failures.record_failure(client_key, Instant::now());
         tracing::warn!(%peer, "dashboard login failed");
         return write_login_page(&mut stream, Some("用户名或密码错误")).await;
     }
@@ -299,7 +341,7 @@ async fn handle_request(
     if !authenticated {
         // Basic 认证失败计数用于独立限速；无凭据的浏览器导航不计数。
         if req.authorization.is_some() {
-            auth_failures.record_failure(peer.ip(), Instant::now());
+            ctx.auth_failures.record_failure(client_key, Instant::now());
         }
         // 浏览器导航请求（Accept: text/html）返回登录页；其余（curl/脚本）返回标准
         // 401 + WWW-Authenticate，保留 Basic Auth 客户端的兼容性。
@@ -311,43 +353,68 @@ async fn handle_request(
             401,
             "text/plain",
             "Unauthorized\n",
-            Some("WWW-Authenticate: Basic realm=\"rfrp dashboard\""),
+            Some(concat!(
+                "WWW-Authenticate: Basic realm=\"rfrp dashboard\"\r\n",
+                "Cache-Control: no-store"
+            )),
         )
         .await;
     }
 
     // 已登录：/login 直接回首页，/logout 清 Cookie 后回首页。
     if req.path == "/login" {
-        return write_response(&mut stream, 302, "text/plain", "", Some("Location: /")).await;
+        return write_response(
+            &mut stream,
+            302,
+            "text/plain",
+            "",
+            Some("Location: /\r\nCache-Control: no-store"),
+        )
+        .await;
     }
     if req.path == "/logout" {
         // 服务端撤销会话，再清除浏览器的 Cookie。
         if let Some(cookie) = req.cookie.as_deref() {
             if let Some(value) = cookie_value(cookie, SESSION_COOKIE) {
-                sessions.revoke(&value);
+                ctx.sessions.revoke(&value);
             }
         }
         // 清除 Cookie：属性与下发时保持一致（`Secure` 尤其重要，
         // 否则带 `Secure` 的 Cookie 不会被同名的非 Secure Cookie 覆盖）。
         let headers = format!(
-            "Location: /\r\nSet-Cookie: {SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/{}\r\n",
-            if cfg.cookie_secure { "; Secure" } else { "" }
+            "Location: /\r\nSet-Cookie: {SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/{}\r\n{}",
+            if ctx.cfg.cookie_secure { "; Secure" } else { "" },
+            NO_STORE
         );
         return write_response(&mut stream, 302, "text/plain", "", Some(&headers)).await;
     }
 
     match req.path.as_str() {
         "/" => {
-            let body = render_html(state);
-            write_response(&mut stream, 200, "text/html; charset=utf-8", &body, None).await
+            let body = render_html(&ctx.state);
+            write_response(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                &body,
+                Some(NO_STORE),
+            )
+            .await
         }
         "/api/status" => {
-            let body = serde_json::to_string_pretty(&status_json(state)).unwrap_or_default();
-            write_response(&mut stream, 200, "application/json", &body, None).await
+            let body = serde_json::to_string_pretty(&status_json(&ctx.state)).unwrap_or_default();
+            write_response(&mut stream, 200, "application/json", &body, Some(NO_STORE)).await
         }
         "/metrics" => {
-            let body = render_metrics(state);
-            write_response(&mut stream, 200, "text/plain; version=0.0.4", &body, None).await
+            let body = render_metrics(&ctx.state);
+            write_response(
+                &mut stream,
+                200,
+                "text/plain; version=0.0.4",
+                &body,
+                Some(NO_STORE),
+            )
+            .await
         }
         _ => write_response(&mut stream, 404, "text/plain", "Not Found\n", None).await,
     }
@@ -673,6 +740,45 @@ mod authorized_tests {
 
     fn parsed(head: &str) -> RequestHead {
         RequestHead::parse(head.as_bytes())
+    }
+
+    #[test]
+    fn resolve_client_ip_ignores_xff_from_untrusted_peer() {
+        let req = parsed("GET / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.7\r\n\r\n");
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        assert_eq!(resolve_client_ip(&req, peer, &[]), peer);
+        let trusted = ["10.0.0.1".parse().unwrap()];
+        assert_eq!(resolve_client_ip(&req, peer, &trusted), peer);
+    }
+
+    #[test]
+    fn resolve_client_ip_walks_trusted_chain_from_right() {
+        let req = parsed("GET / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.7, 10.0.0.2\r\n\r\n");
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<std::net::IpAddr> = vec!["10.0.0.1".parse().unwrap()];
+        // 右侧 10.0.0.2 不是可信代理，因此它才是上游客户端；左侧可伪造值不采信。
+        assert_eq!(
+            resolve_client_ip(&req, peer, &trusted),
+            "10.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        let trusted: Vec<std::net::IpAddr> =
+            vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
+        assert_eq!(
+            resolve_client_ip(&req, peer, &trusted),
+            "198.51.100.7".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_stops_at_invalid_hop() {
+        let req = parsed("GET / HTTP/1.1\r\nX-Forwarded-For: not-an-ip, 10.0.0.2\r\n\r\n");
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<std::net::IpAddr> =
+            vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
+        assert_eq!(
+            resolve_client_ip(&req, peer, &trusted),
+            "10.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]

@@ -601,6 +601,7 @@ async fn work_conn_request_is_retried_until_consumed() {
         .pending_request_interval_ms
         .store(30, std::sync::atomic::Ordering::Relaxed);
     let (session, mut rx) = crate::control::test_session_with_token("r", "tok");
+    register_test_session(&state, &session);
     let (user, _peer) = tokio::io::duplex(64);
     dispatch_user_connection("ssh".to_string(), user, session, state);
 
@@ -614,6 +615,50 @@ async fn work_conn_request_is_retried_until_consumed() {
     assert_eq!(
         work_ids[0], work_ids[1],
         "the same work_id must be re-requested"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_rejects_replaced_or_stopped_session() {
+    // 同 run_id 重连替换后，旧监听任务可能还会 accept 到一条用户连接；
+    // 必须直接丢弃，而不是为失效会话登记 pending / 建立桥接。
+    let state = ServerState::new();
+    let (old, mut old_rx) = crate::control::test_session_with_token("r", "tok");
+    register_test_session(&state, &old);
+    let (new, _new_rx) = crate::control::test_session_with_id("r", "s2", "tok");
+    state.sessions.lock().insert("r".into(), new);
+
+    let (user, _peer) = tokio::io::duplex(64);
+    dispatch_user_connection("ssh".to_string(), user, old, state.clone());
+    assert!(state.pending.lock().is_empty());
+    assert_eq!(
+        state
+            .metrics
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rejected dispatch must not leak the active counter"
+    );
+    assert!(
+        !matches!(
+            tokio::time::timeout(Duration::from_millis(50), old_rx.recv()).await,
+            Ok(Some(_))
+        ),
+        "stale session must not receive ReqWorkConn"
+    );
+
+    // 会话已被 cleanup 取消（stop 先于从 sessions 表移除）时同样拒绝。
+    let state = ServerState::new();
+    let (stopped, mut stopped_rx) = crate::control::test_session_with_token("r2", "tok");
+    register_test_session(&state, &stopped);
+    stopped.stop.cancel();
+    let (user, _peer) = tokio::io::duplex(64);
+    dispatch_user_connection("ssh".to_string(), user, stopped, state.clone());
+    assert!(state.pending.lock().is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stopped_rx.recv())
+            .await
+            .is_err()
     );
 }
 

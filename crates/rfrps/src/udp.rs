@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use rfrp_common::constants::{
-    MAX_PENDING_UDP_SESSIONS, MAX_UDP_PACKET_SIZE, MAX_UDP_SESSIONS_PER_PROXY,
-    UDP_BUF_INITIAL_BYTES, UDP_PACKET_POOL_MAX_BUF_BYTES, UDP_PROXY_QUEUE_MAX_BYTES,
-    UDP_READ_BATCH, UDP_RECV_BATCH, UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH,
-    WORK_CONN_TIMEOUT_RFRPS,
+    MAX_PENDING_UDP_SESSIONS, MAX_TOTAL_UDP_SESSIONS, MAX_UDP_PACKET_SIZE,
+    MAX_UDP_SESSIONS_PER_PROXY, UDP_BUF_INITIAL_BYTES, UDP_GLOBAL_QUEUE_MAX_BYTES,
+    UDP_PACKET_POOL_MAX_BUF_BYTES, UDP_PROXY_QUEUE_MAX_BYTES, UDP_READ_BATCH, UDP_RECV_BATCH,
+    UDP_SESSION_QUEUE_DEPTH, UDP_WRITE_BATCH, WORK_CONN_TIMEOUT_RFRPS,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::msg::*;
@@ -39,14 +39,21 @@ const UDP_PACKET_POOL_MAX: usize = 256;
 pub struct UdpPacket {
     data: BytesMut,
     budget: Option<Arc<AtomicUsize>>,
+    global_budget: Option<Arc<AtomicUsize>>,
     weight: usize,
 }
 
 impl UdpPacket {
-    fn new(data: BytesMut, budget: Option<Arc<AtomicUsize>>, weight: usize) -> Self {
+    fn new(
+        data: BytesMut,
+        budget: Option<Arc<AtomicUsize>>,
+        global_budget: Option<Arc<AtomicUsize>>,
+        weight: usize,
+    ) -> Self {
         Self {
             data,
             budget,
+            global_budget,
             weight,
         }
     }
@@ -56,6 +63,9 @@ impl UdpPacket {
         if let Some(budget) = self.budget.take() {
             budget.fetch_sub(self.weight, Ordering::Relaxed);
         }
+        if let Some(budget) = self.global_budget.take() {
+            budget.fetch_sub(self.weight, Ordering::Relaxed);
+        }
         std::mem::take(&mut self.data)
     }
 }
@@ -63,6 +73,9 @@ impl UdpPacket {
 impl Drop for UdpPacket {
     fn drop(&mut self) {
         if let Some(budget) = self.budget.take() {
+            budget.fetch_sub(self.weight, Ordering::Relaxed);
+        }
+        if let Some(budget) = self.global_budget.take() {
             budget.fetch_sub(self.weight, Ordering::Relaxed);
         }
     }
@@ -90,11 +103,23 @@ fn alloc_udp_packet(
     pool: &Arc<Mutex<Vec<BytesMut>>>,
     data: &[u8],
     budget: Option<&Arc<AtomicUsize>>,
+    global_budget: Option<&Arc<AtomicUsize>>,
+    global_max: usize,
 ) -> Option<UdpPacket> {
     if let Some(budget) = budget {
         let prev = budget.fetch_add(data.len(), Ordering::Relaxed);
         if prev.saturating_add(data.len()) > UDP_PROXY_QUEUE_MAX_BYTES {
             budget.fetch_sub(data.len(), Ordering::Relaxed);
+            return None;
+        }
+    }
+    if let Some(global) = global_budget {
+        let prev = global.fetch_add(data.len(), Ordering::Relaxed);
+        if prev.saturating_add(data.len()) > global_max {
+            global.fetch_sub(data.len(), Ordering::Relaxed);
+            if let Some(budget) = budget {
+                budget.fetch_sub(data.len(), Ordering::Relaxed);
+            }
             return None;
         }
     }
@@ -104,7 +129,12 @@ fn alloc_udp_packet(
         .unwrap_or_else(|| BytesMut::with_capacity(data.len().max(2048)));
     buf.clear();
     buf.extend_from_slice(data);
-    Some(UdpPacket::new(buf, budget.map(Arc::clone), data.len()))
+    Some(UdpPacket::new(
+        buf,
+        budget.map(Arc::clone),
+        global_budget.map(Arc::clone),
+        data.len(),
+    ))
 }
 
 /// 批量归还一批已写入的包缓冲：整批只加一次锁，避免每包 Drop 抢锁。
@@ -171,6 +201,9 @@ fn record_session_close(proxy: &UdpProxy, count: i64) {
     if count == 0 {
         return;
     }
+    for _ in 0..count {
+        release_global_session(proxy);
+    }
     let active = &proxy.stats.active_connections;
     let mut cur = active.load(std::sync::atomic::Ordering::Relaxed);
     loop {
@@ -183,6 +216,46 @@ fn record_session_close(proxy: &UdpProxy, count: i64) {
         ) {
             Ok(_) => return,
             Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 尝试占用一个全局 UDP 会话名额。
+fn try_acquire_global_session(proxy: &UdpProxy) -> bool {
+    let mut cur = proxy.global_sessions.load(Ordering::Relaxed);
+    loop {
+        if cur >= proxy.global_sessions_max {
+            return false;
+        }
+        match proxy.global_sessions.compare_exchange_weak(
+            cur,
+            cur + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 归还一个全局 UDP 会话名额；饱和到 0，避免异常路径下溢。
+#[allow(deprecated)] // MSRV 1.75：try_update 更晚引入
+fn release_global_session(proxy: &UdpProxy) {
+    let _ = proxy
+        .global_sessions
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(1))
+        });
+}
+
+impl Drop for UdpProxy {
+    fn drop(&mut self) {
+        // 正常 sweep/remove 已经把会话从表里摘除并归还名额；这里只兜底
+        // cleanup 直接丢弃 UdpProxy、但仍有活跃会话的场景。
+        let remaining = self.sessions.get_mut().len();
+        for _ in 0..remaining {
+            release_global_session(self);
         }
     }
 }
@@ -218,6 +291,12 @@ pub struct UdpProxy {
     pub packet_pool: Arc<Mutex<Vec<BytesMut>>>,
     /// 所有队列中尚未消费的 UDP 数据报总字节数（代理级内存上界）。
     pub queue_bytes: Arc<AtomicUsize>,
+    /// 所有 UDP 代理共享的队列字节预算。
+    pub global_queue_bytes: Arc<AtomicUsize>,
+    pub global_queue_max: usize,
+    /// 所有 UDP 代理共享的活跃会话计数与上限。
+    pub global_sessions: Arc<AtomicUsize>,
+    pub global_sessions_max: usize,
     pub session_timeout: Duration,
     pub pending_timeout: Duration,
     /// 归属会话 ID：工作连接/清理时校验，防止同名/旧会话操作误伤。
@@ -265,13 +344,43 @@ pub async fn register_udp_proxy(
         stats,
         packet_pool: Arc::new(Mutex::new(Vec::new())),
         queue_bytes: Arc::new(AtomicUsize::new(0)),
+        global_queue_bytes: state.udp_queue_bytes.clone(),
+        global_queue_max: UDP_GLOBAL_QUEUE_MAX_BYTES,
+        global_sessions: state.udp_sessions_active.clone(),
+        global_sessions_max: MAX_TOTAL_UDP_SESSIONS,
         session_timeout,
         pending_timeout: Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS),
         owner_session_id: session.session_id.clone(),
         max_sessions: MAX_UDP_SESSIONS_PER_PROXY,
         stop: CancellationToken::new(),
     });
-    state.udp.lock().insert(proxy_name.clone(), proxy.clone());
+    // 无条件 insert 会被同 run_id 重连竞态破坏：旧会话晚到的注册可能
+    // 覆盖新会话已写入的运行态；旧会话随后回滚又会把新条目删掉。这里在
+    // state.udp 锁内按 owner/current 状态做条件插入。
+    {
+        let mut udp = state.udp.lock();
+        if let Some(existing) = udp.get(&proxy_name) {
+            if existing.owner_session_id != session.session_id {
+                let existing_owner = existing.owner_session_id.clone();
+                let still_current = state
+                    .sessions
+                    .lock()
+                    .values()
+                    .any(|s| s.session_id == existing_owner);
+                if still_current {
+                    return Err(ProxyError::NameExists);
+                }
+                if let Some(old) = udp.remove(&proxy_name) {
+                    old.stop.cancel();
+                }
+                state.remove_proxy_stats(std::slice::from_ref(&proxy_name), &existing_owner);
+            }
+        }
+        if !state.is_current_session(session) {
+            return Err(ProxyError::Internal);
+        }
+        udp.insert(proxy_name.clone(), proxy.clone());
+    }
 
     let session = session.clone();
     let state = state.clone();
@@ -381,8 +490,13 @@ async fn handle_datagram(
             );
             return;
         }
-        let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes))
-        else {
+        let Some(packet) = alloc_udp_packet(
+            &proxy.packet_pool,
+            data,
+            Some(&proxy.queue_bytes),
+            Some(&proxy.global_queue_bytes),
+            proxy.global_queue_max,
+        ) else {
             proxy.metrics.inc_udp_dropped();
             tracing::debug!(
                 proxy = %proxy_name, %peer,
@@ -416,8 +530,13 @@ async fn handle_datagram(
                 );
                 return;
             }
-            let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes))
-            else {
+            let Some(packet) = alloc_udp_packet(
+                &proxy.packet_pool,
+                data,
+                Some(&proxy.queue_bytes),
+                Some(&proxy.global_queue_bytes),
+                proxy.global_queue_max,
+            ) else {
                 proxy.metrics.inc_udp_dropped();
                 tracing::debug!(
                     proxy = %proxy_name, %peer,
@@ -456,7 +575,13 @@ async fn handle_datagram(
     let (tx, rx) = mpsc::channel::<UdpPacket>(UDP_SESSION_QUEUE_DEPTH);
     let work_id = state.next_work_id();
     record_up(proxy, data.len());
-    let Some(packet) = alloc_udp_packet(&proxy.packet_pool, data, Some(&proxy.queue_bytes)) else {
+    let Some(packet) = alloc_udp_packet(
+        &proxy.packet_pool,
+        data,
+        Some(&proxy.queue_bytes),
+        Some(&proxy.global_queue_bytes),
+        proxy.global_queue_max,
+    ) else {
         proxy.metrics.inc_udp_dropped();
         tracing::debug!(
             proxy = %proxy_name, %peer,
@@ -484,16 +609,18 @@ async fn handle_datagram(
     let proxy_cleanup = proxy.clone();
     let tracker = state.data_tasks.clone();
     tracker.spawn(async move {
-        if !send_with_timeout_reserved(
-            &tx_ctl,
-            Message::ReqWorkConn(ReqWorkConn {
-                proxy_name: pname,
-                work_id,
-            }),
-            CONTROL_HEARTBEAT_RESERVE,
-        )
-        .await
-        {
+        let sent = tokio::select! {
+            _ = proxy_cleanup.stop.cancelled() => false,
+            ok = send_with_timeout_reserved(
+                &tx_ctl,
+                Message::ReqWorkConn(ReqWorkConn {
+                    proxy_name: pname,
+                    work_id,
+                }),
+                CONTROL_HEARTBEAT_RESERVE,
+            ) => ok,
+        };
+        if !sent {
             remove_pending(&proxy_cleanup, work_id);
         }
     });
@@ -714,8 +841,13 @@ fn register_session(
 ) -> bool {
     let mut sessions = proxy.sessions.lock();
     let replacing = sessions.contains_key(&client);
-    if !replacing && sessions.len() >= proxy.max_sessions {
-        return false;
+    if !replacing {
+        if sessions.len() >= proxy.max_sessions {
+            return false;
+        }
+        if !try_acquire_global_session(proxy) {
+            return false;
+        }
     }
     // 同一 client 已有旧会话：先取消它，确保旧 handler 即使阻塞在写操作也能退出。
     if let Some(old) = sessions.get(&client) {

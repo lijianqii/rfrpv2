@@ -399,6 +399,10 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 - **默认**：工作连接同样走 TLS（rfrpc 发起时即 TLS 握手），复用 rfrps 服务端证书。
 - **可选禁用**：rfrpc 配置 `work_conn_tls = false` 时工作连接明文传输，仅适用于信任网络或性能敏感场景。
 - **服务端优先**：rfrps 在 `LoginResp` 中下发自身 `work_conn_tls` 偏好，rfrpc 据此决策。
+- **混合模式显式 opt-in**：`work_conn_tls = true` 且 `tls_enable = false` 会把
+  token / `work_conn_token` 暴露在明文控制链路上；配置校验与启动路径默认拒绝该组合，
+  必须同时设置 `allow_plaintext_control = true` 才能启动。该开关只影响控制链路策略，
+  不改变工作连接仍走 TLS 的事实。
 
 **工作连接 TLS 决策表（rfrps 偏好优先）：**
 
@@ -550,7 +554,9 @@ rfrp/
 > - 协议：`PROTOCOL_VERSION = 2`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024`（控制帧实际上限）、`WORK_ID_POOL_RESERVED = 0`
 > - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 300`（可通过服务端 `udp_session_timeout_secs` 覆盖）、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
-> - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP）
+> - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP；IPv6 聚合到 /64，IPv4-mapped IPv6 归一为 IPv4）
+> - 首帧握手限流：全局 `MAX_UNAUTHENTICATED_CONNECTIONS = 1024`，单来源 `MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP = 64`（同样按 IPv6 /64 聚合）
+> - vhost 认证前限流：HTTP/HTTPS 各监听口全局 `VHOST_MAX_PREAUTH_CONNECTIONS = 1024`，单来源 64（与主控制口配额隔离，按 IPv6 /64 聚合）
 > - 代理注册重试（秒）：`PROXY_REGISTER_RETRY_INITIAL = 2`、`PROXY_REGISTER_RETRY_MAX = 8`（轮）、`PROXY_REGISTER_RETRY_MAX_DELAY = 30`
 > - 配置类注册重试（秒）：`PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS = 30`、`PROXY_REGISTER_RETRY_PERSISTENT_MAX = 20`（轮，约 10 分钟）
 > - 工作连接请求重发间隔：`WORK_CONN_REQUEST_INTERVAL_MS = 3000`（在 `WORK_CONN_TIMEOUT_RFRPS` 窗口内周期重发 `ReqWorkConn`）
@@ -819,6 +825,9 @@ UDP 无连接，工作连接模型（一个用户连接对应一条工作连接�
 - **本地 UDP socket 生命周期**：rfrpc 侧为该会话建立的本地 UDP socket（连向 `local_ip:local_port`）**生命周期跟随工作连接**——工作连接关闭（TCP FIN 或 rfrps 主动断开）即立即关闭本地 UDP socket，释放端口资源。会话超时清理时，先关工作连接再关本地 socket。二者超时不一致时（如工作连接因 rfrps 侧异常提前 FIN，但会话未到超时）以**工作连接关闭为准**，会话同步清理。
 - 工作连接承载方式：与 TCP 代理不同，UDP 在工作连接上仍用 8.2 的"首帧后透传字节流"模型，但需在字节流中区分每个 UDP 包边界——首版约定每个 UDP 包前加 **4 字节大端长度前缀**（u32），即工作连接上 UDP 数据帧格式为 `Length(4) + Data`。rfrps 与 rfrpc 双向按此分帧。
 - **单包大小限制**：单个 UDP 包最大 **65507 字节**（IPv4 UDP payload 上限，即 65535 − 20 IP头 − 8 UDP头）。Length 前缀值超过此上限视为协议错误，**关闭该 UDP 工作连接**（长度前缀已不可信，继续解析无法保证流同步）并记日志。实际应用中 UDP 包通常 < 1472 字节（以太网 MTU 1500 − 20 − 8），超限包多为异常。
+- **内存与会话硬上限**：单代理待发送队列 16 MiB、活跃会话 4096；所有代理共享
+  64 MiB 队列预算与 16384 活跃会话预算。超限按 UDP 语义丢包（计入
+  `rfrp_udp_dropped_total`）或拒绝新会话，避免多代理叠加把内存/FD 推到不可控规模。
 
 **转发效率（v0.1 补强）**：UDP 数据面的每一环都做过批量化，但**线格式保持不变**（每包仍是独立的
 `Length(4) + Data`），因此不需要协议版本协商：
@@ -850,6 +859,8 @@ tls_enable = true                # 控制链路 TLS 总开关（M1 测试期可�
 tls_cert = "./cert.pem"          # 控制链路证书
 tls_key  = "./key.pem"
 work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+allow_plaintext_control = false  # 仅 work_conn_tls=true 且 tls_enable=false 时需显式置 true（不安全）
+trusted_proxies = []             # Dashboard 可信反向代理 IP（精确 IP，暂不支持 CIDR）；仅这些对端的 X-Forwarded-For 生效
 tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）
 heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）
@@ -993,10 +1004,11 @@ CLI 参数 > 配置文件 > 默认值。
 - `--watch-config=restart`：父进程监督子进程。父进程不绑定业务端口，负责监听配置、
   通过相同 CLI 参数的 `--check` 校验、通过子进程 stdin 发送 `shutdown`、等待优雅退出
   后重新启动。配置非法时保留旧子进程；子进程异常退出按 1s→30s 指数退避重启。
-  每次启动使用同目录、0600 的私有 stage 配置快照；旧 stage 保留到新子进程启动窗口
-  成功后才删除。新子进程实际启动失败（端口占用/TLS 错误等）时回到旧 stage，并对
-  旧 stage 持续重试，不退出 supervisor；这同时用真实启动验证端口可用性，并保证旧配置
-  在资源可用时恢复。stage/回滚不覆盖用户原配置文件。父进程被强杀时，子进程 stdin EOF
+  每次启动使用同目录、0600 的私有 stage 配置快照；新子进程写入 ready 后进入
+  60s 观察期（probation），观察期内退出则回滚旧 stage 并重新启动旧配置。
+  新子进程实际启动失败（端口占用/TLS 错误等）时同样回到旧 stage，并对旧 stage
+  持续重试，不退出 supervisor；这同时用真实启动验证端口可用性，并保证旧配置在
+  资源可用时恢复。stage/回滚不覆盖用户原配置文件。父进程被强杀时，子进程 stdin EOF
   触发优雅退出；正常退出时删除 active stage。适合 Windows 控制台/无服务管理器环境。
 - `--watch-config=exit`：配置校验通过后触发优雅退出，退出码 `75`；由 systemd
   `Restart=on-failure`、NSSM/WinSW 等外部服务管理器重新拉起。配置非法时继续运行。
@@ -1665,7 +1677,7 @@ M6 发布与打包已完成：
 
 - **优雅退出发送 `Close` 帧**：客户端退出发 `Close{reason:"client shutdown"}`，服务端退出/会话替换发 `Close{reason:"server shutdown"/"session replaced"}`，随后 TLS close_notify（DESIGN §6.2.2）。
 - **服务端字段校验**：`run_id` 必须是 UUID、`token` ≤ 256 字节；`proxy_name` ≤ 64 字节且不含 `/` 与空白；`custom_domains` 数量/长度上限（DESIGN §6.2.3）。
-- **Dashboard 配置校验**：端口不得与 `bind_port` / vhost 端口冲突；绑定非回环地址输出安全警告；每 IP 请求限频（60s 窗口 100 次，429）。
+- **Dashboard 配置校验**：端口不得与 `bind_port` / vhost 端口冲突；绑定非回环地址输出安全警告；每 IP 请求限频（60s 窗口 100 次，429；IPv6 聚合到 /64）。`trusted_proxies` 非空时，仅直连对端命中该列表才采信 `X-Forwarded-For`（从右向左逐跳信任），用于限流与失败封禁。所有响应统一带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 与 CSP。
 - **UDP 可观测修复**：会话活跃时间双向更新；UDP 流量计入 `bytes_up/bytes_down` 指标。
 - **HTTPS vhost SNI 回退**：SNI 无法命中代理时回退到 Host 头路由。
 - **性能基准**：`benches/forward.rs` 用 Criterion 填充（帧编解码吞吐、桥接吞吐、配置解析耗时）。

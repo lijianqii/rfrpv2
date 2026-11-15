@@ -320,6 +320,8 @@ async fn http_vhost_with_tls_work_conn() {
             tls_cert: Some(cert.to_string_lossy().to_string()),
             tls_key: Some(key.to_string_lossy().to_string()),
             work_conn_tls: true,
+            // 该用例专门验证“控制明文 + 工作 TLS”组合，显式接受风险。
+            allow_plaintext_control: true,
             ..Default::default()
         },
         dashboard: None,

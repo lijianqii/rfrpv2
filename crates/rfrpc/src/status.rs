@@ -10,7 +10,7 @@ use rfrp_common::config::ClientConfig;
 use rfrp_common::constants::STATUS_MAX_CONCURRENT_CONNECTIONS;
 use rfrp_common::util::accept::AcceptRetry;
 use rfrp_common::util::http::{html_escape, read_request_head, write_response, RequestHead};
-use rfrp_common::util::ratelimit::RateLimiter;
+use rfrp_common::util::ratelimit::{rate_limit_key, RateLimiter};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -98,10 +98,14 @@ async fn handle_request(
         None => return Ok(()),
     };
 
-    if !limiter.allow(peer.ip(), Instant::now()) {
+    if !limiter.allow(rate_limit_key(peer.ip()), Instant::now()) {
         return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
     }
-    let path = RequestHead::parse(&head).path;
+    let req = RequestHead::parse(&head);
+    if req.framing_error {
+        return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await;
+    }
+    let path = req.path;
 
     // /healthz：隧道健康检查（控制连接已登录 → 200；否则 503），供监控/守护进程使用。
     if path == "/healthz" {

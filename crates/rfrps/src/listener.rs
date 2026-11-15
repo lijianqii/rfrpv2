@@ -386,6 +386,13 @@ pub(crate) fn dispatch_user_connection<S>(
 ) where
     S: AsyncStream + 'static,
 {
+    // accept 与 dispatch 之间会话可能已被替换/清理；为失效会话建立桥接会
+    // 让旧监听任务多存活一个用户连接的生命周期。
+    if session.stop.is_cancelled() || !state.is_current_session(&session) {
+        tracing::debug!(%proxy_name, "session no longer current; rejecting user connection");
+        return;
+    }
+
     // 并发连接数兜底（防 DoS）：原子地检查并递增，避免并发尖峰突破上限。
     let max = state.max_active.load(std::sync::atomic::Ordering::Relaxed);
     // 注意：`fetch_update` 在新工具链里被重命名为 `try_update`，但后者晚于本项目的
@@ -435,10 +442,22 @@ pub(crate) fn dispatch_user_connection<S>(
         }),
     );
 
+    // 统计表按代理名索引；旧会话在途 dispatch 若在 cleanup 之后创建条目，
+    // 会覆盖同名新会话的统计。拿到 Arc 后再确认一次，失效则条件删除。
+    if session.stop.is_cancelled() || !state.is_current_session(&session) {
+        state.remove_proxy_stats(std::slice::from_ref(&proxy_name), &session.session_id);
+        tracing::debug!(%proxy_name, "session stopped during dispatch; dropping user connection");
+        return;
+    }
+
     // 优先命中预热池（§8.2）。池中连接可能已被本地服务（sshd/RDP 等）
     // 在空闲时关闭，出池前先探活，避免用户连接被死连接立即重置。
     let pooled = pop_live_pooled(&session, &proxy_name, &state);
     if let Some(work) = pooled {
+        if session.stop.is_cancelled() || !state.is_current_session(&session) {
+            tracing::debug!(%proxy_name, "session stopped before pooled bridge; dropping");
+            return;
+        }
         tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
         let pname = proxy_name.clone();
         let tracker = state.data_tasks.clone();
@@ -471,8 +490,16 @@ pub(crate) fn dispatch_user_connection<S>(
             created: std::time::Instant::now(),
         },
     );
+    // cleanup 可能恰好发生在“有效性检查”与“插入”之间；cleanup 的 retain
+    // 已经执行过，这里必须自行回滚，否则用户连接会挂到失效会话上直到超时。
+    if session.stop.is_cancelled() || !state.is_current_session(&session) {
+        state.pending.lock().remove(&work_id);
+        tracing::debug!(%proxy_name, work_id, "session stopped; dropped pending user connection");
+        return;
+    }
 
     let tx = session.tx.clone();
+    let stop = session.stop.clone();
     let state2 = state.clone();
     let interval = state.pending_request_interval();
     let tracker = state2.data_tasks.clone();
@@ -482,17 +509,19 @@ pub(crate) fn dispatch_user_connection<S>(
         // 瞬时不可用、建连抖动）时，单次请求会让用户连接白等超时被关闭。
         let deadline = std::time::Instant::now() + Duration::from_secs(WORK_CONN_TIMEOUT_RFRPS);
         loop {
-            if !send_with_timeout_reserved(
-                &tx,
-                Message::ReqWorkConn(ReqWorkConn {
-                    proxy_name: proxy_name.clone(),
-                    work_id,
-                }),
-                CONTROL_HEARTBEAT_RESERVE,
-            )
-            .await
-            {
-                // 控制连接已断或通道拥堵，清理待处理项（避免任务堆积）。
+            let sent = tokio::select! {
+                _ = stop.cancelled() => false,
+                ok = send_with_timeout_reserved(
+                    &tx,
+                    Message::ReqWorkConn(ReqWorkConn {
+                        proxy_name: proxy_name.clone(),
+                        work_id,
+                    }),
+                    CONTROL_HEARTBEAT_RESERVE,
+                ) => ok,
+            };
+            if !sent {
+                // 控制连接已断、通道拥堵或会话已停止，清理待处理项（避免任务堆积）。
                 state2.pending.lock().remove(&work_id);
                 return;
             }

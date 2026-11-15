@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -464,24 +465,56 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = write_ready_file(0) {
-        tracing::error!(error = %e, "failed to write supervisor ready file");
-        return ExitCode::FAILURE;
-    }
     let restart_requested = Arc::new(AtomicBool::new(false));
+    let shutdown = client.shutdown_token();
     let exit_watcher = exit_watch.map(|watch| {
         spawn_client_exit_watcher(
             args.clone(),
             watch,
-            client.shutdown_token(),
+            shutdown.clone(),
             restart_requested.clone(),
         )
     });
-    spawn_supervised_stdin(client.shutdown_token());
+    spawn_supervised_stdin(shutdown.clone());
 
-    let result = client.run().await;
+    // 只有首次登录成功后才写 supervisor ready：错误 token / 证书 / 版本
+    // 会以致命错误退出，supervisor 应回滚旧 stage，而不是把新 stage 当成功。
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    let client = client.with_ready(ready_tx);
+    let mut run_task = tokio::spawn(client.run());
+    let mut ready_error = None;
+    let result = tokio::select! {
+        ready = &mut ready_rx => {
+            if ready.is_ok() {
+                if let Err(e) = write_ready_file(0) {
+                    tracing::error!(error = %e, "failed to write supervisor ready file");
+                    ready_error = Some(());
+                    shutdown.cancel();
+                }
+            }
+            match run_task.await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(error = %e, "rfrpc task join failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        result = &mut run_task => {
+            match result {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(error = %e, "rfrpc task join failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
     if let Some(watcher) = exit_watcher {
         watcher.stop().await;
+    }
+    if ready_error.is_some() {
+        return ExitCode::FAILURE;
     }
     match result {
         Ok(()) if restart_requested.load(Ordering::Relaxed) => ExitCode::from(75),

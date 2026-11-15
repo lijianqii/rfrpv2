@@ -19,6 +19,11 @@ async fn dashboard_requires_auth() {
         http_get(port, "/api/status", Some(&basic_auth("admin", "secret123"))).await;
     assert_eq!(status, 200, "authorized request should succeed: {body}");
     assert!(
+        body.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "authenticated dashboard responses must not be cached: {body}"
+    );
+    assert!(
         body.contains("\"sessions\""),
         "status json missing sessions: {body}"
     );
@@ -63,6 +68,29 @@ async fn dashboard_metrics_and_page() {
 
     let (status, _) = http_get(port, "/nope", Some(&auth)).await;
     assert_eq!(status, 404);
+
+    srv.abort();
+}
+
+#[tokio::test]
+async fn dashboard_sends_security_headers() {
+    let port = free_port();
+    let (srv, _addr) = start_server(dashboard_config(port)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (status, resp) = http_get(port, "/api/status", None).await;
+    assert_eq!(status, 401);
+    for header in [
+        "x-content-type-options: nosniff",
+        "x-frame-options: deny",
+        "referrer-policy: no-referrer",
+        "content-security-policy: default-src 'none'",
+    ] {
+        assert!(
+            resp.to_ascii_lowercase().contains(header),
+            "missing {header:?}: {resp}"
+        );
+    }
 
     srv.abort();
 }
@@ -183,6 +211,11 @@ async fn dashboard_form_login_grants_cookie_session() {
     // 正确凭据：302 回首页并下发会话 Cookie。
     let (status, resp) = http_post_form(port, "/login", "user=admin&password=secret123").await;
     assert_eq!(status, 302, "successful login should redirect: {resp}");
+    assert!(
+        resp.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "login redirect must not be cached: {resp}"
+    );
     let cookie = response_cookie(&resp, "rfrp_dashboard").expect("session cookie set");
 
     // 带上 Cookie 访问首页：应放行。

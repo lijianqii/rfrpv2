@@ -2,8 +2,27 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
+
+/// 限流键：IPv4 保持原样；IPv6 聚合到 /64，IPv4-mapped IPv6 归一为 IPv4。
+///
+/// 单个 IPv6 用户通常控制整个 /64；若按单地址限流，攻击者可轮换地址
+/// 绕过 Dashboard/登录失败/请求频率限制。按 /64 聚合会牺牲少量共享同一
+/// 前缀的客户端独立性，换取不可轻易绕过的限速。
+pub fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
 
 /// 限频表条目上限：达到后先清理过期项再插入（防不同源 IP 导致内存增长）。
 const MAX_ENTRIES: usize = 4096;
@@ -103,5 +122,21 @@ mod tests {
         }
         let _ = limiter.allow("9.9.9.9".parse().unwrap(), now);
         assert!(limiter.inner.lock().len() < MAX_ENTRIES);
+    }
+
+    #[test]
+    fn rate_limit_key_aggregates_ipv6_by_64() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(rate_limit_key(a), rate_limit_key(b));
+        assert_ne!(rate_limit_key(a), rate_limit_key(c));
+    }
+
+    #[test]
+    fn rate_limit_key_maps_ipv4_mapped_ipv6_to_ipv4() {
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let expected: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(rate_limit_key(mapped), expected);
     }
 }

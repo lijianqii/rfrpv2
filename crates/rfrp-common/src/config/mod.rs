@@ -60,7 +60,7 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig> {
             describe_io_error(&e)
         ))
     })?;
-    let mut cfg: ServerConfig = toml::from_str(&text)?;
+    let mut cfg: ServerConfig = toml::from_str(&text).map_err(toml_parse_error)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.server.tls_cert, base);
     resolve_opt_path(&mut cfg.server.tls_key, base);
@@ -80,13 +80,28 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
             describe_io_error(&e)
         ))
     })?;
-    let mut cfg: ClientConfig = toml::from_str(&text)?;
+    let mut cfg: ClientConfig = toml::from_str(&text).map_err(toml_parse_error)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_opt_path(&mut cfg.client.tls_ca, base);
     cfg.normalize();
     cfg.validate()?;
     tracing::debug!(path = %path.display(), "client config loaded");
     Ok(cfg)
+}
+
+/// 将 TOML 解析错误转为不含原始配置行的错误。
+///
+/// `toml::de::Error` 的 Display 会附带出错行原文，可能包含 token/password；
+/// 日志与 CI 输出不应记录这类敏感内容。只保留错误类别和字节位置。
+fn toml_parse_error(e: toml::de::Error) -> crate::error::Error {
+    let location = e
+        .span()
+        .map(|span| format!(" at byte {}", span.start))
+        .unwrap_or_default();
+    config(format!(
+        "invalid TOML configuration{location}: {}",
+        e.message()
+    ))
 }
 
 /// 将相对路径解析为相对于配置文件所在目录的路径。

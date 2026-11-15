@@ -2,12 +2,12 @@
 
 use crate::config::{is_valid_domain, LogSection};
 use crate::constants::{
-    MAX_CUSTOM_DOMAINS, POOL_SIZE_DEFAULT, POOL_SIZE_MAX, POOL_SIZE_WARN_THRESHOLD,
+    MAX_CUSTOM_DOMAINS, MAX_PROXY_NAME_LEN, POOL_SIZE_DEFAULT, POOL_SIZE_MAX,
+    POOL_SIZE_WARN_THRESHOLD,
 };
 use crate::error::{config, Result};
 use crate::protocol::msg::ProxyType;
 use serde::Deserialize;
-use std::path::Path;
 
 fn default_local_ip() -> String {
     "127.0.0.1".to_string()
@@ -129,6 +129,17 @@ pub struct ClientProxy {
 impl ClientProxy {
     /// 校验本代理条目字段一致性（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
+        // 与服务端 NewProxy 校验保持同一套规则，避免 --check 通过后注册才失败。
+        if self.name.is_empty()
+            || self.name.len() > MAX_PROXY_NAME_LEN
+            || self.name.contains('/')
+            || self.name.chars().any(char::is_whitespace)
+        {
+            return Err(config(format!(
+                "invalid proxy name '{}': must be 1-{} bytes and contain no '/' or whitespace",
+                self.name, MAX_PROXY_NAME_LEN
+            )));
+        }
         // local_ip 允许域名（如 `db.internal`）：实际解析发生在建连时
         // （`TcpStream::connect((host, port))`）。这里只做非空/无空白的基础校验。
         if self.local_ip.trim().is_empty() || self.local_ip.chars().any(char::is_whitespace) {
@@ -286,9 +297,10 @@ impl ClientConfig {
             )));
         }
         if let Some(ca) = &self.client.tls_ca {
-            if !Path::new(ca).is_file() {
+            if let Err(e) = std::fs::File::open(ca) {
                 return Err(config(format!(
-                    "tls_ca file not found or not readable: {ca}"
+                    "tls_ca file not found or not readable: {ca} ({})",
+                    crate::error::describe_io_error(&e)
                 )));
             }
         }

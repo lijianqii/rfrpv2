@@ -29,6 +29,7 @@ use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
 use rfrp_common::protocol::msg::*;
 use rfrp_common::util::control::{graceful_close, send_with_timeout, try_send};
 use rfrp_common::util::now_ms;
+use rfrp_common::util::ratelimit::rate_limit_key;
 use tokio::io::split;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -40,7 +41,9 @@ use crate::state::ServerState;
 
 mod session;
 #[cfg(test)]
-pub(crate) use session::{test_entry, test_entry_with, test_session, test_session_with_token};
+pub(crate) use session::{
+    test_entry, test_entry_with, test_session, test_session_with_id, test_session_with_token,
+};
 pub use session::{ProxyEntry, Session};
 
 /// 拒绝登录并下发失败 LoginResp（`error=None` 表示鉴权失败，不回显原因，§10.2）。
@@ -83,10 +86,11 @@ where
 {
     // 同一 IP 的“检查限速 → 校验 token → 记录失败/清除”必须串行；
     // 否则并发尝试可以同时通过检查，再一起记录失败，突破失败次数上限。
-    let login_guard = state.login_lock(peer_ip).lock().await;
+    let limit_ip = rate_limit_key(peer_ip);
+    let login_guard = state.login_lock(limit_ip).lock().await;
 
     // 登录失败限速（防 token 穷举）：超限直接拒绝，且不区分失败原因。
-    if !state.login_allowed(peer_ip) {
+    if !state.login_allowed(limit_ip) {
         drop(login_guard);
         // 限速是临时状态，必须回一个可重试错误；不能用 `error=None`（客户端将其
         // 视为鉴权失败并永久退出，导致合法客户端被同 IP 的其他失败尝试连累）。
@@ -128,13 +132,13 @@ where
 
     // token 鉴权。鉴权失败不回显具体原因（DESIGN §10.2），客户端将 `ok=false + error=None` 视为致命鉴权失败。
     if !verify_token(&config.server.token, &token) {
-        state.record_login_failure(peer_ip);
+        state.record_login_failure(limit_ip);
         drop(login_guard);
         tracing::warn!(run_id = %run_id, %peer_ip, "login rejected: token mismatch");
         reject_login(stream, None).await?;
         return Ok(());
     }
-    state.clear_login_failures(peer_ip);
+    state.clear_login_failures(limit_ip);
     drop(login_guard);
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -162,7 +166,10 @@ where
             Ok(reg.insert(session.run_id.clone(), session.clone()))
         } else if reg.len() >= state.max_sessions.load(Ordering::Relaxed) {
             Err("global limit reached")
-        } else if reg.values().filter(|s| s.peer_ip == peer_ip).count()
+        } else if reg
+            .values()
+            .filter(|s| rate_limit_key(s.peer_ip) == limit_ip)
+            .count()
             >= state.max_sessions_per_ip.load(Ordering::Relaxed)
         {
             Err("per-ip limit reached")
@@ -543,12 +550,14 @@ fn cleanup(session: &Session, state: &ServerState) {
         let domain_names: Vec<String> = session.proxy_domains.lock().keys().cloned().collect();
         (proxy_names, udp_names, domain_names)
     };
-    state.remove_proxy_stats(&proxy_names, &session.session_id);
-    state.unindex_proxies(proxy_names, session);
+    state.unindex_proxies(proxy_names.clone(), session);
     state.unindex_domains(domain_names, session);
+    // 先 abort 监听任务再移除统计：反过来的话，正在 accept 的任务可能在
+    // 统计移除后又创建同名条目，导致统计表残留且不再被清理。
     for (_, entry) in session.proxies.lock().drain() {
         entry.handle.abort();
     }
+    state.remove_proxy_stats(&proxy_names, &session.session_id);
     let mut udp = state.udp.lock();
     for n in udp_names {
         // 仅移除本会话持有的 UDP 运行态：同一 run_id 的新会话可能已注册同名

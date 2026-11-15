@@ -478,3 +478,107 @@ fn resource_limit_defaults_and_validation() {
     cfg.server.max_total_pooled_work_conns = 0;
     assert!(cfg.validate().is_err());
 }
+
+#[test]
+fn allow_ports_rejects_zero() {
+    for bad in ["0", "0-100", "100-0"] {
+        let cfg = ProxySection {
+            allow_ports: bad.into(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.parse_allow_ports().is_err(),
+            "port 0 must be rejected: {bad}"
+        );
+    }
+}
+
+#[test]
+fn dashboard_password_minimum_counts_characters() {
+    let mk = |password: &str| DashboardSection {
+        addr: "127.0.0.1:7500".into(),
+        user: "admin".into(),
+        password: password.into(),
+        ..Default::default()
+    };
+    assert!(mk("密码密").validate().is_err(), "3 chars must fail");
+    assert!(mk("密码密码密码").validate().is_ok(), "6 chars must pass");
+}
+
+#[test]
+fn empty_bind_addr_rejected() {
+    let cfg = ServerConfig {
+        server: ServerSection {
+            bind_addr: String::new(),
+            token: "x".into(),
+            work_conn_tls: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn toml_parse_error_does_not_echo_secret_line() {
+    let dir = std::env::temp_dir().join(format!(
+        "rfrp-config-secret-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("server.toml");
+    std::fs::write(&path, "[server]\ntoken = \"super-secret\n").unwrap();
+    let err = crate::config::load_server_config(&path)
+        .expect_err("malformed TOML must fail")
+        .to_string();
+    assert!(
+        !err.contains("super-secret"),
+        "parse error must not echo secret token: {err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn mixed_plaintext_control_requires_explicit_opt_in() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut cfg = ServerConfig {
+        server: ServerSection {
+            token: "x".into(),
+            tls_enable: false,
+            tls_cert: Some(base.join("cert.pem").to_string_lossy().into_owned()),
+            tls_key: Some(base.join("key.pem").to_string_lossy().into_owned()),
+            work_conn_tls: true,
+            allow_plaintext_control: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("allow_plaintext_control"), "{err}");
+    cfg.server.allow_plaintext_control = true;
+    assert!(
+        cfg.validate().is_ok(),
+        "explicit opt-in must allow the mixed mode"
+    );
+}
+
+#[test]
+fn trusted_proxies_must_be_exact_ips() {
+    let mut cfg = ServerConfig {
+        server: ServerSection {
+            token: "x".into(),
+            work_conn_tls: false,
+            trusted_proxies: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("trusted_proxies"), "{err}");
+    cfg.server.trusted_proxies = vec!["10.0.0.1".into(), "::1".into()];
+    assert!(cfg.validate().is_ok());
+}

@@ -64,12 +64,24 @@ pub async fn handle_work_conn(req: ReqWorkConn, state: Arc<ClientState>) -> Resu
             state.metrics.inc_work_conn_failure();
             Error::Other("work_conn_tls enabled but client TLS not initialized".into())
         })?;
-        let tls_work = timeout_at(deadline, tls.connect(work))
-            .await
-            .map_err(|_| {
+        let tls_work = match timeout_at(deadline, tls.connect(work)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
                 state.metrics.inc_work_conn_failure();
-                Error::Other("work connection TLS handshake timeout".into())
-            })??;
+                if let Error::Auth(msg) = &e {
+                    // 证书/主机名校验失败是配置错误；不能让控制会话保持“健康”
+                    // 却让所有工作连接静默失败。置位 fatal 并停止重连。
+                    *state.fatal.lock() = Some(msg.clone());
+                    state.shutdown.cancel();
+                    tracing::error!(error = %msg, "work connection TLS authentication failed");
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                state.metrics.inc_work_conn_failure();
+                return Err(Error::Other("work connection TLS handshake timeout".into()));
+            }
+        };
         Box::new(tls_work)
     } else {
         Box::new(work)

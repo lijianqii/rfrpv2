@@ -58,6 +58,10 @@ pub struct ClientState {
     pub preheat_limit: Arc<tokio::sync::Semaphore>,
     /// 进程级运行指标（跨重连累计）。
     pub metrics: Arc<ClientMetrics>,
+    /// 工作连接 TLS 鉴权失败等不可自愈错误：置位后取消控制会话，由 run() 返回失败。
+    pub fatal: Arc<Mutex<Option<String>>>,
+    /// 进程级退出令牌（工作连接发现致命配置错误时提前停止重连）。
+    pub shutdown: CancellationToken,
 }
 
 /// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
@@ -83,6 +87,10 @@ pub struct Client {
     metrics: Arc<ClientMetrics>,
     /// 优雅退出令牌：信号或外部触发后停止重连并退出（§14.4）。
     shutdown: CancellationToken,
+    /// 工作连接 TLS 鉴权失败等不可自愈错误的跨会话状态。
+    fatal: Arc<Mutex<Option<String>>>,
+    /// 首次登录成功时通知 supervisor：此刻配置/TLS/鉴权均已通过，才算可回滚的“启动成功”。
+    ready: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 /// 按配置构建客户端 TLS；不启用 TLS 时返回 `None`。
@@ -128,7 +136,15 @@ impl Client {
             tls,
             metrics: Arc::new(ClientMetrics::new()),
             shutdown: CancellationToken::new(),
+            fatal: Arc::new(Mutex::new(None)),
+            ready: Mutex::new(None),
         })
+    }
+
+    /// 注入“首次登录成功”通知；供 supervisor 在认证通过后再写 ready 文件。
+    pub fn with_ready(self, tx: oneshot::Sender<()>) -> Self {
+        *self.ready.lock() = Some(tx);
+        self
     }
 
     /// 覆盖心跳间隔与响应超时（主要用于测试：缩短失联检测时间）。
@@ -229,6 +245,9 @@ impl Client {
             }
         }
         sig.abort();
+        if let Some(reason) = self.fatal.lock().take() {
+            return Err(anyhow::anyhow!("fatal work connection error: {reason}"));
+        }
         Ok(())
     }
 
@@ -358,6 +377,8 @@ impl Client {
             inflight_work: Mutex::new(HashSet::new()),
             preheat_limit: Arc::new(tokio::sync::Semaphore::new(PREHEAT_MAX_CONCURRENT)),
             metrics: self.metrics.clone(),
+            fatal: self.fatal.clone(),
+            shutdown: shutdown.clone(),
         });
         let (tx, rx) = mpsc::channel::<Message>(64);
         let (login_otx, login_orx) = oneshot::channel();
@@ -416,6 +437,9 @@ impl Client {
                     }
                     self.metrics.set_connected(true);
                     connected_at = Some(std::time::Instant::now());
+                    if let Some(tx) = self.ready.lock().take() {
+                        let _ = tx.send(());
+                    }
                 }
                 if !resp.ok {
                     let reason = resp.error.clone().unwrap_or_else(|| "auth failed".into());
@@ -814,10 +838,12 @@ fn spawn_preheat(state: &Arc<ClientState>, p: &ClientProxy) {
     }
     let state = state.clone();
     let p = p.clone();
-    // 每个代理一个预热任务，并在全局 Semaphore 下串行建立连接：
-    // 避免 128 代理 × pool_size=32 时瞬间创建数千条连接/任务。
-    tokio::spawn(async move {
-        for _ in 0..p.pool_size.min(POOL_SIZE_MAX) {
+    // 每个池槽独立任务：handle_work_conn 在建立后进入桥接并阻塞到连接被使用，
+    // 不能用串行 await 循环（否则 pool_size 实际只生效 1）。
+    for _ in 0..p.pool_size.min(POOL_SIZE_MAX) {
+        let state = state.clone();
+        let p = p.clone();
+        tokio::spawn(async move {
             let Ok(permit) = state.preheat_limit.clone().acquire_owned().await else {
                 return;
             };
@@ -827,8 +853,8 @@ fn spawn_preheat(state: &Arc<ClientState>, p: &ClientProxy) {
             };
             let _ = crate::workconn::handle_work_conn(req, state.clone()).await;
             drop(permit);
-        }
-    });
+        });
+    }
 }
 
 /// 后台注册重试。
@@ -948,6 +974,8 @@ pub(crate) fn test_state(
         inflight_work: Mutex::new(HashSet::new()),
         preheat_limit: Arc::new(tokio::sync::Semaphore::new(PREHEAT_MAX_CONCURRENT)),
         metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+        fatal: Arc::new(Mutex::new(None)),
+        shutdown: CancellationToken::new(),
     })
 }
 

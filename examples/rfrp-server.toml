@@ -9,6 +9,8 @@ tls_enable = true                 # 控制链路 TLS 总开关（代码默认 fa
 tls_cert = "./cert.pem"          # 控制链路证书（相对配置文件目录解析，已随示例提供）
 tls_key  = "./key.pem"
 work_conn_tls = true             # 是否要求工作连接走 TLS（true 时拒绝明文工作连接）
+allow_plaintext_control = false  # 仅 work_conn_tls=true 且 tls_enable=false 时需显式置 true（不安全）
+trusted_proxies = []             # Dashboard 可信反向代理 IP（精确 IP，暂不支持 CIDR）；仅这些对端的 X-Forwarded-For 生效
 tcp_keepalive_secs = 30          # TCP keepalive 空闲秒数；0 = 禁用（默认 30）
 heartbeat_interval_secs = 30     # 心跳发送间隔（秒，默认 30）
 heartbeat_timeout_secs = 10      # 心跳回应超时（秒，默认 10，必须小于 interval）

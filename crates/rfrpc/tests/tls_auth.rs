@@ -159,7 +159,10 @@ async fn tls_control_only_work_plaintext() {
 async fn work_conn_tls_upgrades_when_server_prefers_tls() {
     init_logging();
     let echo_port = spawn_echo().await;
-    let (srv, addr) = start_server(server_config(false, true, "secret")).await;
+    // 该用例专门验证“控制明文 + 工作 TLS”组合，显式接受 token 暴露风险。
+    let mut cfg = server_config(false, true, "secret");
+    cfg.server.allow_plaintext_control = true;
+    let (srv, addr) = start_server(cfg).await;
     let remote = free_port();
     let cli = start_client(client_config(
         addr,

@@ -605,3 +605,19 @@ async fn resolve_server_addrs_returns_all_candidates_and_accepts_brackets() {
     assert_eq!(addrs.len(), 1);
     assert!(addrs[0].ip().is_loopback());
 }
+
+#[test]
+fn client_proxy_name_rejects_server_invalid_names() {
+    let mk = |name: &str| ClientProxy {
+        name: name.into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: 22,
+        remote_port: Some(6000),
+        custom_domains: None,
+        pool_size: 0,
+    };
+    assert!(mk("bad/name").validate().is_err());
+    assert!(mk("bad name").validate().is_err());
+    assert!(mk(&"x".repeat(MAX_PROXY_NAME_LEN + 1)).validate().is_err());
+}

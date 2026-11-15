@@ -60,6 +60,9 @@ impl TaskGroup {
     /// 标记不再期望新任务。调用后仍应避免继续 spawn；`wait` 以 active 为准。
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        // 若 wait 在 close 之前进入等待，此时 active 可能已经为 0，
+        // 不会再有 ActiveGuard drop 来触发通知；必须在这里主动唤醒。
+        self.inner.notify.notify_waiters();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -117,5 +120,22 @@ mod tests {
             .await
             .expect("panicked task must release its slot");
         assert!(group.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_wakes_wait_started_before_close() {
+        let group = TaskGroup::new();
+        let waiter = {
+            let group = group.clone();
+            tokio::spawn(async move {
+                group.wait().await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        group.close();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait must be woken by close even with no active tasks")
+            .unwrap();
     }
 }

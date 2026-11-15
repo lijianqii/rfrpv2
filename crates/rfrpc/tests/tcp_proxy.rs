@@ -3,6 +3,8 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
@@ -10,7 +12,7 @@ use rfrp_common::config::ClientProxy;
 use rfrp_common::protocol::msg::ProxyType;
 use rfrps::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
 async fn tcp_proxy_roundtrip() {
@@ -99,6 +101,49 @@ async fn tcp_proxy_multiple_proxies() {
     expect_echo(r2, addr, b"to-web").await;
     expect_echo(r2, addr, b"web-again").await;
     expect_echo(r1, addr, b"ssh-again").await;
+
+    srv.abort();
+    cli.abort();
+}
+
+#[tokio::test]
+async fn tcp_proxy_prewarms_all_pool_slots() {
+    // pool_size=3 必须实际建立 3 条到本地服务的预热连接，而不是只建立 1 条。
+    init_logging();
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = local.accept().await {
+            counter.fetch_add(1, Ordering::Relaxed);
+            held.push(s);
+        }
+    });
+
+    let (srv, addr) = start_server(server_config(0)).await;
+    let remote = free_port();
+    let proxy = ClientProxy {
+        name: "p-pool".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port,
+        remote_port: Some(remote),
+        custom_domains: None,
+        pool_size: 3,
+    };
+    let cli = start_client(client_config(addr, vec![proxy], None)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while accepted.load(Ordering::Relaxed) < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected 3 prewarmed local connections, got {}",
+            accepted.load(Ordering::Relaxed)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     srv.abort();
     cli.abort();

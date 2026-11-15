@@ -4,7 +4,6 @@ use crate::config::LogSection;
 use crate::error::{config, Result};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::Path;
 
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
@@ -47,6 +46,14 @@ pub struct ServerSection {
     /// 是否要求工作连接走 TLS。默认 true（见 DESIGN §6.5）。
     #[serde(default = "default_true")]
     pub work_conn_tls: bool,
+    /// 显式允许“控制连接明文 + 工作连接 TLS”这一不安全组合。
+    /// 默认 false：该组合会把 token/work_conn_token 暴露在明文控制链路上。
+    #[serde(default)]
+    pub allow_plaintext_control: bool,
+    /// 可信反向代理的 IP 列表（Dashboard 的 `X-Forwarded-For` 只在
+    /// 直连对端命中该列表时生效）。默认空：忽略 XFF，按 TCP 对端地址限流。
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// TCP keepalive 空闲时间（秒）；0 = 禁用。缺省 30。
     /// 用于空闲长连接（SSH/RDP）的断线感知；Windows 亦生效。
     #[serde(default)]
@@ -90,6 +97,8 @@ impl Default for ServerSection {
             tls_cert: None,
             tls_key: None,
             work_conn_tls: default_true(),
+            allow_plaintext_control: false,
+            trusted_proxies: Vec::new(),
             tcp_keepalive_secs: None,
             heartbeat_interval_secs: None,
             heartbeat_timeout_secs: None,
@@ -180,7 +189,7 @@ impl DashboardSection {
         if self.user.is_empty() {
             return Err(config("dashboard.user must not be empty"));
         }
-        if self.password.len() < 6 {
+        if self.password.chars().count() < 6 {
             return Err(config("dashboard.password must be at least 6 characters"));
         }
         if let Some(secs) = self.session_ttl_secs {
@@ -241,11 +250,17 @@ impl ProxySection {
                 if s > e {
                     return Err(config(format!("port range start > end: {part}")));
                 }
+                if s == 0 || e == 0 {
+                    return Err(config(format!("port must be 1-65535: {part}")));
+                }
                 ranges.push((s, e));
             } else {
                 let p: u16 = part
                     .parse()
                     .map_err(|_| config(format!("invalid port: {part}")))?;
+                if p == 0 {
+                    return Err(config(format!("port must be 1-65535: {part}")));
+                }
                 ranges.push((p, p));
             }
         }
@@ -269,12 +284,14 @@ impl ProxySection {
 
 /// 校验证书/私钥文件存在且可读。
 fn ensure_file_exists(path: &str, field: &str) -> Result<()> {
-    if !Path::new(path).is_file() {
-        return Err(config(format!(
-            "{field} file not found or not readable: {path}"
-        )));
+    // is_file() 对无读权限的文件仍可能返回 true；实际打开一次才能覆盖“可读”契约。
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(config(format!(
+            "{field} file not found or not readable: {path} ({})",
+            crate::error::describe_io_error(&e)
+        ))),
     }
-    Ok(())
 }
 
 /// 完整服务端配置。
@@ -302,6 +319,20 @@ impl ServerConfig {
 
     /// 校验配置（DESIGN §9.4）。
     pub fn validate(&self) -> Result<()> {
+        let bind_addr = self.server.bind_addr.trim();
+        if bind_addr.is_empty() || bind_addr.chars().any(char::is_whitespace) {
+            return Err(config(format!(
+                "invalid bind_addr: '{}'",
+                self.server.bind_addr
+            )));
+        }
+        // 配置里的 bind_addr 是纯主机名/IP，不带端口；IPv6 字面量直接写 `::1`。
+        if bind_addr.contains(':') && bind_addr.parse::<std::net::IpAddr>().is_err() {
+            return Err(config(format!(
+                "invalid bind_addr '{}': use host without port (IPv6 without brackets)",
+                self.server.bind_addr
+            )));
+        }
         if !(1..=65535).contains(&self.server.bind_port) {
             return Err(config(format!(
                 "bind_port {} out of range 1-65535",
@@ -310,6 +341,15 @@ impl ServerConfig {
         }
         if self.server.token.is_empty() {
             return Err(config("server token must not be empty"));
+        }
+        for (i, proxy) in self.server.trusted_proxies.iter().enumerate() {
+            if proxy.parse::<std::net::IpAddr>().is_err() {
+                return Err(config(format!(
+                    "trusted_proxies[{i}] '{}' must be an exact IP address \
+                     (CIDR/域名不支持)",
+                    proxy
+                )));
+            }
         }
         if self.server.token.len() > crate::constants::MAX_TOKEN_LEN {
             return Err(config(format!(
@@ -336,6 +376,15 @@ impl ServerConfig {
                 .ok_or_else(|| config(missing_tls.clone()))?;
             ensure_file_exists(cert, "tls_cert")?;
             ensure_file_exists(key, "tls_key")?;
+            if self.server.work_conn_tls
+                && !self.server.tls_enable
+                && !self.server.allow_plaintext_control
+            {
+                return Err(config(
+                    "work_conn_tls=true with tls_enable=false sends tokens over plaintext; \
+                     set tls_enable=true, or set allow_plaintext_control=true to explicitly accept the risk",
+                ));
+            }
         }
         if let Some(secs) = self.server.tcp_keepalive_secs {
             if secs > 3600 {
@@ -444,7 +493,7 @@ impl ServerConfig {
                     "dashboard addr port must not equal vhost_https_port",
                 ));
             }
-            if daddr.ip().is_unspecified() {
+            if !daddr.ip().is_loopback() {
                 tracing::warn!(
                     addr = %d.addr,
                     "dashboard bound to a non-loopback address; Basic Auth is plaintext, restrict access"

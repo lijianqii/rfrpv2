@@ -8,6 +8,12 @@
 
 ### Added
 
+- **`[server].allow_plaintext_control`**：默认拒绝 `work_conn_tls=true` +
+  `tls_enable=false` 的混合模式（会把 token/`work_conn_token` 暴露在明文控制链路上）。
+  确需该组合时必须显式置 `true`，配置校验与 `Server::new` 两处都会拒绝未声明的启动。
+- **`[server].trusted_proxies`**：Dashboard 反向代理信任列表（精确 IP，默认空）。
+  仅当 TCP 对端命中列表时才解析 `X-Forwarded-For`，并从右向左逐跳信任；
+  直连客户端伪造的 XFF 不会影响限流/失败封禁。
 - **Dashboard 会话 Cookie 有效期与 `Secure` 开关**：`[dashboard].session_ttl_secs`
   （默认 8 小时，范围 1 分钟~30 天）给会话 Cookie 加上明确 `Max-Age`——此前 Cookie
   没有过期时间，浏览器会话结束前一直可用；`[dashboard].cookie_secure = true` 给 Cookie
@@ -36,6 +42,18 @@
 
 ### Changed
 
+- **supervisor 观察期（probation）**：`--watch-config=restart` 下新配置子进程写入 ready 后
+  保留旧 stage 60s；观察期内子进程退出则回滚旧配置，而不是继续重启新配置。观察期
+  通过后才删除旧 stage，避免“能通过启动检查但运行即崩”的配置反复重启。
+- **UDP 全局内存/会话预算**：单代理队列 16 MiB、会话 4096 不变；新增所有代理共享的
+  64 MiB 队列预算与 16384 活跃会话预算。超出时丢包或拒绝新会话，并计入
+  `rfrp_udp_dropped_total`，防止多代理叠加耗尽内存。
+- **限流键统一 IPv6 /64**：控制登录、Dashboard、客户端状态端点与首帧握手配额
+  均把 IPv6 聚合到 /64，IPv4-mapped IPv6 归一为 IPv4；新增控制口单来源握手并发上限 64，
+  vhost HTTP/HTTPS 各自新增单来源认证前并发上限 64，防止一个前缀占满全局未认证名额。
+- **Dashboard/状态端点统一安全响应头**：所有 `write_response` 响应增加
+  `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`
+  与 CSP（允许本页内联样式/脚本，禁止外部资源与 iframe 嵌套）。
 - **资源上限可配置**：`[server]` 新增 `max_active_connections`、`max_total_proxies`、
   `max_total_domains`、`max_total_pooled_work_conns`，用于低内存/多租户部署限制 fd 与内存；
   默认值保持较高以兼容现有部署。
@@ -102,6 +120,42 @@
 
 ### Fixed
 
+- **会话清理与用户连接分派的竞态**：`dispatch_user_connection` 在入口、统计条目创建后、
+  pending 插入后分别校验 `session.stop` 与 `is_current_session`；失效会话不再新建桥接，
+  已插入的 pending 会自行回滚。`cleanup` 改为先 abort 监听任务再移除每代理统计，
+  避免在途 accept 在统计删除后又创建同名条目。TCP/UDP 的 `ReqWorkConn` 发送任务同时
+  监听会话/代理停止信号，控制链路断开时不再等发送超时。
+- **vhost 与 Dashboard/状态端点的消息边界歧义**：vhost 请求头拒绝重复 `Host`、
+  非法 UTF-8 `Host`、重复 `Content-Length`、重复 `Transfer-Encoding` 以及
+  `Content-Length + Transfer-Encoding` 并存；Dashboard/状态端点对同类歧义请求
+  返回 400（`RequestHead.framing_error`）。
+- **HTTP 响应头与原因短语**：`write_response` 的 `extra_header` 末尾带 `\r\n` 时
+  会生成空行提前结束响应头（多个响应头拼接场景）；现统一去掉尾部换行。503
+  补回 `Service Unavailable` 原因短语，此前会落回默认 `OK`。
+- **配置/CLI 输入校验补齐**：`bind_addr` 空值或含端口被拒；`allow_ports` 端口 0 被拒；
+  Dashboard 密码按字符数（≥6）而非字节数校验；客户端代理名与服务端 `NewProxy`
+  使用同一套规则（长度、`/`、空白），避免 `--check` 通过但注册失败；`split_host_port`
+  拒绝裸 IPv6、多余冒号与 `[域名]:端口`。
+- **TOML 解析错误不再回显配置原文**：`toml::de::Error` 的 Display 会附带出错行，
+  可能包含 token/password；现只保留错误类别与字节位置。
+- **TLS 材料按"可读"校验**：`tls_cert` / `tls_key` / `tls_ca` 从 `Path::is_file()`
+  改为实际 `File::open`，覆盖"文件存在但无读权限"，错误信息带 IO 原因。
+- **`pool_size > 1` 预热只建 1 条连接**：`spawn_preheat` 原用单任务串行 await，
+  而 `handle_work_conn` 建连后会阻塞在桥接等待被使用，循环无法进入下一轮；
+  现每个池槽一个独立任务（全局 Semaphore 仍限制并发）。
+- **客户端 ready 文件写入时机**：原在 `run_client` 启动时就写，错误 token/证书/版本
+  也会被 supervisor 判定为启动成功；现只在首次 `LoginResp.ok=true` 后写
+  （`Client::with_ready`），失败配置进入正常回滚。
+- **工作连接 TLS 鉴权失败被静默忽略**：证书/主机名校验失败（`Error::Auth`）此前
+  只计一次工作连接失败，控制会话仍"健康"并持续重连；现置位 fatal 并取消退出令牌，
+  `run()` 返回失败。
+- **UDP 运行态被旧会话覆盖**：`register_udp_proxy` 原无条件 `insert`，同 `run_id`
+  重连竞态下旧会话晚到会覆盖新会话运行态、随后回滚又删掉新条目；现按
+  owner/current 条件插入。
+- **`TaskGroup::close` 不唤醒已等待的 `wait`**：active 已为 0 时没有 guard drop
+  触发通知，`wait()` 可能永久挂住；现 `close` 主动 `notify_waiters()`。
+- **Dashboard 绑定告警与缓存**：非回环绑定告警覆盖所有非回环地址（原来只判
+  unspecified）；已认证/健康检查响应加 `Cache-Control: no-store`。
 - **控制连接断开后服务端资源延迟约 1 秒才释放**：`Session` 结构里持有一份出站通道的
   `tx` 克隆，`drop(tx)` 并不会关闭通道，写任务的 `rx.recv()` 永远挂起——旧实现把会话
   清理放在写任务 await **之后**，导致写任务只能等 1 秒硬超时被 abort，公网端口、代理监听

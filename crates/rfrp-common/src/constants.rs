@@ -243,6 +243,16 @@ pub const UDP_READ_BATCH: usize = 32;
 /// `udp_dropped_total`；16 MiB 足够覆盖正常 RDP 突发，又不会让单代理
 /// 在低内存机器上无界增长。
 pub const UDP_PROXY_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// 所有 UDP 代理共享的待发送队列总字节上限。
+///
+/// 单代理预算无法约束“多代理 × 多会话”的聚合内存；64 MiB 为默认全局硬上限，
+/// 低内存部署可结合 `max_total_proxies` 进一步收紧。
+pub const UDP_GLOBAL_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// 全局活跃 UDP 会话上限（所有代理合计）。
+///
+/// 单代理最多 4096 会话；没有全局上限时，多代理可把客户端 handler 缓冲
+/// 叠加到不可控规模。这里给所有代理一个统一硬上限。
+pub const MAX_TOTAL_UDP_SESSIONS: usize = 16384;
 /// UDP 读/写缓冲的初始容量。按实际数据增长，避免每个会话一上来就占 64 KiB。
 pub const UDP_BUF_INITIAL_BYTES: usize = 8 * 1024;
 /// 包池只回收不超过该容量的缓冲；超大包缓冲用完即丢，防止池被 65 KiB 缓冲撑大。
@@ -276,6 +286,12 @@ pub const MAX_TOTAL_POOLED_WORK_CONNS: usize = 8192;
 /// 该阶段尚未认证，不占用 `MAX_SESSIONS`；限流可防止大量半开连接在认证前
 /// 占用任务/套接字（配合控制帧长度上限，避免每连接预分配大缓冲）。
 pub const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
+/// 同一来源（IPv4 单地址 / IPv6 聚合到 /64）同时处于首帧握手阶段的上限。
+///
+/// 全局上限无法阻止单个来源占满全部握手名额；按来源配额保证一个 IP
+/// （或一个 IPv6 用户前缀）不能饿死其他客户端。64 为 NAT 场景保留余量，
+/// 同时远低于全局 1024。`trusted_proxies` 不改变该计数（握手阶段尚无 HTTP 头）。
+pub const MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP: usize = 64;
 
 // ---- 字符串长度上限（字节）----
 

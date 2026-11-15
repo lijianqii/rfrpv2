@@ -10,6 +10,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// 请求头上限（超过后按已读内容处理，解析失败按 `/` 处理）。
 pub const MAX_REQUEST_HEAD: usize = 8192;
 
+/// 服务端生成页面的统一安全响应头。
+///
+/// `script-src 'unsafe-inline'` 是 Dashboard 单文件页面所必需（无外部脚本源）；
+/// 其余指令默认拒绝外部资源、禁止被 iframe 嵌套，并通过 `form-action 'self'`
+/// 限制登录表单只能提交到本站。
+const SECURITY_HEADERS: &str = concat!(
+    "X-Content-Type-Options: nosniff\r\n",
+    "X-Frame-Options: DENY\r\n",
+    "Referrer-Policy: no-referrer\r\n",
+    "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; ",
+    "script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; ",
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\n",
+);
+
 /// 解析后的请求行与常用头部（Dashboard 与客户端状态端点共用）。
 ///
 /// 两个只读 HTTP 端点此前各自写了一套 `httparse` 样板；集中到这里后行为一致
@@ -24,6 +38,11 @@ pub struct RequestHead {
     pub accept_html: bool,
     pub authorization: Option<String>,
     pub cookie: Option<String>,
+    /// 原始 `X-Forwarded-For` 头（可多个）；是否可信由调用方按 `trusted_proxies` 判断。
+    pub x_forwarded_for: Vec<String>,
+    /// 消息边界歧义（重复 `Content-Length`、非法长度、`CL + Transfer-Encoding`）。
+    /// 调用方应直接返回 400，避免前后端对请求体长度产生不同解释。
+    pub framing_error: bool,
 }
 
 impl RequestHead {
@@ -43,17 +62,36 @@ impl RequestHead {
             if let Some(p) = req.path {
                 out.path = p.to_string();
             }
+            let mut content_length_seen = false;
+            let mut transfer_encoding_seen = false;
             for h in req.headers.iter() {
                 let value = std::str::from_utf8(h.value).unwrap_or("").trim();
                 if h.name.eq_ignore_ascii_case("content-length") {
-                    out.content_length = value.parse().unwrap_or(0);
+                    if content_length_seen {
+                        out.framing_error = true;
+                    }
+                    content_length_seen = true;
+                    match value.parse() {
+                        Ok(n) => out.content_length = n,
+                        Err(_) => out.framing_error = true,
+                    }
+                } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                    if transfer_encoding_seen {
+                        out.framing_error = true;
+                    }
+                    transfer_encoding_seen = true;
                 } else if h.name.eq_ignore_ascii_case("accept") {
                     out.accept_html = value.to_ascii_lowercase().contains("text/html");
                 } else if h.name.eq_ignore_ascii_case("authorization") {
                     out.authorization = Some(value.to_string());
                 } else if h.name.eq_ignore_ascii_case("cookie") {
                     out.cookie = Some(value.to_string());
+                } else if h.name.eq_ignore_ascii_case("x-forwarded-for") {
+                    out.x_forwarded_for.push(value.to_string());
                 }
+            }
+            if content_length_seen && transfer_encoding_seen {
+                out.framing_error = true;
             }
         }
         out
@@ -188,6 +226,7 @@ where
         401 => "Unauthorized",
         404 => "Not Found",
         429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let mut resp = format!(
@@ -195,9 +234,17 @@ where
         body.len()
     );
     if let Some(h) = extra_header {
-        resp.push_str(h);
-        resp.push_str("\r\n");
+        // 调用方常把多个头用 CRLF 拼接后传入，末尾可能已带 CRLF；
+        // 这里统一去掉尾部换行，避免生成 `\r\n\r\n` 提前结束响应头。
+        let h = h.trim_end_matches(['\r', '\n']);
+        if !h.is_empty() {
+            resp.push_str(h);
+            resp.push_str("\r\n");
+        }
     }
+    // 本模块只用于服务端生成的 HTML/JSON/文本页面；统一加上安全响应头，
+    // 避免 Dashboard/状态页被嗅探 MIME、被 iframe 嵌套或通过 Referer 泄露地址。
+    resp.push_str(SECURITY_HEADERS);
     resp.push_str("Connection: close\r\n\r\n");
     resp.push_str(body);
     stream.write_all(resp.as_bytes()).await?;
@@ -208,6 +255,29 @@ where
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn request_head_flags_duplicate_content_length() {
+        let head = RequestHead::parse(
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        );
+        assert!(head.framing_error);
+    }
+
+    #[test]
+    fn request_head_flags_cl_with_transfer_encoding() {
+        let head = RequestHead::parse(
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(head.framing_error);
+    }
+
+    #[test]
+    fn request_head_accepts_normal_framing() {
+        let head = RequestHead::parse(b"POST /login HTTP/1.1\r\nContent-Length: 12\r\n\r\n");
+        assert!(!head.framing_error);
+        assert_eq!(head.content_length, 12);
+    }
 
     #[tokio::test]
     async fn reads_head_until_terminator() {
@@ -279,6 +349,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writes_response_with_security_headers() {
+        let (mut client, mut server) = duplex(4096);
+        write_response(&mut server, 200, "text/html", "ok", None)
+            .await
+            .unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        for header in [
+            "X-Content-Type-Options: nosniff\r\n",
+            "X-Frame-Options: DENY\r\n",
+            "Referrer-Policy: no-referrer\r\n",
+            "Content-Security-Policy: default-src 'none'",
+        ] {
+            assert!(text.contains(header), "missing {header:?} in {text}");
+        }
+    }
+
+    #[tokio::test]
     async fn writes_response_with_extra_header() {
         let (mut client, mut server) = duplex(4096);
         write_response(
@@ -296,6 +386,50 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(text.contains("WWW-Authenticate: Basic realm=\"x\"\r\n"));
+    }
+
+    #[tokio::test]
+    async fn extra_header_with_trailing_crlf_does_not_end_headers_early() {
+        let (mut client, mut server) = duplex(4096);
+        write_response(
+            &mut server,
+            429,
+            "text/plain",
+            "Too Many Requests\n",
+            Some("Retry-After: 30\r\n"),
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("Retry-After: 30\r\n"),
+            "extra header missing: {text}"
+        );
+        assert_eq!(
+            text.matches("\r\n\r\n").count(),
+            1,
+            "extra header must not create an empty line before the body: {text}"
+        );
+        assert!(text.ends_with("Too Many Requests\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_has_correct_reason_phrase() {
+        let (mut client, mut server) = duplex(4096);
+        write_response(&mut server, 503, "text/plain", "down\n", None)
+            .await
+            .unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{text}"
+        );
     }
 
     struct PendingWriter;
