@@ -46,6 +46,11 @@
   采用，避免服务端已注册成功而客户端收到 `proxy_name exists` 后永久放弃；
   `TaskGroup` 的公开等待入口改为 `close_and_wait`；代理/UDP 监听复用控制口
   已解析的绑定 IP，避免每次注册重复解析域名；UDP 指标拆分为 received/forwarded。
+- **低优先级一致性收尾**：未知代理类型映射为 `ProxyType::Unknown` 并返回稳定
+  `invalid type` 错误码（不再直接断开控制连接）；CLI 日志覆盖值在 `--check`/启动时
+  校验；协议支持版本改用区间表示，消除硬编码列表漂移；明确非 vhost 代理域名
+  “单向校验、不预留”的语义并补回归测试；去掉 Windows `canonicalize` 产生的
+  `\\?\` 路径前缀；客户端状态端点 `/healthz` 补 `Cache-Control: no-store`。
 
 ### Added
 

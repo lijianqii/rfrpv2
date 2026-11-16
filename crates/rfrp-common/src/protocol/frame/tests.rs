@@ -267,12 +267,23 @@ mod proptests {
         /// 版本不符必须被拒绝（不做任何 payload 处理）。
         #[test]
         fn wrong_version_rejected(version in any::<u8>()) {
-            prop_assume!(version != PROTOCOL_VERSION);
+            prop_assume!(!is_supported_protocol_version(version));
             let mut buf = BytesMut::new();
             buf.put_u8(version);
             buf.put_u8(0x01);
             buf.put_u32(0);
             prop_assert!(FrameCodec.decode(&mut buf).is_err());
+        }
+
+        /// 支持区间内的版本都应被接受（未来区间扩展时该断言仍然成立）。
+        #[test]
+        fn in_range_version_accepted(version in PROTOCOL_MIN_VERSION..=PROTOCOL_VERSION) {
+            let mut buf = BytesMut::new();
+            buf.put_u8(version);
+            buf.put_u8(0x01);
+            buf.put_u32(0);
+            let frame = FrameCodec.decode(&mut buf).unwrap().unwrap();
+            prop_assert_eq!(frame.version, version);
         }
     }
 }

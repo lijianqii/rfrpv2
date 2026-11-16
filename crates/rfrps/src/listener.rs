@@ -43,6 +43,10 @@ pub async fn register_proxy(
     state: &Arc<ServerState>,
     config: &ServerConfig,
 ) -> std::result::Result<(), ProxyError> {
+    // 未知类型必须返回稳定错误码，而不是让服务端把它当成 TCP 处理。
+    if np.r#type == ProxyType::Unknown {
+        return Err(ProxyError::InvalidType);
+    }
     // 会话内代理数上限：认证客户端也不得无限占用端口/内存。
     if session.proxies.lock().len() >= MAX_PROXIES_PER_SESSION {
         tracing::warn!(proxy = %np.proxy_name, "proxy limit per session reached");
@@ -95,6 +99,7 @@ pub async fn register_proxy(
             Some(rp)
         }
         ProxyType::Http | ProxyType::Https => None,
+        ProxyType::Unknown => return Err(ProxyError::InvalidType),
     };
 
     // 全局 proxy_name 唯一（DESIGN §6.6）：在 bind 之前原子预留，失败路径负责回滚。
@@ -127,8 +132,9 @@ pub async fn register_proxy(
             }
         }
         if !is_vhost {
-            // TCP/UDP 不路由域名，只做“不得抢占已有 vhost 域名”的冲突校验；
+            // TCP/UDP 不路由域名，只做“不得抢占已有 vhost 域名”的**单向**校验；
             // 立即释放临时预留，避免新域名被非 vhost 代理长期占住。
+            // 因此两个 TCP/UDP 代理可以声明同一域名，之后的 vhost 也仍可注册该域名。
             state.release_domains(&domains, session, &np.proxy_name);
         }
     }
@@ -187,6 +193,10 @@ pub async fn register_proxy(
             tracker.spawn(async move {
                 proxy_accept_loop(listener, proxy_name, session, state_loop).await;
             })
+        }
+        ProxyType::Unknown => {
+            release_reservation(state, session, &np.proxy_name, &domains);
+            return Err(ProxyError::InvalidType);
         }
     };
 

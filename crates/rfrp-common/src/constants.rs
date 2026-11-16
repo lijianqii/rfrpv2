@@ -36,8 +36,13 @@ pub fn negotiate_protocol_version(client_version: u8) -> Option<u8> {
     is_supported_protocol_version(client_version).then_some(client_version)
 }
 
-/// 本实现支持的版本列表（用于错误提示与文档）。
-pub const PROTOCOL_VERSIONS_SUPPORTED: &[u8] = &[PROTOCOL_VERSION];
+/// 本实现支持的版本区间（用于错误提示与文档）。
+///
+/// 不再维护独立的“支持版本列表”常量：列表与 [`PROTOCOL_MIN_VERSION`] /
+/// [`PROTOCOL_VERSION`] 容易漂移，统一使用区间。
+pub fn supported_protocol_versions() -> std::ops::RangeInclusive<u8> {
+    PROTOCOL_MIN_VERSION..=PROTOCOL_VERSION
+}
 
 /// 帧头长度：Version(1) + MsgType(1) + Length(4)。
 pub const FRAME_HEADER_LEN: usize = 6;
@@ -325,13 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_versions_list_matches_current() {
-        assert!(PROTOCOL_VERSIONS_SUPPORTED.contains(&PROTOCOL_VERSION));
-        for v in PROTOCOL_VERSIONS_SUPPORTED {
-            assert!(
-                is_supported_protocol_version(*v),
-                "listed version {v} must be inside the accepted range"
-            );
-        }
+    fn supported_version_range_is_consistent() {
+        let range = supported_protocol_versions();
+        assert_eq!(*range.start(), PROTOCOL_MIN_VERSION);
+        assert_eq!(*range.end(), PROTOCOL_VERSION);
+        assert!(range.contains(&PROTOCOL_VERSION));
+        assert!(!range.contains(&(PROTOCOL_VERSION + 1)));
     }
 }

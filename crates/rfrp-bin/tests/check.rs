@@ -149,6 +149,34 @@ fn check_reports_effective_cli_grace() {
 }
 
 #[test]
+fn check_rejects_invalid_cli_log_options() {
+    let cfg = tmp_config(
+        "log-invalid",
+        r#"
+        [server]
+        bind_addr = "127.0.0.1"
+        bind_port = 7000
+        token = "secret"
+        work_conn_tls = false
+    "#,
+    );
+    for args in [
+        vec!["--log-level", "verbose"],
+        vec!["--log-output", "stdout"],
+        vec!["--log-format", "yaml"],
+    ] {
+        let mut cmd = vec!["server", "-c", cfg.to_str().unwrap()];
+        cmd.extend(args);
+        cmd.push("--check");
+        let out = run(&cmd);
+        assert!(
+            !out.status.success(),
+            "invalid CLI log options must fail --check: {out:?}"
+        );
+    }
+}
+
+#[test]
 fn check_rejects_duplicate_listener_ports() {
     let cfg = tmp_config(
         "dup-ports",

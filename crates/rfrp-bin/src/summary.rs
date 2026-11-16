@@ -11,6 +11,18 @@ pub struct LogOverrides {
     pub format: Option<String>,
 }
 
+impl LogOverrides {
+    /// 校验 CLI 日志覆盖值；非法值必须报错，不能静默回落到 info/stderr。
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        rfrp_common::config::validate_log_values(
+            self.level.as_deref(),
+            self.output.as_deref(),
+            self.format.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// 按“CLI 参数 > 配置文件 > 默认值”合并日志设置并初始化。
 pub fn init_logging(log: &LogSection, overrides: &LogOverrides) {
     crate::logging::init_logging(

@@ -25,6 +25,23 @@ fn tcp_proxy_parses() {
 }
 
 #[test]
+fn unknown_proxy_type_is_rejected() {
+    // 未知类型映射为 ProxyType::Unknown（而不是反序列化失败），客户端配置校验必须拒绝。
+    let p: ClientProxy = toml::from_str(
+        r#"
+        name = "bad"
+        type = "ftp"
+        local_port = 22
+        remote_port = 6000
+    "#,
+    )
+    .unwrap();
+    assert_eq!(p.r#type, ProxyType::Unknown);
+    let err = p.validate().unwrap_err().to_string();
+    assert!(err.contains("invalid type"), "{err}");
+}
+
+#[test]
 fn invalid_log_config_is_rejected() {
     let text = r#"
         [client]

@@ -22,7 +22,7 @@ use rfrp_common::auth::verify_token;
 use rfrp_common::config::ServerConfig;
 use rfrp_common::constants::{
     negotiate_protocol_version, MAX_CUSTOM_DOMAINS, MAX_DOMAIN_LEN, MAX_PROXY_NAME_LEN,
-    MAX_RUN_ID_LEN, MAX_TOKEN_LEN, PROTOCOL_VERSIONS_SUPPORTED,
+    MAX_RUN_ID_LEN, MAX_TOKEN_LEN,
 };
 use rfrp_common::error::Result;
 use rfrp_common::protocol::frame::{Frame, FrameCodec, FramedRead, FramedWrite};
@@ -380,6 +380,9 @@ where
                                     }
                                     continue;
                                 }
+                                // bind_addr 已在 Server::new 解析为 state.bind_ip；
+                                // register_proxy 内部只剩本地 bind/listen 系统调用，
+                                // 不会因 DNS 解析阻塞本会话的控制读循环。
                                 let result = listener::register_proxy(&np, &session, &state, &config).await;
                                 let (ok, error) = match result {
                                     Ok(()) => (true, None),
@@ -498,16 +501,19 @@ fn unregister_session(state: &ServerState, session: &Session) {
 /// 前缀固定为 `version mismatch`（客户端据此判定致命错误并停止重连），
 /// 后面附带客户端声明版本与服务端支持列表，便于直接排障。
 fn version_mismatch_detail(client_version: u8) -> String {
-    let supported = PROTOCOL_VERSIONS_SUPPORTED
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("version mismatch: client={client_version}, server supports [{supported}]")
+    let range = rfrp_common::constants::supported_protocol_versions();
+    format!(
+        "version mismatch: client={client_version}, server supports [{}..={}]",
+        range.start(),
+        range.end()
+    )
 }
 
 /// NewProxy 字段校验（DESIGN §6.2.3），返回错误标识或 None。
 fn new_proxy_invalid(np: &NewProxy) -> Option<&'static str> {
+    if np.r#type == ProxyType::Unknown {
+        return Some(ProxyError::InvalidType.as_str());
+    }
     if np.proxy_name.is_empty()
         || np.proxy_name.len() > MAX_PROXY_NAME_LEN
         || np.proxy_name.contains('/')

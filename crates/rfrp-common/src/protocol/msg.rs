@@ -28,6 +28,10 @@ pub enum ProxyType {
     Udp,
     Http,
     Https,
+    /// 未知/未来类型。反序列化不再直接断开控制连接，而是由服务端返回
+    /// `invalid type` 错误码（客户端配置校验也会拒绝）。
+    #[serde(other)]
+    Unknown,
 }
 
 /// 登录鉴权（C→S，不携带 proxy）。DESIGN §6.2。
@@ -399,8 +403,13 @@ mod tests {
     }
 
     #[test]
-    fn proxy_type_unknown_variant_errors() {
-        assert!(serde_json::from_str::<ProxyType>(r#""ftp""#).is_err());
+    fn proxy_type_unknown_variant_maps_to_unknown() {
+        // 未知类型不再让整帧反序列化失败（否则控制连接会被直接关闭），
+        // 而是映射为 Unknown，由服务端返回稳定的 invalid type 错误码。
+        assert_eq!(
+            serde_json::from_str::<ProxyType>(r#""ftp""#).unwrap(),
+            ProxyType::Unknown
+        );
     }
 
     #[test]

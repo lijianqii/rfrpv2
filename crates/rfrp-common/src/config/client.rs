@@ -216,6 +216,12 @@ impl ClientProxy {
                     }
                 }
             }
+            ProxyType::Unknown => {
+                return Err(config(format!(
+                    "proxy {} has invalid type: only tcp/udp/http/https are supported",
+                    self.name
+                )))
+            }
         }
         if self.pool_size > POOL_SIZE_MAX {
             return Err(config(format!(
@@ -348,6 +354,8 @@ impl ClientConfig {
                 ProxyType::Udp => (&mut udp_ports, "udp"),
                 // vhost 代理不占用独立端口（走共享监听），无端口唯一性问题。
                 ProxyType::Http | ProxyType::Https => continue,
+                // p.validate() 已拒绝 Unknown，这里只是保持 match 穷尽。
+                ProxyType::Unknown => continue,
             };
             let rp = p.remote_port.ok_or_else(|| {
                 config(format!(

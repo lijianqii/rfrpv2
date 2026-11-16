@@ -62,6 +62,29 @@ async fn register_udp_port_not_allowed_rejected() {
 }
 
 #[tokio::test]
+async fn register_unknown_proxy_type_returns_invalid_type() {
+    // 未知类型现在能通过反序列化（ProxyType::Unknown），服务端必须回稳定错误码，
+    // 而不是把它当成 TCP 或直接断开控制连接。
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    let cfg = test_config("");
+    let np = NewProxy {
+        proxy_name: "bad".into(),
+        r#type: ProxyType::Unknown,
+        remote_port: Some(free_port()),
+        custom_domains: None,
+    };
+    assert_eq!(
+        register_proxy(&np, &session, &state, &cfg)
+            .await
+            .unwrap_err(),
+        ProxyError::InvalidType
+    );
+    assert!(!session.proxies.lock().contains_key("bad"));
+}
+
+#[tokio::test]
 async fn register_rejects_remote_port_zero() {
     let state = ServerState::new();
     let session = test_session("r");
@@ -475,6 +498,39 @@ async fn tcp_proxy_does_not_reserve_new_domains() {
     };
     assert!(register_proxy(&web, &session, &state, &cfg).await.is_ok());
     assert!(state.session_for_domain("new.example.com").is_some());
+}
+
+#[tokio::test]
+async fn tcp_proxies_may_share_an_unreserved_domain() {
+    // 非 vhost 代理的 custom_domains 只做“不得抢占已有 vhost 域名”的单向校验，
+    // 不会预留新域名：两个 TCP 代理可声明同一域名，之后的 vhost 也仍可注册。
+    let state = ServerState::new();
+    let session = test_session("r");
+    register_test_session(&state, &session);
+    state
+        .sessions
+        .lock()
+        .insert(session.run_id.clone(), session.clone());
+    let cfg = test_config("");
+    for name in ["a", "b"] {
+        let tcp = NewProxy {
+            proxy_name: name.into(),
+            r#type: ProxyType::Tcp,
+            remote_port: Some(free_port()),
+            custom_domains: Some(vec!["shared.example.com".into()]),
+        };
+        assert!(register_proxy(&tcp, &session, &state, &cfg).await.is_ok());
+    }
+    assert!(state.session_for_domain("shared.example.com").is_none());
+
+    let web = NewProxy {
+        proxy_name: "web".into(),
+        r#type: ProxyType::Http,
+        remote_port: None,
+        custom_domains: Some(vec!["shared.example.com".into()]),
+    };
+    assert!(register_proxy(&web, &session, &state, &cfg).await.is_ok());
+    assert!(state.session_for_domain("shared.example.com").is_some());
 }
 
 #[tokio::test]

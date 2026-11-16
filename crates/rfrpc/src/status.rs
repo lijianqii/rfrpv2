@@ -112,7 +112,14 @@ async fn handle_request(
         } else {
             (503, "unhealthy: control connection down\n")
         };
-        return write_response(&mut stream, status, "text/plain", body, None).await;
+        return write_response(
+            &mut stream,
+            status,
+            "text/plain",
+            body,
+            Some("Cache-Control: no-store"),
+        )
+        .await;
     }
 
     if !limiter.allow(rate_limit_key(peer.ip()), Instant::now()) {

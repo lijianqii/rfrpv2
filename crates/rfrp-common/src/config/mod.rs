@@ -24,37 +24,47 @@ pub struct LogSection {
 impl LogSection {
     /// 校验日志设置。非法值必须在启动/`--check` 阶段报错，而不是静默回落。
     pub fn validate(&self) -> Result<()> {
-        if let Some(level) = &self.level {
-            if !matches!(
-                level.as_str(),
-                "trace" | "debug" | "info" | "warn" | "error"
-            ) {
-                return Err(config(format!(
-                    "invalid log.level '{level}': expected trace/debug/info/warn/error"
-                )));
-            }
-        }
-        if let Some(format) = &self.format {
-            if !matches!(format.as_str(), "text" | "json") {
-                return Err(config(format!(
-                    "invalid log.format '{format}': expected text or json"
-                )));
-            }
-        }
-        if let Some(output) = &self.output {
-            if output != "stderr" {
-                let Some(path) = output.strip_prefix("file:") else {
-                    return Err(config(format!(
-                        "invalid log.output '{output}': expected stderr or file:<path>"
-                    )));
-                };
-                if path.trim().is_empty() {
-                    return Err(config("log.output file: path must not be empty"));
-                }
-            }
-        }
-        Ok(())
+        validate_log_values(
+            self.level.as_deref(),
+            self.output.as_deref(),
+            self.format.as_deref(),
+        )
     }
+}
+
+/// 校验日志 level/output/format（配置文件与 CLI 覆盖共用）。
+pub fn validate_log_values(
+    level: Option<&str>,
+    output: Option<&str>,
+    format: Option<&str>,
+) -> Result<()> {
+    if let Some(level) = level {
+        if !matches!(level, "trace" | "debug" | "info" | "warn" | "error") {
+            return Err(config(format!(
+                "invalid log.level '{level}': expected trace/debug/info/warn/error"
+            )));
+        }
+    }
+    if let Some(format) = format {
+        if !matches!(format, "text" | "json") {
+            return Err(config(format!(
+                "invalid log.format '{format}': expected text or json"
+            )));
+        }
+    }
+    if let Some(output) = output {
+        if output != "stderr" {
+            let Some(path) = output.strip_prefix("file:") else {
+                return Err(config(format!(
+                    "invalid log.output '{output}': expected stderr or file:<path>"
+                )));
+            };
+            if path.trim().is_empty() {
+                return Err(config("log.output file: path must not be empty"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 兼容别名：客户端侧日志段与 `LogSection` 相同。
@@ -149,6 +159,7 @@ fn resolve_opt_path(value: &mut Option<String>, base: &Path) {
             // 文件存在时规范化，去掉路径中的 `..`；不存在时保留 joined 用于后续报错。
             let resolved = joined
                 .canonicalize()
+                .map(strip_verbatim_prefix)
                 .unwrap_or(joined)
                 .to_string_lossy()
                 .to_string();
@@ -156,6 +167,21 @@ fn resolve_opt_path(value: &mut Option<String>, base: &Path) {
             *value = Some(resolved);
         }
     }
+}
+
+/// 去掉 Windows `canonicalize` 产生的 `\\?\` / `\\?\UNC\` 前缀。
+///
+/// 这些前缀会让日志与 `--check` 摘要里出现用户不认识的路径；`std::fs` 两种
+/// 形式都能打开。Unix 上通常是 no-op。
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    path
 }
 
 /// 校验可配置的心跳参数（服务端/客户端共用，DESIGN §8.3 / §9.4）。
@@ -214,6 +240,22 @@ pub(crate) fn plaintext_hint(work_conn_tls: bool) -> &'static str {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    #[test]
+    fn strips_windows_verbatim_path_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(std::path::PathBuf::from(r"\\?\C:\rfrp\cert.pem")),
+            std::path::PathBuf::from(r"C:\rfrp\cert.pem")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(std::path::PathBuf::from(r"\\?\UNC\server\share\a.pem")),
+            std::path::PathBuf::from(r"\\server\share\a.pem")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(std::path::PathBuf::from("/etc/rfrp/cert.pem")),
+            std::path::PathBuf::from("/etc/rfrp/cert.pem")
+        );
+    }
 
     #[test]
     fn valid_log_section_passes() {

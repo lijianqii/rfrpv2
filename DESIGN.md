@@ -332,8 +332,9 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 - **rfrpc 主动退出**：收到 SIGTERM/Ctrl-C，发送 `Close{reason:"client shutdown"}` 后断开。
 - **rfrps 主动退出**：收到信号，向所有 Session 发送 `Close{reason:"server shutdown"}` 后断开。
-- **配置/协议错误**：如帧格式错误、不兼容的 NewProxy 类型（rfrps 发 `Close` 后断开）。
-- **版本不匹配**：发生在 Login 阶段，rfrps 返回 `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [...]"}` 后断开，不发 Close（错误前缀固定为 `version mismatch`，客户端按前缀判定致命）。
+- **配置/协议错误**：如帧格式错误，rfrps 发 `Close` 后断开；未知代理类型不再断开
+  控制连接，而是回 `NewProxyResp{ok:false, error:"invalid type"}`。
+- **版本不匹配**：发生在 Login 阶段，rfrps 返回 `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [<min>..=<max>]"}` 后断开，不发 Close（错误前缀固定为 `version mismatch`，客户端按前缀判定致命）。
 - **鉴权失败**：rfrps 不发 Close，直接断开（避免回显，见 10.2）。
 - **rfrps 主动下线单 Proxy**：首版不支持运行期动态下线（无热重载）；但若 rfrps 在 NewProxy 后因 bind remote_port 失败需清理已注册的 Proxy 条目，rfrps **不发 Close**（控制连接仍存活，仅该 Proxy 失效），rfrpc 已通过 NewProxyResp{ok:false} 获知失败，无需额外通知。若未来支持动态下线，可扩展 `Close{reason:"proxy removed", proxy_name?}` 携带 proxy_name 字段（首版不实现，Close 不含 proxy_name）。
 - `reason` 字段可选，用于日志诊断，不影响对端行为（对端收到 Close 后应清理资源并视情况重连）。
@@ -384,7 +385,7 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 
 - 帧头 `Version` 与 `Login.version` 字段**必须一致**，且都落在服务端支持区间
   `[PROTOCOL_MIN_VERSION, PROTOCOL_VERSION]` 内；否则服务端拒绝并返回
-  `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [...]"}`。
+  `LoginResp{ok:false, error:"version mismatch: client=<v>, server supports [<min>..=<max>]"}`。
 - 客户端发送的帧头 Version 即其声明版本；服务端在支持区间内**协商**出本次会话使用的版本，
   并通过 `LoginResp.protocol_version` **回传给客户端**，双方据此使用同一套语义。
   旧服务端不回传该字段时，客户端按"沿用自己声明的版本"处理。
@@ -447,8 +448,8 @@ rfrps 收到 `NewProxy` 后按顺序校验，任一失败返回 `NewProxyResp{ok
 
 > error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。
 >
-> `invalid type` 目前会在消息反序列化阶段被拒绝（控制连接关闭），不会出现在
-> `NewProxyResp` 中；保留该错误码供未来协议扩展/兼容旧客户端使用。
+> 未知 `type` 由 `ProxyType::Unknown` 捕获（不再让整帧反序列化失败），服务端通过
+> `NewProxyResp{ok:false, error:"invalid type"}` 回传；控制连接保持可用。
 >
 > **实现**（`rfrp_common::ProxyError` 为唯一来源）：rfrpc 收到 `ok=false` 时按上表分类——
 > `"port occupied"` / `"domain conflict"`（运行时冲突）交由后台任务短退避重试
@@ -475,6 +476,10 @@ rfrpc 重连复用 `run_id`，rfrps 处理流程：
 - 同 `remote_port`：**同协议**的第二个注册请求被拒绝（端口占用）；TCP 与 UDP 端口空间独立，
   允许同一端口号上分别存在一个 TCP 代理与一个 UDP 代理（RDP 的 TCP + UDP 传输即此用法）。
 - 不做负载均衡，不允许多个 rfrpc 共享同一 Proxy 条目。
+- **非 vhost 代理的 `custom_domains` 是单向校验**：TCP/UDP 类型不会用域名路由，也不会
+  预留新域名；服务端只检查它是否抢占了**已存在**的 vhost 域名。因此两个 TCP/UDP 代理
+  可以声明同一域名，之后的 vhost 代理仍可注册该域名。需要域名唯一性时请使用
+  HTTP/HTTPS 类型。
 
 ---
 

@@ -348,6 +348,10 @@ fn write_ready_file(grace_secs: u64) -> std::io::Result<()> {
 
 /// 服务端：加载配置 → CLI 覆盖 → 校验 → 日志 → accept 循环直到退出。
 pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
+    if let Err(e) = log.validate() {
+        eprintln!("invalid log options: {e}");
+        return ExitCode::FAILURE;
+    }
     let exit_watch = if args.watch_exit && !args.check {
         match open_exit_watch(&args.config) {
             Ok(watch) => Some(watch),
@@ -433,6 +437,10 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
 
 /// 客户端：加载配置 → CLI 覆盖 → 校验 → 日志 → 长驻运行（重连直到退出）。
 pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
+    if let Err(e) = log.validate() {
+        eprintln!("invalid log options: {e}");
+        return ExitCode::FAILURE;
+    }
     let exit_watch = if args.watch_exit && !args.check {
         match open_exit_watch(&args.config) {
             Ok(watch) => Some(watch),
