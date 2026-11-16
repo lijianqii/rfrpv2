@@ -74,8 +74,7 @@ pub async fn run_status_server(
             }
         }
     }
-    tasks.close();
-    let _ = tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), tasks.close_and_wait()).await;
 }
 
 async fn handle_request(
@@ -98,16 +97,15 @@ async fn handle_request(
         None => return Ok(()),
     };
 
-    if !limiter.allow(rate_limit_key(peer.ip()), Instant::now()) {
-        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
-    }
     let req = RequestHead::parse(&head);
-    if req.framing_error {
+    if req.framing_error || req.parse_error {
         return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await;
     }
     let path = req.path;
 
     // /healthz：隧道健康检查（控制连接已登录 → 200；否则 503），供监控/守护进程使用。
+    // 它不参与通用请求限流：探活与 `/metrics` 共用 100 次/分钟配额时，探活可能拿到 429，
+    // 被守护进程误判为不健康。
     if path == "/healthz" {
         let (status, body) = if metrics.is_connected() {
             (200, "ok\n")
@@ -115,6 +113,17 @@ async fn handle_request(
             (503, "unhealthy: control connection down\n")
         };
         return write_response(&mut stream, status, "text/plain", body, None).await;
+    }
+
+    if !limiter.allow(rate_limit_key(peer.ip()), Instant::now()) {
+        return write_response(
+            &mut stream,
+            429,
+            "text/plain",
+            "Too Many Requests\n",
+            Some("Retry-After: 60\r\n"),
+        )
+        .await;
     }
 
     match path.as_str() {
@@ -139,13 +148,16 @@ fn status_json(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> serde_json::
         .proxies
         .iter()
         .map(|p| {
+            let status = metrics.proxy_state(&p.name);
             json!({
                 "name": p.name,
                 "kind": serde_json::to_value(p.r#type).unwrap_or_default(),
-                "local": format!("{}:{}", p.local_ip, p.local_port),
+                "local": format_host_port(&p.local_ip, p.local_port),
                 "remote_port": p.remote_port,
                 "domains": p.custom_domains,
                 "pool_size": p.pool_size,
+                "state": status.state.as_str(),
+                "last_error": status.last_error,
             })
         })
         .collect();
@@ -154,7 +166,7 @@ fn status_json(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> serde_json::
         "uptime_seconds": metrics.uptime_secs(),
         "connected": metrics.is_connected(),
         "rtt_ms": metrics.rtt_ms(),
-        "server": format!("{}:{}", cfg.client.server_addr, cfg.client.server_port),
+        "server": format_host_port(&cfg.client.server_addr, cfg.client.server_port),
         "tls": cfg.client.tls_enable,
         "work_conn_tls": metrics.work_conn_tls(),
         "work_conn_tls_configured": cfg.client.work_conn_tls,
@@ -169,19 +181,32 @@ fn status_json(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> serde_json::
     })
 }
 
+/// 拼接 `host:port`；IPv6 字面量加方括号，避免 `::1:8080` 之类的歧义。
+fn format_host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.starts_with('[') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn render_html(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> String {
     let rows: String = cfg
         .proxies
         .iter()
         .map(|p| {
+            let status = metrics.proxy_state(&p.name);
             format!(
-                "<tr><td>{}</td><td>{:?}</td><td>{}:{}</td><td>{:?}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{:?}</td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td></tr>",
                 html_escape(&p.name),
                 p.r#type,
-                html_escape(&p.local_ip),
-                p.local_port,
+                html_escape(&format_host_port(&p.local_ip, p.local_port)),
                 p.remote_port,
-                p.pool_size
+                p.pool_size,
+                html_escape(status.state.as_str())
             )
         })
         .collect();
@@ -189,17 +214,35 @@ fn render_html(cfg: &ClientConfig, metrics: &Arc<ClientMetrics>) -> String {
         "<html><head><title>rfrp client status</title>\
          <meta http-equiv=\"refresh\" content=\"5\"></head><body>\
          <h1>rfrp client <small>v{}</small></h1>\
-         <p>server: {}:{} | connected: {} | uptime: {}s</p>\
+         <p>server: {} | connected: {} | uptime: {}s</p>\
          <pre>{}</pre>\
          <h2>Proxies</h2>\
-         <table border=1><tr><th>name</th><th>type</th><th>local</th><th>remote_port</th><th>pool</th></tr>{}</table>\
+         <table border=1><tr><th>name</th><th>type</th><th>local</th><th>remote_port</th><th>pool</th><th>state</th></tr>{}</table>\
          </body></html>",
         env!("CARGO_PKG_VERSION"),
-        html_escape(&cfg.client.server_addr),
-        cfg.client.server_port,
+        html_escape(&format_host_port(
+            &cfg.client.server_addr,
+            cfg.client.server_port
+        )),
         metrics.is_connected(),
         metrics.uptime_secs(),
         html_escape(&metrics.render()),
         rows
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_host_port_brackets_ipv6() {
+        assert_eq!(format_host_port("127.0.0.1", 8080), "127.0.0.1:8080");
+        assert_eq!(format_host_port("::1", 8080), "[::1]:8080");
+        assert_eq!(format_host_port("[::1]", 8080), "[::1]:8080");
+        assert_eq!(
+            format_host_port("frp.example.com", 7000),
+            "frp.example.com:7000"
+        );
+    }
 }

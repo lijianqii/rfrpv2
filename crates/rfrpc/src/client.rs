@@ -30,7 +30,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::control;
-use crate::metrics::ClientMetrics;
+use crate::metrics::{ClientMetrics, ProxyState};
 
 /// 客户端运行时共享状态（控制循环与注册逻辑共享）。
 pub struct ClientState {
@@ -41,6 +41,12 @@ pub struct ClientState {
     pub proxies: HashMap<String, ClientProxy>,
     /// proxy_name → NewProxyResp 的一次性回传通道（注册时 await）。
     pub resps: Mutex<HashMap<String, oneshot::Sender<NewProxyResp>>>,
+    /// 注册响应超时后才到达的 NewProxyResp。
+    ///
+    /// 超时后接收端已返回重试，响应无法再交给原 waiter；缓存起来供下一轮重试
+    /// 直接采用，避免“服务端其实注册成功、客户端重试收到 proxy_name exists 后
+    /// 永久放弃”的边界问题。
+    pub late_responses: Mutex<HashMap<String, NewProxyResp>>,
     /// Login 结果一次性回传通道（连接时 await，用于区分致命/可恢复失败）。
     pub login_tx: Mutex<Option<oneshot::Sender<LoginResp>>>,
     /// 客户端 TLS 配置（控制链路和工作连接共用；仅任一 TLS 开启时存在）。
@@ -62,6 +68,19 @@ pub struct ClientState {
     pub fatal: Arc<Mutex<Option<String>>>,
     /// 进程级退出令牌（工作连接发现致命配置错误时提前停止重连）。
     pub shutdown: CancellationToken,
+}
+
+impl ClientState {
+    /// 缓存一个没有 waiter 的 NewProxyResp（注册已超时/接收端已放弃）。
+    ///
+    /// 上限 256：代理数本身受配置与服务端上限约束，这里的上限只防止异常对端
+    /// 用大量响应撑大内存。
+    pub fn remember_late_response(&self, resp: NewProxyResp) {
+        let mut late = self.late_responses.lock();
+        if late.len() < 256 {
+            late.insert(resp.proxy_name.clone(), resp);
+        }
+    }
 }
 
 /// 单次连接的结果：决定上层是否重连（DESIGN §8.1 / §8.3）。
@@ -129,12 +148,14 @@ impl Drop for StatusTask {
 impl Client {
     pub fn new(config: ClientConfig) -> RfrpResult<Self> {
         let tls = build_tls(&config)?;
+        let metrics = Arc::new(ClientMetrics::new());
+        metrics.reset_proxy_states(config.proxies.iter().map(|p| p.name.as_str()));
         Ok(Self {
             heartbeat_interval: config.client.heartbeat_interval(),
             heartbeat_timeout: config.client.heartbeat_timeout(),
             config,
             tls,
-            metrics: Arc::new(ClientMetrics::new()),
+            metrics,
             shutdown: CancellationToken::new(),
             fatal: Arc::new(Mutex::new(None)),
             ready: Mutex::new(None),
@@ -333,12 +354,17 @@ impl Client {
             let tls = tls.as_ref().expect("tls built above");
             // 控制链路 TLS 握手必须有超时：服务端/中间设备接受 TCP 但不完成握手时，
             // 否则客户端会永久挂起、既不重连也没有日志（工作连接 TLS 已有超时）。
-            match tokio::time::timeout(
-                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
-                tls.connect(stream),
-            )
-            .await
-            {
+            // 同时监听退出令牌：SIGTERM 落在握手期间时不应等满 10s。
+            let tls_result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    return Ok(ConnectOutcome::Reconnect { connected: false, lived: Duration::ZERO });
+                }
+                result = tokio::time::timeout(
+                    Duration::from_secs(TLS_HANDSHAKE_TIMEOUT),
+                    tls.connect(stream),
+                ) => result,
+            };
+            match tls_result {
                 Ok(Ok(s)) => Box::new(s),
                 // 证书校验/协议协商失败是配置问题，重试不会自愈：按致命处理并退出，
                 // 避免无限退避重连且不给用户明确信号（连接类错误仍是瞬时问题）。
@@ -370,6 +396,7 @@ impl Client {
                 .map(|p| (p.name.clone(), p.clone()))
                 .collect(),
             resps: Mutex::new(HashMap::new()),
+            late_responses: Mutex::new(HashMap::new()),
             login_tx: Mutex::new(None),
             tls,
             work_conn_tls: Mutex::new(self.config.client.work_conn_tls),
@@ -399,7 +426,19 @@ impl Client {
         ));
 
         // 等待 Login 结果，区分致命 / 可恢复失败（§8.1）。
-        match tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT), login_orx).await {
+        // 必须同时监听退出令牌：服务端在登录响应前关闭连接/进程收到 SIGTERM 时，
+        // 不应再等满 10s 的 LOGIN_TIMEOUT。
+        let login_result = tokio::select! {
+            _ = shutdown.cancelled() => {
+                stop_control(ctrl, &session_shutdown).await;
+                return Ok(ConnectOutcome::Reconnect {
+                    connected: false,
+                    lived: Duration::ZERO,
+                });
+            }
+            result = tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT), login_orx) => result,
+        };
+        match login_result {
             Ok(Ok(resp)) => {
                 if resp.ok {
                     // 服务端的 work_conn_tls 偏好可以覆盖客户端配置；若服务端要求
@@ -480,6 +519,9 @@ impl Client {
         }
 
         tracing::info!(count = self.config.proxies.len(), "registering proxies");
+        // 新一轮控制会话：先全部标记为 pending，注册结果会逐条覆盖。
+        self.metrics
+            .reset_proxy_states(self.config.proxies.iter().map(|p| p.name.as_str()));
         // 可重试失败的代理（如端口被旧会话占用），交给后台任务退避重试（§6.6）。
         let mut retryable: Vec<ClientProxy> = Vec::new();
         let mut persistent: Vec<ClientProxy> = Vec::new();
@@ -516,6 +558,7 @@ impl Client {
         let _ = ctrl.await;
         // 兜底清理未消费的注册响应通道（正常情况下各路径已各自移除）。
         state.resps.lock().clear();
+        state.late_responses.lock().clear();
         self.metrics.set_connected(false);
         Ok(ConnectOutcome::Reconnect {
             connected: true,
@@ -739,6 +782,12 @@ async fn register_one_proxy(
     p: &ClientProxy,
     shutdown: &CancellationToken,
 ) -> RegisterOutcome {
+    // 上一轮超时后迟到但已到达的响应：直接采用，不再重复发送 NewProxy。
+    let late = state.late_responses.lock().remove(&p.name);
+    if let Some(resp) = late {
+        tracing::info!(proxy = %p.name, "using late registration response");
+        return registration_outcome(state, p, resp);
+    }
     let (otx, orx) = oneshot::channel();
     state.resps.lock().insert(p.name.clone(), otx);
     let sent = tokio::select! {
@@ -752,60 +801,103 @@ async fn register_one_proxy(
     if !sent {
         // 控制连接已断或正在退出：清理未消费的响应通道。
         state.resps.lock().remove(&p.name);
+        state.metrics.set_proxy_state(
+            &p.name,
+            ProxyState::Pending,
+            Some("control connection lost".into()),
+        );
         return RegisterOutcome::ConnLost;
     }
     let response = tokio::select! {
         _ = shutdown.cancelled() => {
             state.resps.lock().remove(&p.name);
+            state.metrics.set_proxy_state(
+                &p.name,
+                ProxyState::Pending,
+                Some("client shutting down".into()),
+            );
             return RegisterOutcome::ConnLost;
         }
         result = tokio::time::timeout(Duration::from_secs(NEW_PROXY_TIMEOUT), orx) => result,
     };
     match response {
-        Ok(Ok(resp)) if resp.ok => {
-            tracing::info!(proxy = %p.name, "proxy registered");
-            spawn_preheat(state, p);
-            RegisterOutcome::Ok
-        }
-        Ok(Ok(resp)) => {
-            let code = resp.error.as_deref().and_then(ProxyError::from_code);
-            state.metrics.inc_proxy_register_failure();
-            if code.is_some_and(ProxyError::is_retryable) {
-                tracing::warn!(
-                    proxy = %p.name, code = ?resp.error,
-                    "proxy registration rejected (retryable, will retry in background)"
-                );
-                RegisterOutcome::Retryable
-            } else if code.is_some_and(ProxyError::is_persistently_retryable) {
-                // 如服务端尚未放行 allow_ports：重试不会立刻自愈，但服务端改完配置即可恢复，
-                // 且不需要重启客户端，因此用长退避继续尝试。
-                tracing::warn!(
-                    proxy = %p.name, code = ?resp.error,
-                    hint = registration_hint(code),
-                    "proxy registration rejected (will retry in background with long backoff)"
-                );
-                RegisterOutcome::Persistent
-            } else {
-                tracing::error!(
-                    proxy = %p.name, code = ?resp.error,
-                    hint = registration_hint(code),
-                    "proxy registration rejected (not retryable)"
-                );
-                RegisterOutcome::Failed
-            }
-        }
+        Ok(Ok(resp)) => registration_outcome(state, p, resp),
         Ok(Err(_)) => {
             state.resps.lock().remove(&p.name);
+            state.metrics.inc_proxy_register_failure();
+            state.metrics.set_proxy_state(
+                &p.name,
+                ProxyState::Failed,
+                Some("registration response channel dropped".into()),
+            );
             tracing::warn!(proxy = %p.name, "registration response channel dropped");
             RegisterOutcome::Failed
         }
         Err(_) => {
-            // 超时后服务端可能仍会回包，但已按可重试处理；此处移除条目避免累积，
-            // 迟到的响应由控制循环查不到条目而丢弃。
-            state.resps.lock().remove(&p.name);
+            // 超时后服务端可能仍会回包：保留 resps 条目，让控制循环在迟到响应
+            // 无法交给已放弃的 waiter 时写入 late_responses，供下一轮重试采用。
+            state.metrics.inc_proxy_register_failure();
+            state.metrics.set_proxy_state(
+                &p.name,
+                ProxyState::Retrying,
+                Some("registration response timeout".into()),
+            );
             tracing::warn!(proxy = %p.name, "registration response timeout");
             RegisterOutcome::Retryable
         }
+    }
+}
+
+/// 处理一个 NewProxyResp（正常收到或迟到缓存），并更新指标/代理状态。
+fn registration_outcome(
+    state: &Arc<ClientState>,
+    p: &ClientProxy,
+    resp: NewProxyResp,
+) -> RegisterOutcome {
+    if resp.ok {
+        tracing::info!(proxy = %p.name, "proxy registered");
+        state
+            .metrics
+            .set_proxy_state(&p.name, ProxyState::Registered, None);
+        spawn_preheat(state, p);
+        return RegisterOutcome::Ok;
+    }
+
+    let code = resp.error.as_deref().and_then(ProxyError::from_code);
+    state.metrics.inc_proxy_register_failure();
+    let next = if code.is_some_and(ProxyError::is_retryable)
+        || code.is_some_and(ProxyError::is_persistently_retryable)
+    {
+        ProxyState::Retrying
+    } else {
+        ProxyState::Failed
+    };
+    state
+        .metrics
+        .set_proxy_state(&p.name, next, resp.error.clone());
+
+    if code.is_some_and(ProxyError::is_retryable) {
+        tracing::warn!(
+            proxy = %p.name, code = ?resp.error,
+            "proxy registration rejected (retryable, will retry in background)"
+        );
+        RegisterOutcome::Retryable
+    } else if code.is_some_and(ProxyError::is_persistently_retryable) {
+        // 如服务端尚未放行 allow_ports：重试不会立刻自愈，但服务端改完配置即可恢复，
+        // 且不需要重启客户端，因此用长退避继续尝试。
+        tracing::warn!(
+            proxy = %p.name, code = ?resp.error,
+            hint = registration_hint(code),
+            "proxy registration rejected (will retry in background with long backoff)"
+        );
+        RegisterOutcome::Persistent
+    } else {
+        tracing::error!(
+            proxy = %p.name, code = ?resp.error,
+            hint = registration_hint(code),
+            "proxy registration rejected (not retryable)"
+        );
+        RegisterOutcome::Failed
     }
 }
 
@@ -937,6 +1029,11 @@ async fn retry_loop(
         }
     }
     for p in pending {
+        state.metrics.set_proxy_state(
+            &p.name,
+            ProxyState::Retrying,
+            Some("retries exhausted; will retry on next reconnect".into()),
+        );
         tracing::warn!(
             proxy = %p.name,
             "proxy still unavailable after retries; will retry on next reconnect"
@@ -967,6 +1064,7 @@ pub(crate) fn test_state(
         run_id: run_id.to_string(),
         proxies,
         resps: Mutex::new(HashMap::new()),
+        late_responses: Mutex::new(HashMap::new()),
         login_tx: Mutex::new(None),
         tls: None,
         work_conn_tls: Mutex::new(work_conn_tls),

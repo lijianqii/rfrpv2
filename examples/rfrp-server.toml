@@ -42,8 +42,8 @@ allow_ports = "6000-6100,7001-7010"
 # 注意：80/443 为特权端口（<1024），Linux 下需 root 运行或通过 setcap 授权：
 #   sudo setcap 'cap_net_bind_service=+ep' /path/to/rfrp
 # 非特权场景可改用 8080/8443 等高位端口
-vhost_http_port  = 8080           # 默认 80 需要 root/特权；非特权环境请用 >=1024 的端口
-vhost_https_port = 8443           # 同上（默认 443 需要特权）
+vhost_http_port  = 8080           # 示例使用高位端口；改用 80 需要 root/特权
+vhost_https_port = 8443           # 示例使用高位端口；改用 443 需要 root/特权
 # HTTPS vhost 证书（可与控制链路证书不同）
 vhost_tls_cert = "./vhost-cert.pem"   # 相对配置文件目录解析
 vhost_tls_key  = "./vhost-key.pem"

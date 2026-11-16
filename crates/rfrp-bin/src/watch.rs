@@ -91,12 +91,6 @@ pub fn watch_config_file(path: &Path, events: mpsc::Sender<()>) -> notify::Resul
     if target_parent != parent {
         watcher.watch(&target_parent, RecursiveMode::NonRecursive)?;
     }
-    tracing::info!(
-        path = %absolute.display(),
-        target = %target.display(),
-        dir = %parent.display(),
-        "config file watcher started"
-    );
     Ok(ConfigWatcher { _watcher: watcher })
 }
 

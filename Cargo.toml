@@ -10,9 +10,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT"
-authors = ["rfrp"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -32,7 +31,6 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
 socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"

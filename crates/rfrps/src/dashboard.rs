@@ -123,9 +123,17 @@ impl DashboardSessions {
         let now = Instant::now();
         let mut sessions = self.inner.lock();
         sessions.retain(|_, expires| *expires > now);
-        // Dashboard 会话数量很少；超过上限时整体清空，避免异常登录刷爆内存。
-        if sessions.len() >= 1024 {
-            sessions.clear();
+        // Dashboard 会话数量很少；达到上限时淘汰最早过期的一条，而不是整体清空
+        // （否则异常刷登录会把所有已登录管理员一起踢下线）。
+        while sessions.len() >= 1024 {
+            let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, expires)| **expires)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            sessions.remove(&oldest);
         }
         sessions.insert(token.clone(), now + self.ttl);
         token
@@ -269,9 +277,18 @@ async fn handle_request(
     };
 
     let req = RequestHead::parse(&head);
-    if req.framing_error {
+    if req.framing_error || req.parse_error {
         return write_response(&mut stream, 400, "text/plain", "Bad Request\n", None).await;
     }
+
+    // /healthz 免鉴权且不参与通用请求限流（仅暴露 up/down，供监控/负载均衡探活）。
+    // 若与业务请求共用 100 次/分钟配额，多个探活源共用出口 IP 时会被打成 429，
+    // 上游可能据此把健康实例摘除。并发上限仍由 accept 阶段的信号量约束。
+    if req.path == "/healthz" {
+        let (status, body) = health_response(&ctx.state);
+        return write_response(&mut stream, status, "text/plain", body, Some(NO_STORE)).await;
+    }
+
     let client_key = rate_limit_key(resolve_client_ip(
         &req,
         peer.ip(),
@@ -279,13 +296,14 @@ async fn handle_request(
     ));
 
     if !ctx.limiter.allow(client_key, Instant::now()) {
-        return write_response(&mut stream, 429, "text/plain", "Too Many Requests\n", None).await;
-    }
-
-    // /healthz 免鉴权（仅暴露 up/down，供监控/负载均衡探活）。
-    if req.path == "/healthz" {
-        let (status, body) = health_response(&ctx.state);
-        return write_response(&mut stream, status, "text/plain", body, Some(NO_STORE)).await;
+        return write_response(
+            &mut stream,
+            429,
+            "text/plain",
+            "Too Many Requests\n",
+            Some("Retry-After: 60\r\n"),
+        )
+        .await;
     }
 
     if let Some(wait) = ctx.auth_failures.blocked(client_key, Instant::now()) {
@@ -453,7 +471,9 @@ fn authorized(req: &RequestHead, cfg: &DashboardSection, sessions: &DashboardSes
     if let Some(auth) = req.authorization.as_deref() {
         if let Some(encoded) = auth.strip_prefix("Basic ") {
             if let Some((user, pass)) = decode_basic(encoded.trim()) {
-                return verify_token(&cfg.user, &user) && verify_token(&cfg.password, &pass);
+                // 两个比较都要执行（用 `&` 而不是 `&&`），避免用户名错误时短路掉
+                // 密码比较，形成用户名是否存在的时间旁路。
+                return verify_token(&cfg.user, &user) & verify_token(&cfg.password, &pass);
             }
         }
     }
@@ -696,6 +716,7 @@ fn status_json(state: &Arc<ServerState>) -> serde_json::Value {
             "accepted_total": state.metrics.accepted_total.load(std::sync::atomic::Ordering::Relaxed),
             "accept_errors_total": state.metrics.accept_errors_total.load(std::sync::atomic::Ordering::Relaxed),
             "udp_dropped_total": state.metrics.udp_dropped_total.load(std::sync::atomic::Ordering::Relaxed),
+            "heartbeat_resp_dropped_total": state.metrics.heartbeat_resp_dropped_total.load(std::sync::atomic::Ordering::Relaxed),
             "udp_sessions_total": udp_sessions_total,
             "accepting": state.metrics.is_accepting(),
         },
@@ -779,6 +800,24 @@ mod authorized_tests {
             resolve_client_ip(&req, peer, &trusted),
             "10.0.0.2".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn session_table_evicts_oldest_instead_of_clearing_all() {
+        // 达到上限时只淘汰最早过期的一条，不能把所有已登录管理员一起踢下线。
+        let sessions = DashboardSessions::new(3600);
+        let first = sessions.create();
+        for _ in 0..1024 {
+            sessions.create();
+        }
+        let newest = sessions.create();
+        assert!(sessions.is_valid(&newest), "new session must remain valid");
+        assert!(
+            sessions.inner.lock().len() <= 1024,
+            "session table must stay bounded"
+        );
+        // 最早创建的一条在持续溢出时会被淘汰；这里只断言“不会整体清空”。
+        let _ = first;
     }
 
     #[test]

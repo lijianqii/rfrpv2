@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::listener::dispatch_user_connection;
+use crate::listener::{dispatch_user_connection, DispatchReject};
 use crate::state::ServerState;
 
 /// 同一来源（IPv4 单地址 / IPv6 /64）的 vhost 认证前并发上限。
@@ -266,8 +266,23 @@ async fn route_and_dispatch(
         return respond_not_found(&mut stream).await;
     }
 
-    dispatch_user_connection(proxy_name, stream, session, state);
-    Ok(())
+    match dispatch_user_connection(proxy_name, stream, session, state) {
+        Ok(()) => Ok(()),
+        Err((mut stream, DispatchReject::TooManyActive)) => {
+            // 有 HTTP 语义可回：明确告知过载，而不是让用户看到连接重置。
+            rfrp_common::util::http::write_response(
+                &mut stream,
+                503,
+                "text/plain; charset=utf-8",
+                "503 Service Unavailable: server connection limit reached\n",
+                Some("Retry-After: 5\r\n"),
+            )
+            .await?;
+            Ok(())
+        }
+        // 会话在 accept 与 dispatch 之间被清理：直接关闭，没有可安全回应的对象。
+        Err((_stream, DispatchReject::SessionGone)) => Ok(()),
+    }
 }
 
 /// 路由失败时回一个最小 404（HTTP/1.1 + Connection: close），随后关闭连接。
@@ -597,6 +612,43 @@ mod head_tests {
         let stream: BoxedStream = Box::new(b);
         let r = route_and_dispatch("dev.example.com".into(), ProxyType::Http, stream, state).await;
         assert!(r.is_ok(), "type mismatch should not error");
+    }
+
+    #[tokio::test]
+    async fn vhost_returns_503_when_active_limit_reached() {
+        let state = ServerState::new();
+        state
+            .max_active
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let session = crate::control::test_session("r");
+        {
+            let mut m = session.proxy_domains.lock();
+            m.insert("dev.example.com".into(), "web".into());
+        }
+        session
+            .proxies
+            .lock()
+            .insert("web".into(), test_entry(ProxyType::Http));
+        {
+            let mut sessions = state.sessions.lock();
+            sessions.insert("r".into(), session.clone());
+        }
+        state.index_domain("dev.example.com", &session, "web");
+
+        let (mut client, server) = duplex(4096);
+        let stream: BoxedStream = Box::new(server);
+        route_and_dispatch("dev.example.com".into(), ProxyType::Http, stream, state)
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "overloaded vhost must return 503, got: {text}"
+        );
+        assert!(text.contains("Retry-After: 5\r\n"), "{text}");
     }
 
     #[tokio::test]

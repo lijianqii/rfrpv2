@@ -5,6 +5,71 @@ use rfrp_common::config::{ClientConfig, ClientProxy, ClientSection};
 use rfrp_common::constants::MAX_RUN_ID_LEN;
 use rfrp_common::protocol::msg::{NewProxy, ProxyType};
 
+#[tokio::test]
+async fn late_registration_response_is_adopted_without_resending() {
+    // 注册超时后迟到但成功的响应：下一轮重试应直接采用，而不是再发一次
+    // NewProxy（后者会收到 proxy_name exists 并被永久放弃）。
+    let p = ClientProxy {
+        name: "late".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: 1,
+        remote_port: Some(6000),
+        custom_domains: None,
+        pool_size: 0,
+    };
+    let mut proxies = std::collections::HashMap::new();
+    proxies.insert(p.name.clone(), p.clone());
+    let state = test_state("127.0.0.1:1".parse().unwrap(), "run", proxies, false);
+    state.remember_late_response(rfrp_common::protocol::msg::NewProxyResp {
+        proxy_name: "late".into(),
+        ok: true,
+        error: None,
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let outcome = register_one_proxy(&tx, &state, &p, &CancellationToken::new()).await;
+    assert!(matches!(outcome, RegisterOutcome::Ok));
+    assert!(
+        rx.try_recv().is_err(),
+        "must not send a duplicate NewProxy when a late response is cached"
+    );
+    assert_eq!(
+        state.metrics.proxy_state("late").state,
+        ProxyState::Registered
+    );
+    assert!(state.late_responses.lock().is_empty());
+}
+
+#[tokio::test]
+async fn late_registration_error_is_classified() {
+    let p = ClientProxy {
+        name: "late-err".into(),
+        r#type: ProxyType::Tcp,
+        local_ip: "127.0.0.1".into(),
+        local_port: 1,
+        remote_port: Some(6000),
+        custom_domains: None,
+        pool_size: 0,
+    };
+    let mut proxies = std::collections::HashMap::new();
+    proxies.insert(p.name.clone(), p.clone());
+    let state = test_state("127.0.0.1:1".parse().unwrap(), "run", proxies, false);
+    state.remember_late_response(rfrp_common::protocol::msg::NewProxyResp {
+        proxy_name: "late-err".into(),
+        ok: false,
+        error: Some("port occupied".into()),
+    });
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let outcome = register_one_proxy(&tx, &state, &p, &CancellationToken::new()).await;
+    assert!(matches!(outcome, RegisterOutcome::Retryable));
+    assert_eq!(
+        state.metrics.proxy_state("late-err").state,
+        ProxyState::Retrying
+    );
+}
+
 #[test]
 fn new_proxy_from_config_maps_fields() {
     let p = ClientProxy {
@@ -39,6 +104,7 @@ fn cfg_for(path: &std::path::Path) -> ClientConfig {
     ClientConfig {
         client: ClientSection {
             run_id_file: Some(path.to_string_lossy().to_string()),
+            work_conn_tls: false,
             ..Default::default()
         },
         ..Default::default()

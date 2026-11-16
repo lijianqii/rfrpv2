@@ -16,6 +16,7 @@ fn client_config() -> ClientConfig {
     // 指向无监听的端口，连接必然失败（用于验证不会陷入无限重连）。
     c.client.server_addr = "127.0.0.1".into();
     c.client.server_port = 1;
+    c.client.work_conn_tls = false;
     c
 }
 
@@ -53,6 +54,44 @@ async fn client_run_exits_on_shutdown_without_infinite_reconnect() {
 }
 
 #[tokio::test]
+async fn client_shutdown_interrupts_login_wait() {
+    // 服务端接受 TCP 但一直不回 LoginResp：客户端收到退出信号后不得等满
+    // LOGIN_TIMEOUT(10s)，必须尽快退出。修复前该用例会在 3s 超时。
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            // 保持连接不关闭、不响应。
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    let mut cfg = ClientConfig::default();
+    cfg.client.server_addr = addr.ip().to_string();
+    cfg.client.server_port = addr.port();
+    cfg.client.work_conn_tls = false;
+    let client = Client::new(cfg).unwrap();
+    let sd = client.shutdown_token();
+    let task = tokio::spawn(async move { client.run().await });
+
+    // 等客户端完成 TCP 建连并进入 LoginResp 等待。
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    sd.cancel();
+    let res = timeout(Duration::from_secs(3), task).await;
+    assert!(
+        res.is_ok(),
+        "shutdown must interrupt the login wait instead of waiting for LOGIN_TIMEOUT"
+    );
+    assert!(res.unwrap().is_ok(), "client.run() should exit cleanly");
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn server_and_client_exit_cleanly_on_shutdown() {
     // 端到端：触发服务端优雅退出后，客户端控制连接被关闭；再取消客户端令牌，二者均干净退出。
     let server = Server::new(server_config())
@@ -66,6 +105,7 @@ async fn server_and_client_exit_cleanly_on_shutdown() {
     let mut client_cfg = ClientConfig::default();
     client_cfg.client.server_addr = addr.ip().to_string();
     client_cfg.client.server_port = addr.port();
+    client_cfg.client.work_conn_tls = false;
     let client = Client::new(client_cfg).unwrap();
     let client_sd = client.shutdown_token();
     let client_task = tokio::spawn(async move { client.run().await });

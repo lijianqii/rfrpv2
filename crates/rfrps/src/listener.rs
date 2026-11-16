@@ -137,13 +137,16 @@ pub async fn register_proxy(
         // vhost 代理不绑定独立端口，仅登记域名与元信息（共享 vhost 监听在 Server 启动时创建）。
         ProxyType::Http | ProxyType::Https => tokio::spawn(async {}),
         ProxyType::Udp => {
-            let rp = remote_port.expect("validated above");
+            let Some(rp) = remote_port else {
+                release_reservation(state, session, &np.proxy_name, &domains);
+                return Err(ProxyError::InvalidField);
+            };
             match crate::udp::register_udp_proxy(
                 np.proxy_name.clone(),
                 rp,
                 session,
                 state,
-                &config.server.bind_addr,
+                state.bind_ip,
                 config.server.udp_session_timeout(),
             )
             .await
@@ -156,8 +159,11 @@ pub async fn register_proxy(
             }
         }
         ProxyType::Tcp => {
-            let rp = remote_port.expect("validated above");
-            let listener = match TcpListener::bind((config.server.bind_addr.as_str(), rp)).await {
+            let Some(rp) = remote_port else {
+                release_reservation(state, session, &np.proxy_name, &domains);
+                return Err(ProxyError::InvalidField);
+            };
+            let listener = match TcpListener::bind((state.bind_ip, rp)).await {
                 Ok(l) => l,
                 Err(e) => {
                     // 具体原因只写服务端日志（DESIGN §8.5）：端口占用可重试，
@@ -207,7 +213,8 @@ pub async fn register_proxy(
         ProxyEntry {
             handle,
             kind,
-            remote_port: np.remote_port,
+            // vhost 代理不绑定独立端口；`remote_port` 只对 TCP/UDP 有意义。
+            remote_port,
             custom_domains: if is_vhost {
                 domains.clone()
             } else {
@@ -297,7 +304,13 @@ async fn proxy_accept_loop(
                             tracing::warn!(%proxy_name, %peer, error = %e, "failed to configure user TCP stream");
                         }
                         tracing::debug!(%proxy_name, %peer, "user connected");
-                        dispatch_user_connection(proxy_name.clone(), user, session.clone(), state.clone());
+                        // TCP 代理没有 HTTP 语义可回 503；被限流时直接丢弃连接。
+                        let _ = dispatch_user_connection(
+                            proxy_name.clone(),
+                            user,
+                            session.clone(),
+                            state.clone(),
+                        );
                     }
                     Err(e) => {
                         let backoff = retry.record_err();
@@ -378,25 +391,35 @@ fn probe_alive(mut work: BoxedStream) -> std::result::Result<BoxedStream, ()> {
 
 /// 统一处理一条用户连接：优先命中预热池，否则登记 pending 并按需请求工作连接。
 /// 桥接与 ReqWorkConn 均放入独立任务，避免阻塞 accept 循环。
+/// 用户连接被拒绝的原因。vhost 可据此返回 HTTP 503；TCP 没有应用层语义，直接丢弃。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchReject {
+    /// 会话已被替换或清理。
+    SessionGone,
+    /// 达到 `max_active_connections` 上限。
+    TooManyActive,
+}
+
 pub(crate) fn dispatch_user_connection<S>(
     proxy_name: String,
     user: S,
     session: Arc<Session>,
     state: Arc<ServerState>,
-) where
+) -> std::result::Result<(), (S, DispatchReject)>
+where
     S: AsyncStream + 'static,
 {
     // accept 与 dispatch 之间会话可能已被替换/清理；为失效会话建立桥接会
     // 让旧监听任务多存活一个用户连接的生命周期。
     if session.stop.is_cancelled() || !state.is_current_session(&session) {
         tracing::debug!(%proxy_name, "session no longer current; rejecting user connection");
-        return;
+        return Err((user, DispatchReject::SessionGone));
     }
 
     // 并发连接数兜底（防 DoS）：原子地检查并递增，避免并发尖峰突破上限。
     let max = state.max_active.load(std::sync::atomic::Ordering::Relaxed);
     // 注意：`fetch_update` 在新工具链里被重命名为 `try_update`，但后者晚于本项目的
-    // MSRV(1.75)，因此继续使用旧名并显式豁免 deprecation 警告（bump MSRV 后再改）。
+    // MSRV(1.85)，因此继续使用旧名并显式豁免 deprecation 警告（bump MSRV 后再改）。
     #[allow(deprecated)]
     let accepted = state
         .metrics
@@ -415,7 +438,7 @@ pub(crate) fn dispatch_user_connection<S>(
         .is_ok();
     if !accepted {
         tracing::warn!(%proxy_name, "too many active connections, rejecting");
-        return;
+        return Err((user, DispatchReject::TooManyActive));
     }
 
     // 统计连接与流量。active 已在上面原子递增；CountingStream drop 时递减。
@@ -447,7 +470,7 @@ pub(crate) fn dispatch_user_connection<S>(
     if session.stop.is_cancelled() || !state.is_current_session(&session) {
         state.remove_proxy_stats(std::slice::from_ref(&proxy_name), &session.session_id);
         tracing::debug!(%proxy_name, "session stopped during dispatch; dropping user connection");
-        return;
+        return Ok(());
     }
 
     // 优先命中预热池（§8.2）。池中连接可能已被本地服务（sshd/RDP 等）
@@ -456,7 +479,7 @@ pub(crate) fn dispatch_user_connection<S>(
     if let Some(work) = pooled {
         if session.stop.is_cancelled() || !state.is_current_session(&session) {
             tracing::debug!(%proxy_name, "session stopped before pooled bridge; dropping");
-            return;
+            return Ok(());
         }
         tracing::debug!(%proxy_name, "user connected; pool hit, bridging");
         let pname = proxy_name.clone();
@@ -476,7 +499,7 @@ pub(crate) fn dispatch_user_connection<S>(
                 }),
             );
         }
-        return;
+        return Ok(());
     }
 
     let work_id = state.next_work_id();
@@ -495,7 +518,7 @@ pub(crate) fn dispatch_user_connection<S>(
     if session.stop.is_cancelled() || !state.is_current_session(&session) {
         state.pending.lock().remove(&work_id);
         tracing::debug!(%proxy_name, work_id, "session stopped; dropped pending user connection");
-        return;
+        return Ok(());
     }
 
     let tx = session.tx.clone();
@@ -536,6 +559,7 @@ pub(crate) fn dispatch_user_connection<S>(
             }
         }
     });
+    Ok(())
 }
 
 /// 单次扫描：移除超过 `timeout` 仍未配对的待处理项，关闭其用户连接，返回清理条数。

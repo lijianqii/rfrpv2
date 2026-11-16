@@ -57,6 +57,9 @@ impl Server {
             TcpListener::bind((config.server.bind_addr.as_str(), config.server.bind_port))
                 .await
                 .map_err(|e| bind_error("control listener", &bind, e))?;
+        // 代理 / vhost / UDP 监听复用控制口的实际 IP，避免每次注册都解析 bind_addr
+        // （域名解析可能阻塞控制读循环）。
+        let bind_ip = listener.local_addr()?.ip();
         let vhost_http =
             bind_optional(&config.server.bind_addr, config.proxy.vhost_http_port).await?;
         let dashboard = bind_dashboard(&config).await?;
@@ -66,7 +69,7 @@ impl Server {
         let heartbeat_interval = config.server.heartbeat_interval();
         let heartbeat_timeout = config.server.heartbeat_timeout();
         let grace = config.server.grace();
-        let state = ServerState::new();
+        let state = ServerState::with_bind_ip(bind_ip);
         state.configure_limits(&config);
         Ok(Self {
             config: Arc::new(config),
@@ -266,10 +269,9 @@ impl Server {
                                     "accept loop failed repeatedly; exiting for supervisor restart"
                                 );
                                 self.state.shutdown.cancel();
-                                self.state.data_tasks.close();
                                 let _ = tokio::time::timeout(
                                     self.grace,
-                                    self.state.data_tasks.wait(),
+                                    self.state.data_tasks.close_and_wait(),
                                 )
                                 .await;
                                 sig.abort();
@@ -307,7 +309,7 @@ impl Server {
         // 池命中桥接、vhost/Dashboard 每连接任务、代理/UDP 监听都在 tracker 中。
         if !self.state.data_tasks.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = tokio::time::timeout(remaining, self.state.data_tasks.wait()).await;
+            let _ = tokio::time::timeout(remaining, self.state.data_tasks.close_and_wait()).await;
         }
         sig.abort();
         Ok(())

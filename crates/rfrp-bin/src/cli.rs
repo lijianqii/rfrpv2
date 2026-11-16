@@ -116,6 +116,9 @@ pub enum ClientAction {
         /// 覆盖状态端点地址（默认取 `[client].status_addr`）
         #[arg(long)]
         addr: Option<String>,
+        /// 只校验配置与目标地址，不建立连接
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -262,12 +265,32 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Client {
-                action: Some(ClientAction::Status { config, addr }),
+                action:
+                    Some(ClientAction::Status {
+                        config,
+                        addr,
+                        check,
+                    }),
                 ..
             } => {
                 assert_eq!(config, PathBuf::from("x.toml"));
                 assert_eq!(addr.as_deref(), Some("127.0.0.1:7400"));
+                assert!(!check);
             }
+            other => panic!("expected client status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_status_accepts_check_flag() {
+        // `--check` 可写在 status 子命令之后（README 的用法），也可写在 client 之后。
+        let cli =
+            Cli::try_parse_from(["rfrp", "client", "status", "-c", "x.toml", "--check"]).unwrap();
+        match cli.command {
+            Commands::Client {
+                action: Some(ClientAction::Status { check, .. }),
+                ..
+            } => assert!(check),
             other => panic!("expected client status, got {other:?}"),
         }
     }

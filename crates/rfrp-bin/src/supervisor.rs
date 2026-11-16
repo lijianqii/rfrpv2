@@ -60,6 +60,26 @@ enum RollbackOutcome {
     Shutdown,
 }
 
+/// 子进程就绪策略。
+///
+/// - 服务端：绑定端口后立即写 ready，超时即可判定启动失败（严格）。
+/// - 客户端：ready 只在首次登录成功后写；服务端暂不可达时子进程仍在重连，
+///   不能因为 30s 内没登录成功就杀掉它（否则 `--watch-config=restart` 在
+///   服务端维护窗口/网络未就绪时表现为“起不来”）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyPolicy {
+    Strict,
+    DeferredIfAlive,
+}
+
+fn ready_policy(args: &[OsString]) -> ReadyPolicy {
+    if args.first().and_then(|a| a.to_str()) == Some("client") {
+        ReadyPolicy::DeferredIfAlive
+    } else {
+        ReadyPolicy::Strict
+    }
+}
+
 /// 启动 supervisor。`config` 用于文件监听，`args` 是完整 argv（含程序名）。
 pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
     let exe = match std::env::current_exe() {
@@ -70,6 +90,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         }
     };
     let base_args: Vec<OsString> = args.into_iter().skip(1).collect();
+    let ready_policy = ready_policy(&base_args);
 
     // 监听必须在读取/校验初始配置之前建立，避免启动窗口内的变更被漏掉。
     let (event_tx, mut event_rx) = mpsc::channel(1);
@@ -80,6 +101,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    eprintln!("rfrp supervisor: watching config {}", config.display());
 
     let mut generation = 0u64;
     let mut active_stage = match stage_config(&config, generation) {
@@ -108,7 +130,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
 
     let active_ready = ready_path(&active_stage);
     let (mut child, mut child_grace) =
-        match spawn_and_check(&exe, &active_args, &active_ready).await {
+        match spawn_and_check(&exe, &active_args, &active_ready, ready_policy).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("rfrp supervisor: cannot start child: {e}");
@@ -188,6 +210,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                         &config,
                         &base_args,
                         &mut generation,
+                        ready_policy,
                     )
                     .await
                     {
@@ -306,7 +329,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
         let new_ready = ready_path(&new_stage);
         stop_child(&mut child, child_grace).await;
 
-        match spawn_and_check(&exe, &new_args, &new_ready).await {
+        match spawn_and_check(&exe, &new_args, &new_ready, ready_policy).await {
             Ok((new_child, grace)) => {
                 child = new_child;
                 child_grace = grace;
@@ -342,6 +365,7 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
                     &config,
                     &base_args,
                     &mut generation,
+                    ready_policy,
                 )
                 .await
                 {
@@ -492,16 +516,18 @@ async fn spawn_and_check(
     exe: &Path,
     child_args: &[OsString],
     ready: &Path,
+    policy: ReadyPolicy,
 ) -> std::result::Result<(Child, Duration), String> {
-    spawn_and_check_with_timeout(exe, child_args, ready, STARTUP_TIMEOUT).await
+    spawn_and_check_with_timeout(exe, child_args, ready, STARTUP_TIMEOUT, policy).await
 }
 
-/// 与 [`spawn_and_check`] 相同，但启动超时可注入，便于单测覆盖超时分支。
+/// 与 [`spawn_and_check`] 相同，但启动超时与就绪策略可注入，便于单测覆盖各分支。
 async fn spawn_and_check_with_timeout(
     exe: &Path,
     child_args: &[OsString],
     ready: &Path,
     startup_timeout: Duration,
+    policy: ReadyPolicy,
 ) -> std::result::Result<(Child, Duration), String> {
     let _ = fs::remove_file(ready);
     let mut child = spawn_child(exe, child_args, ready)
@@ -527,6 +553,32 @@ async fn spawn_and_check_with_timeout(
             return Ok((child, grace));
         }
         if Instant::now() >= deadline {
+            if policy == ReadyPolicy::DeferredIfAlive {
+                match child.try_wait() {
+                    Ok(None) => {
+                        eprintln!(
+                            "rfrp supervisor: child did not become ready within {}s but is still \
+                             running; supervising with deferred readiness",
+                            startup_timeout.as_secs()
+                        );
+                        // 尚无 ready 文件，不知道 effective grace；用默认宽限期兜底停止。
+                        return Ok((
+                            child,
+                            Duration::from_secs(rfrp_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT),
+                        ));
+                    }
+                    Ok(Some(status)) => {
+                        let _ = fs::remove_file(ready);
+                        return Err(format!("child exited during startup: {status}"));
+                    }
+                    Err(e) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        let _ = fs::remove_file(ready);
+                        return Err(format!("try_wait failed: {e}"));
+                    }
+                }
+            }
             let _ = child.kill().await;
             let _ = child.wait().await;
             let _ = fs::remove_file(ready);
@@ -550,12 +602,13 @@ async fn spawn_rollback_with_retry(
     config: &Path,
     base_args: &[OsString],
     generation: &mut u64,
+    policy: ReadyPolicy,
 ) -> RollbackOutcome {
     let mut delay = BACKOFF_INITIAL;
     let mut event_open = true;
     let mut config_changed = false;
     loop {
-        match spawn_and_check(exe, old_args, old_ready).await {
+        match spawn_and_check(exe, old_args, old_ready, policy).await {
             Ok((child, grace)) => {
                 return RollbackOutcome::StartedOld {
                     child,
@@ -594,7 +647,7 @@ async fn spawn_rollback_with_retry(
             match stage_and_validate(exe, config, base_args, *generation).await {
                 Ok((stage, args)) => {
                     let ready = ready_path(&stage);
-                    match spawn_and_check(exe, &args, &ready).await {
+                    match spawn_and_check(exe, &args, &ready, policy).await {
                         Ok((child, grace)) => {
                             return RollbackOutcome::StartedNew {
                                 child,
@@ -851,6 +904,7 @@ mod tests {
             &[OsString::from("-c"), OsString::from("exit 7")],
             &ready,
             Duration::from_secs(2),
+            ReadyPolicy::Strict,
         )
         .await
         .unwrap_err();
@@ -869,6 +923,7 @@ mod tests {
             &[OsString::from("5")],
             &ready,
             Duration::from_millis(150),
+            ReadyPolicy::Strict,
         )
         .await
         .unwrap_err();
@@ -878,6 +933,32 @@ mod tests {
             "must not wait for the child's natural exit"
         );
         assert!(!ready.exists(), "timed-out startup must clean ready file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_check_defers_ready_while_child_is_alive() {
+        // 客户端在服务端不可达时会持续重连、暂时不写 ready；supervisor 不能因此
+        // 杀掉它（否则 --watch-config=restart 在服务端维护窗口内起不来）。
+        let (dir, ready) = temp_ready_path("deferred");
+        let (mut child, grace) = spawn_and_check_with_timeout(
+            Path::new("/bin/sleep"),
+            &[OsString::from("5")],
+            &ready,
+            Duration::from_millis(150),
+            ReadyPolicy::DeferredIfAlive,
+        )
+        .await
+        .expect("alive child must be deferred, not killed");
+        assert!(grace.as_secs() > 0);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "deferred child must still be running"
+        );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(!ready.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -47,7 +47,7 @@ pub fn init_logging(
     };
 
     if let Some(path) = output.strip_prefix("file:") {
-        match File::options().create(true).append(true).open(path) {
+        match open_log_file(path) {
             Ok(file) => {
                 let _ = install(BoxMakeWriter::new(Mutex::new(file)), false);
             }
@@ -59,6 +59,21 @@ pub fn init_logging(
     } else {
         let _ = install(BoxMakeWriter::new(std::io::stderr), ansi_enabled());
     }
+}
+
+/// 打开日志文件：追加写入；Unix 下新建文件使用 0600。
+///
+/// 日志包含 bind 地址、代理名/域名与错误上下文，默认不应让同机其他用户读取。
+/// 已存在的文件不改权限（尊重运维显式设置的组可读等策略）。
+fn open_log_file(path: &str) -> std::io::Result<File> {
+    let mut options = File::options();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// 判断 stderr 日志是否应启用 ANSI 颜色。
@@ -76,4 +91,53 @@ fn ansi_enabled() -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_log_file_append_only() {
+        let path = std::env::temp_dir().join(format!(
+            "rfrp-log-open-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let path_str = path.to_string_lossy().into_owned();
+        {
+            let mut f = open_log_file(&path_str).unwrap();
+            use std::io::Write;
+            f.write_all(b"first\n").unwrap();
+        }
+        {
+            let mut f = open_log_file(&path_str).unwrap();
+            use std::io::Write;
+            f.write_all(b"second\n").unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "first\nsecond\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_log_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "rfrp-log-mode-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        drop(open_log_file(&path.to_string_lossy()).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -76,3 +76,30 @@ fn client_status_without_endpoint_hints_config() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("status_addr"), "{stderr}");
 }
+
+#[test]
+fn client_status_check_does_not_connect() {
+    // `--check` 只校验配置与目标地址，不建立连接：指向一个必然拒绝的端口也应成功。
+    let cfg = client_config();
+    let started = std::time::Instant::now();
+    let out = Command::new(BIN)
+        .args([
+            "client",
+            "status",
+            "-c",
+            cfg.to_str().unwrap(),
+            "--addr",
+            "127.0.0.1:1",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("client config OK"), "{stdout}");
+    assert!(stdout.contains("127.0.0.1:1"), "{stdout}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "status --check must not attempt a network connection"
+    );
+}

@@ -148,6 +148,9 @@ pub struct ServerState {
     pub max_total_domains: AtomicUsize,
     /// 全局预热工作连接总数上限。
     pub max_total_pooled_work_conns: AtomicUsize,
+    /// 控制监听实际绑定的 IP。代理 / vhost 监听复用该地址，避免每次注册都重新
+    /// 解析 `bind_addr`（域名解析可能阻塞控制读循环）。
+    pub bind_ip: IpAddr,
     /// 当前已入池的预热工作连接总数。
     pub pooled_work_conns: AtomicUsize,
     /// 所有 UDP 代理共享的待发送队列字节数。
@@ -173,6 +176,11 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new() -> Arc<Self> {
+        Self::with_bind_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    /// 生产路径：使用控制监听实际绑定的 IP，代理/UDP 注册不再重复解析域名。
+    pub fn with_bind_ip(bind_ip: IpAddr) -> Arc<Self> {
         Arc::new(Self {
             work_id: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
@@ -188,6 +196,7 @@ impl ServerState {
             max_total_proxies: AtomicUsize::new(MAX_TOTAL_PROXIES),
             max_total_domains: AtomicUsize::new(MAX_TOTAL_DOMAINS),
             max_total_pooled_work_conns: AtomicUsize::new(MAX_TOTAL_POOLED_WORK_CONNS),
+            bind_ip,
             pooled_work_conns: AtomicUsize::new(0),
             udp_queue_bytes: Arc::new(AtomicUsize::new(0)),
             udp_sessions_active: Arc::new(AtomicUsize::new(0)),
@@ -338,7 +347,7 @@ impl ServerState {
     /// 尝试占用一个全局预热工作连接名额。
     pub fn try_acquire_pooled_slot(&self) -> bool {
         let max = self.max_total_pooled_work_conns.load(Ordering::Relaxed);
-        // 保持 MSRV 1.75：新工具链的 try_update 更晚引入。
+        // 保持 MSRV 1.85：新工具链的 try_update 更晚引入。
         #[allow(deprecated)]
         self.pooled_work_conns
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {

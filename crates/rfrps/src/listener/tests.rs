@@ -349,6 +349,10 @@ async fn register_http_proxy_registers_domains() {
     let proxies = session.proxies.lock();
     let entry = proxies.get("web").unwrap();
     assert_eq!(entry.kind, ProxyType::Http);
+    assert_eq!(
+        entry.remote_port, None,
+        "vhost proxies must not record a public port they never bind"
+    );
 }
 
 #[tokio::test]
@@ -603,7 +607,7 @@ async fn work_conn_request_is_retried_until_consumed() {
     let (session, mut rx) = crate::control::test_session_with_token("r", "tok");
     register_test_session(&state, &session);
     let (user, _peer) = tokio::io::duplex(64);
-    dispatch_user_connection("ssh".to_string(), user, session, state);
+    let _ = dispatch_user_connection("ssh".to_string(), user, session, state);
 
     let mut work_ids = Vec::new();
     for _ in 0..2 {
@@ -629,7 +633,7 @@ async fn dispatch_rejects_replaced_or_stopped_session() {
     state.sessions.lock().insert("r".into(), new);
 
     let (user, _peer) = tokio::io::duplex(64);
-    dispatch_user_connection("ssh".to_string(), user, old, state.clone());
+    let _ = dispatch_user_connection("ssh".to_string(), user, old, state.clone());
     assert!(state.pending.lock().is_empty());
     assert_eq!(
         state
@@ -653,12 +657,35 @@ async fn dispatch_rejects_replaced_or_stopped_session() {
     register_test_session(&state, &stopped);
     stopped.stop.cancel();
     let (user, _peer) = tokio::io::duplex(64);
-    dispatch_user_connection("ssh".to_string(), user, stopped, state.clone());
+    let _ = dispatch_user_connection("ssh".to_string(), user, stopped, state.clone());
     assert!(state.pending.lock().is_empty());
     assert!(
         tokio::time::timeout(Duration::from_millis(50), stopped_rx.recv())
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dispatch_rejects_with_stream_when_active_limit_reached() {
+    // vhost 需要拿回用户流才能返回 503；TCP 调用方丢弃返回值即可。
+    let state = ServerState::new();
+    state
+        .max_active
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let (session, _rx) = crate::control::test_session_with_token("r", "tok");
+    register_test_session(&state, &session);
+    let (user, _peer) = tokio::io::duplex(64);
+    let err = dispatch_user_connection("ssh".to_string(), user, session, state.clone())
+        .expect_err("max_active=0 must reject");
+    assert_eq!(err.1, DispatchReject::TooManyActive);
+    assert_eq!(
+        state
+            .metrics
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rejected dispatch must not increment active connections"
     );
 }
 

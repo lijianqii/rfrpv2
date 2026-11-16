@@ -1,8 +1,8 @@
 # 常用开发任务。用法：make <target>，默认 make ci
 
-.PHONY: all fmt fmt-check clippy build check test e2e soak soak-long ci ci-release clean
+.PHONY: all fmt fmt-check clippy build check test e2e soak soak-long ci ci-release clean bench bench-gate fuzz-smoke miri audit gen-cert release
 
-all: fmt-check clippy build test
+all: ci
 
 fmt:
 	cargo fmt --all
@@ -49,8 +49,6 @@ ci-release: ci bench-gate
 clean:
 	cargo clean
 
-.PHONY: bench bench-gate gen-cert release
-
 # 性能基准（Criterion）
 bench:
 	cargo bench -p rfrp-common --bench forward
@@ -60,7 +58,20 @@ bench:
 # 因此必须用 release 构建并显式带 --ignored 运行。
 # scripts/release.sh 会在打包前自动跑这道闸门。
 bench-gate:
-	cargo test --release -p rfrpc --test udp_burst -- --ignored --nocapture
+	cargo test --locked --release -p rfrpc --test udp_burst -- --ignored --nocapture
+
+# 短时 fuzz 冒烟（需 `cargo install cargo-fuzz` 与 nightly）。
+fuzz-smoke:
+	cargo +nightly fuzz run frame_decode -- -runs=10000
+	cargo +nightly fuzz run config_parse -- -runs=10000
+
+# 对协议/鉴权等纯逻辑跑 Miri（需 `rustup +nightly component add miri`）。
+miri:
+	MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p rfrp-common --lib auth::
+
+# 依赖安全审计（需 `cargo install cargo-audit`）。
+audit:
+	cargo audit
 
 # 生成 examples 下的自签证书
 gen-cert:

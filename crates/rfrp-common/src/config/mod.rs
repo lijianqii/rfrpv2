@@ -21,6 +21,42 @@ pub struct LogSection {
     pub format: Option<String>,
 }
 
+impl LogSection {
+    /// 校验日志设置。非法值必须在启动/`--check` 阶段报错，而不是静默回落。
+    pub fn validate(&self) -> Result<()> {
+        if let Some(level) = &self.level {
+            if !matches!(
+                level.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error"
+            ) {
+                return Err(config(format!(
+                    "invalid log.level '{level}': expected trace/debug/info/warn/error"
+                )));
+            }
+        }
+        if let Some(format) = &self.format {
+            if !matches!(format.as_str(), "text" | "json") {
+                return Err(config(format!(
+                    "invalid log.format '{format}': expected text or json"
+                )));
+            }
+        }
+        if let Some(output) = &self.output {
+            if output != "stderr" {
+                let Some(path) = output.strip_prefix("file:") else {
+                    return Err(config(format!(
+                        "invalid log.output '{output}': expected stderr or file:<path>"
+                    )));
+                };
+                if path.trim().is_empty() {
+                    return Err(config("log.output file: path must not be empty"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 兼容别名：客户端侧日志段与 `LogSection` 相同。
 pub use LogSection as ClientLogSection;
 
@@ -172,5 +208,46 @@ pub(crate) fn plaintext_hint(work_conn_tls: bool) -> &'static str {
         "; set work_conn_tls=false for plaintext work connections"
     } else {
         ""
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn valid_log_section_passes() {
+        let log = LogSection {
+            level: Some("debug".into()),
+            output: Some("file:/var/log/rfrp/rfrp.log".into()),
+            format: Some("json".into()),
+        };
+        assert!(log.validate().is_ok());
+        assert!(LogSection::default().validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_log_values_are_rejected() {
+        for level in ["verbose", "INFO", ""] {
+            let log = LogSection {
+                level: Some(level.into()),
+                ..Default::default()
+            };
+            assert!(log.validate().is_err(), "level {level:?}");
+        }
+        for format in ["yaml", "TEXT", ""] {
+            let log = LogSection {
+                format: Some(format.into()),
+                ..Default::default()
+            };
+            assert!(log.validate().is_err(), "format {format:?}");
+        }
+        for output in ["stdout", "file:", "file:   ", "file"] {
+            let log = LogSection {
+                output: Some(output.into()),
+                ..Default::default()
+            };
+            assert!(log.validate().is_err(), "output {output:?}");
+        }
     }
 }

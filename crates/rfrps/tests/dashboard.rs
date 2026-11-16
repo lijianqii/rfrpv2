@@ -110,6 +110,34 @@ async fn dashboard_rate_limits_excess_requests() {
     assert_eq!(statuses[..100].iter().filter(|s| **s == 200).count(), 100);
     assert_eq!(statuses[100], 429, "101st request should be rate limited");
 
+    // /healthz 不参与业务限流：即使 API 已被限流，探活仍必须可用，
+    // 否则共享出口 IP 的监控会拿到 429 并误判实例不健康。
+    let (status, _) = http_get(port, "/healthz", None).await;
+    assert_eq!(status, 200, "healthz must bypass the general rate limiter");
+
+    srv.abort();
+}
+
+#[tokio::test]
+async fn dashboard_rejects_malformed_request_head() {
+    // 无法解析的请求行/头部必须返回 400，而不是被当成 `GET /` 返回登录页。
+    let port = free_port();
+    let (srv, _addr) = start_server(dashboard_config(port)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(b"garbage\r\n\r\n").await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "malformed request must be 400: {text}"
+    );
+
     srv.abort();
 }
 

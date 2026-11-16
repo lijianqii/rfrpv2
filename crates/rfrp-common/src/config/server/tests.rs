@@ -31,6 +31,25 @@ fn allow_ports_parsing_variants() {
 }
 
 #[test]
+fn invalid_log_config_is_rejected() {
+    let text = r#"
+        [server]
+        bind_addr = "127.0.0.1"
+        bind_port = 7000
+        token = "secret"
+        work_conn_tls = false
+
+        [log]
+        level = "verbose"
+    "#;
+    let cfg: ServerConfig = toml::from_str(text).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "invalid log.level must fail validation"
+    );
+}
+
+#[test]
 fn allow_ports_empty_segments_do_not_fail_open() {
     for bad in [",", " , ", ",,,"] {
         let cfg = ProxySection {

@@ -161,9 +161,21 @@ fn record_up(proxy: &UdpProxy, n: usize) {
         .bytes_up
         .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     proxy
+        .metrics
+        .udp_bytes_received_total
+        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    proxy
         .stats
         .bytes_up
         .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 记录成功入队的 UDP 上行字节（不含因背压/预算丢弃的包）。
+fn record_forwarded(proxy: &UdpProxy, n: usize) {
+    proxy
+        .metrics
+        .udp_bytes_forwarded_total
+        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 记录 UDP 下行字节：全局总量 + 每代理统计。
@@ -240,7 +252,7 @@ fn try_acquire_global_session(proxy: &UdpProxy) -> bool {
 }
 
 /// 归还一个全局 UDP 会话名额；饱和到 0，避免异常路径下溢。
-#[allow(deprecated)] // MSRV 1.75：try_update 更晚引入
+#[allow(deprecated)] // MSRV 1.85：try_update 更晚引入
 fn release_global_session(proxy: &UdpProxy) {
     let _ = proxy
         .global_sessions
@@ -314,10 +326,10 @@ pub async fn register_udp_proxy(
     remote_port: u16,
     session: &Arc<Session>,
     state: &Arc<ServerState>,
-    bind_addr: &str,
+    bind_ip: std::net::IpAddr,
     session_timeout: Duration,
 ) -> std::result::Result<JoinHandle<()>, ProxyError> {
-    let socket = match UdpSocket::bind((bind_addr, remote_port)).await {
+    let socket = match UdpSocket::bind((bind_ip, remote_port)).await {
         Ok(s) => s,
         Err(e) => {
             // 具体原因只写服务端日志（DESIGN §8.5）。
@@ -510,6 +522,8 @@ async fn handle_datagram(
                 proxy = %proxy_name, %peer,
                 "udp session backpressure; dropping datagram"
             );
+        } else {
+            record_forwarded(proxy, data.len());
         }
         return;
     }
@@ -550,6 +564,8 @@ async fn handle_datagram(
                     proxy = %proxy_name, %peer,
                     "udp pending backpressure; dropping datagram"
                 );
+            } else {
+                record_forwarded(proxy, data.len());
             }
         }
         return;
@@ -589,7 +605,9 @@ async fn handle_datagram(
         );
         return;
     };
-    let _ = tx.send(packet).await;
+    if tx.send(packet).await.is_ok() {
+        record_forwarded(proxy, data.len());
+    }
     proxy.pending_by_id.lock().insert(
         work_id,
         PendingUdp {

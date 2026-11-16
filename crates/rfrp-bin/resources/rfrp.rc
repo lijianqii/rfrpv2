@@ -2,8 +2,8 @@
 // 不 include <winresrc.h>，避免交叉编译时依赖 Windows SDK 头文件（ID 直接用数字）。
 
 1 VERSIONINFO
-FILEVERSION    0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION    {{FILEVERSION}}
+PRODUCTVERSION {{FILEVERSION}}
 FILEFLAGSMASK  0x3fL
 FILEFLAGS      0x0L
 FILEOS         0x40004L
@@ -16,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "rfrp contributors"
             VALUE "FileDescription",  "rfrp - Rust Fast Reverse Proxy"
-            VALUE "FileVersion",      "0.1.0"
+            VALUE "FileVersion",      "{{VERSION}}"
             VALUE "InternalName",     "rfrp"
             VALUE "LegalCopyright",   "Copyright (c) 2026 rfrp contributors. Licensed under the MIT License."
             VALUE "OriginalFilename", "rfrp.exe"
             VALUE "ProductName",      "rfrp"
-            VALUE "ProductVersion",   "0.1.0"
+            VALUE "ProductVersion",   "{{VERSION}}"
         END
     END
     BLOCK "VarFileInfo"

@@ -52,30 +52,32 @@
 
 - **语言**：Rust（edition 2021）
 - **异步运行时**：tokio（multi-threaded runtime）
-- **最低支持版本**：MSRV = Rust 1.75
+- **最低支持版本**：MSRV = Rust 1.85
 
 ### 3.2 关键依赖
 
 | 用途 | crate | 说明 |
 |------|-------|------|
 | 异步运行时 | `tokio` | net / io / sync / time / signal |
-| 序列化 | `serde` / `serde_json` | 配置与部分协议消息 |
+| 序列化 | `serde` / `serde_json` | 配置与协议消息 |
 | 配置 | `toml` | 配置文件格式 |
-| TLS | `rustls` + `tokio-rustls` | 控制链路、工作连接、HTTPS |
-| 日志 | `tracing` + `tracing-subscriber` | 结构化日志 |
-| HTTP | `hyper` + `http` | HTTP/HTTPS 代理与 Dashboard |
-| CLI | `clap` | 命令行解析（含子命令） |
+| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `webpki-roots` | 控制链路、工作连接、HTTPS |
+| 日志 | `tracing` + `tracing-subscriber` | 结构化日志（text/json） |
+| HTTP | `httparse` + 手写响应 | vhost 请求头解析；Dashboard/状态端点为极简自实现 |
+| CLI | `clap` + `clap_complete` | 命令行解析与 shell 补全 |
 | 错误 | `thiserror` / `anyhow` | 库错误 / 应用错误 |
-| UUID | `uuid` | run_id / session_id 生成（v4） |
-| 指标 | `prometheus` | 指标暴露 |
-| Dashboard | `axum` | Dashboard HTTP 服务（基于 hyper，复用 tokio） |
-| 静态资源 | `rust-embed` | Dashboard 前端页面嵌入二进制 |
+| UUID | `uuid` | run_id / session_id / 工作连接令牌 |
+| 指标 | 手写 Prometheus 文本 | 无 `prometheus` crate 依赖 |
+| Dashboard | `include_str!` 单文件页面 | 无 `axum` / `rust-embed` 依赖 |
 | 文件监听 | `notify` | 配置变更事件（inotify/ReadDirectoryChangesW/FSEvents） |
-| 工具 | `bytes` / `tokio-util` | 缓冲区、codec |
+| 工具 | `bytes` / `tokio-util` / `futures` / `parking_lot` / `socket2` / `base64` | 缓冲区、codec、锁、socket 参数、Basic Auth |
+
+> 实现阶段对依赖做了收敛：没有引入 hyper/axum/prometheus/rust-embed，HTTP 解析与响应、
+> Prometheus 文本渲染、Dashboard 页面嵌入均由项目自身实现，减少编译时间与攻击面。
 
 > 心跳时间戳 `ts`（Unix 毫秒）用 `std::time::SystemTime` 获取，不引入 `chrono` 等外部时间库。
 
-> 依赖版本在 M0 搭建时于各 crate 的 `Cargo.toml` 中锁定（用 `^` 兼容版本），所有依赖须满足 MSRV = Rust 1.75。若某依赖要求更高 MSRV，则降级到兼容版本或寻找替代。
+> 依赖版本在 M0 搭建时于各 crate 的 `Cargo.toml` 中锁定（用 `^` 兼容版本），所有依赖须满足 MSRV = Rust 1.85（当前 clap/uuid/proptest 等依赖要求 1.85，`make ci` 的 MSRV job 会验证）。若某依赖要求更高 MSRV，则降级到兼容版本或寻找替代。
 
 ### 3.3 平台与构建策略
 
@@ -263,9 +265,11 @@ ls target/x86_64-pc-windows-gnu/release/rfrp.exe
 +----------+----------+----------+----------------+
 ```
 
-- `Version`：协议版本（当前 = 1），用于兼容性协商。
+- `Version`：协议版本（当前 = 2），用于兼容性协商。
 - `MsgType`：消息类型枚举。
-- `Length`：Payload 字节数（u32，大端），单帧上限 16 MiB。**`Length=0` 合法**，表示无 Payload（如 `Close` 无 reason 时）；解码端据此跳过 Payload 读取。
+- `Length`：Payload 字节数（u32，大端），当前实现对单帧的实际上限为 **64 KiB**
+  （`CONTROL_FRAME_MAX_PAYLOAD`）。**`Length=0` 合法**，表示无 Payload（如 `Close`
+  无 reason 时）；解码端据此跳过 Payload 读取。
 - `Payload`：按 MsgType 不同，为 JSON 或二进制。Length=0 时 Payload 为空。
 
 > 帧头含 Version + MsgType，`tokio_util::codec::LengthDelimitedCodec` 无法直接承载（它只处理 Length + Payload）。因此**自定义 Codec**，在 `rfrp-common::protocol::frame` 中实现 `tokio_util::codec::Encoder<Frame>` 与 `Decoder`：解码时先读 6 字节头（Version + MsgType + Length），校验 Version 与 Length，再读 Payload；编码时按序写入。底层 `Framed<TcpStream, FrameCodec>` 自动处理半包/粘包。
@@ -443,6 +447,9 @@ rfrps 收到 `NewProxy` 后按顺序校验，任一失败返回 `NewProxyResp{ok
 
 > error 字符串为**小写英文标识符**，不含变量（端口号、域名等不拼入字符串，便于 rfrpc 按精确匹配分类处理）。具体冲突值可通过日志关联，不回显给对端。
 >
+> `invalid type` 目前会在消息反序列化阶段被拒绝（控制连接关闭），不会出现在
+> `NewProxyResp` 中；保留该错误码供未来协议扩展/兼容旧客户端使用。
+>
 > **实现**（`rfrp_common::ProxyError` 为唯一来源）：rfrpc 收到 `ok=false` 时按上表分类——
 > `"port occupied"` / `"domain conflict"`（运行时冲突）交由后台任务短退避重试
 > （`PROXY_REGISTER_RETRY_*`，2s→30s，8 轮）；`"port not allowed"` / `"internal error"`
@@ -551,7 +558,7 @@ rfrp/
 `crates/rfrp-common/benches/`。
 
 > **`rfrp-common::constants` 集中常量定义**：以下散布于各章节的数值常量统一在 `constants.rs` 中定义并导出，避免 magic number：
-> - 协议：`PROTOCOL_VERSION = 2`、`FRAME_HEADER_LEN = 6`、`FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024`、`CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024`（控制帧实际上限）、`WORK_ID_POOL_RESERVED = 0`
+> - 协议：`PROTOCOL_VERSION = 2`、`FRAME_HEADER_LEN = 6`、`CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024`（所有帧的实际单帧上限）、`WORK_ID_POOL_RESERVED = 0`
 > - 超时（秒）：`CONNECT_TIMEOUT = 10`（控制连接建连）、`TLS_HANDSHAKE_TIMEOUT = 10`、`HTTP_HEAD_TIMEOUT = 10`、`HEARTBEAT_INTERVAL = 30`、`HEARTBEAT_TIMEOUT = 10`、`WORK_CONN_TIMEOUT_RFRPS = 10`、`WORK_CONN_TIMEOUT_RFRPC = 8`、`UDP_SESSION_TIMEOUT = 300`（可通过服务端 `udp_session_timeout_secs` 覆盖）、`GRACEFUL_SHUTDOWN_TIMEOUT = 30`
 > - 重连退避（秒）：`RECONNECT_BACKOFF_INITIAL = 1`、`RECONNECT_BACKOFF_MAX = 30`、`MIN_STABLE_CONNECTION_SECS = 60`（短命连接不重置退避）
 > - 登录限速：`LOGIN_FAILURE_LIMIT = 10` 次 / `LOGIN_FAILURE_WINDOW = 60` 秒（按来源 IP；IPv6 聚合到 /64，IPv4-mapped IPv6 归一为 IPv4）
@@ -561,7 +568,7 @@ rfrp/
 > - 配置类注册重试（秒）：`PROXY_REGISTER_RETRY_PERSISTENT_DELAY_SECS = 30`、`PROXY_REGISTER_RETRY_PERSISTENT_MAX = 20`（轮，约 10 分钟）
 > - 工作连接请求重发间隔：`WORK_CONN_REQUEST_INTERVAL_MS = 3000`（在 `WORK_CONN_TIMEOUT_RFRPS` 窗口内周期重发 `ReqWorkConn`）
 > - 上限：`MAX_PENDING_UDP_SESSIONS = 256`、`MAX_PROXIES_PER_SESSION = 128`、`MAX_CUSTOM_DOMAINS = 16`、`POOL_SIZE_DEFAULT = 1`、`POOL_SIZE_WARN_THRESHOLD = 16`、`MAX_UDP_PACKET_SIZE: usize = 65507`
-> - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`、`MAX_ERROR_LEN = 512`
+> - 字符串长度上限（字节）：`MAX_RUN_ID_LEN = 64`、`MAX_TOKEN_LEN = 256`、`MAX_PROXY_NAME_LEN = 64`、`MAX_DOMAIN_LEN = 253`
 
 ### 7.2 职责边界
 
@@ -1320,9 +1327,9 @@ C:\rfrp\
 | **M1** | TCP 跑通：rfrps/rfrpc 控制+监听+桥接 | ✅ **已完成**（2026-08-14） |
 | M2 | 健壮性：心跳/重连/run_id/优雅退出/连接池 | ✅ 完成 |
 | M3 | 安全：TLS 控制链路 + 工作连接 TLS + token 鉴权 | ✅ **已完成** |
-| M4 | UDP / HTTP / HTTPS（vhost） | ⬜ 未开始 |
-| M5 | Dashboard 与可观测（指标/结构化日志） | ⬜ 未开始 |
-| M6 | 打磨与发布（交叉编译三产物/打包/文档） | ✅ **已完成** |
+| M4 | UDP / HTTP / HTTPS（vhost） | ✅ **已完成** |
+| M5 | Dashboard 与可观测（指标/结构化日志） | ✅ **已完成** |
+| M6 | 打磨与发布（交叉编译两产物/打包/文档） | ✅ **已完成** |
 
 ### 17.2 M0 交付物核对（对照 §12）
 

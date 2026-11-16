@@ -9,8 +9,14 @@ Rust 反向代理（内网穿透）工具。同一二进制既是服务端也是
 |---|---|
 | `rfrp`（Windows 为 `rfrp.exe`） | 主程序 |
 | `rfrp-server.toml` / `rfrp-client.toml` | 配置模板（**请修改 token、地址、证书路径**） |
+| `cert.pem` / `key.pem` / `ca.pem` | 发布时生成的自签演示证书（仅供本地试用，**生产必须替换**） |
+| `vhost-cert.pem` / `vhost-key.pem` | HTTPS vhost 演示证书（同上） |
 | `rfrp-server.service` / `rfrp-client.service` | systemd unit（仅 Linux 包） |
 | `LICENSE` / `README.md` | 许可证与本说明 |
+
+> 包内证书是发布流水线生成的自签证书，私钥随包分发，**只能用于本地/内网试用**。
+> 生产环境请用 `scripts/gen-self-signed-cert.sh` 重新生成并妥善保管私钥，
+> 或替换为正式 CA 签发的证书。
 
 ## 快速开始
 
@@ -31,7 +37,10 @@ rfrp.exe client -c rfrp-client.toml
 提示：
 
 - `rfrp --help` / `rfrp server --help` 查看全部参数（CLI 参数可覆盖配置文件）。
-- 启用 TLS 需要证书与私钥；自签场景可用仓库 `scripts/gen-self-signed-cert.sh` 生成。
+- 解包后可先执行 `./rfrp server -c rfrp-server.toml --check` 与
+  `./rfrp client -c rfrp-client.toml --check`，只校验配置、不监听端口/不建连。
+- 启用 TLS 需要证书与私钥；包内已附带演示证书，生产环境务必替换
+  （可用仓库 `scripts/gen-self-signed-cert.sh` 生成自签证书）。
 - 客户端 `status_addr` 可开启只读状态端点（`/`、`/api/status`、`/metrics`），
   服务端 `[dashboard]` 提供 Dashboard 与 Prometheus 指标。
 - Windows 若被杀毒软件拦截，见仓库 `docs/WINDOWS_ANTIVIRUS.md`。

@@ -20,7 +20,7 @@ fn default_pool_size() -> u32 {
 }
 
 /// `[client]` 连接服务端与鉴权。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSection {
     pub server_addr: String,
@@ -53,6 +53,29 @@ pub struct ClientSection {
     /// 默认关闭；仅只读、无鉴权，建议绑定回环地址。
     #[serde(default)]
     pub status_addr: Option<String>,
+}
+
+impl Default for ClientSection {
+    /// 与 serde 的字段默认值保持一致：`work_conn_tls` 默认 **true**。
+    ///
+    /// 此前 derive 的 `Default` 给出 `false`，与 TOML 解析路径不一致，
+    /// 容易让测试/调用方构造出与真实配置不同的安全默认值。
+    fn default() -> Self {
+        Self {
+            server_addr: String::new(),
+            server_port: 0,
+            token: String::new(),
+            tls_enable: false,
+            tls_server_name: None,
+            tls_ca: None,
+            work_conn_tls: true,
+            run_id_file: None,
+            tcp_keepalive_secs: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
+            status_addr: None,
+        }
+    }
 }
 
 impl ClientSection {
@@ -274,6 +297,7 @@ impl ClientConfig {
             self.client.heartbeat_interval_secs,
             self.client.heartbeat_timeout_secs,
         )?;
+        self.log.validate()?;
         if let Some(addr) = &self.client.status_addr {
             let parsed = addr
                 .parse::<std::net::SocketAddr>()
@@ -325,7 +349,12 @@ impl ClientConfig {
                 // vhost 代理不占用独立端口（走共享监听），无端口唯一性问题。
                 ProxyType::Http | ProxyType::Https => continue,
             };
-            let rp = p.remote_port.expect("validated above");
+            let rp = p.remote_port.ok_or_else(|| {
+                config(format!(
+                    "proxy {} (type {:?}) requires remote_port",
+                    p.name, p.r#type
+                ))
+            })?;
             if !ports.insert(rp) {
                 return Err(config(format!("duplicate remote_port for {kind}: {rp}")));
             }

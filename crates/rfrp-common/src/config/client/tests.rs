@@ -25,6 +25,25 @@ fn tcp_proxy_parses() {
 }
 
 #[test]
+fn invalid_log_config_is_rejected() {
+    let text = r#"
+        [client]
+        server_addr = "127.0.0.1"
+        server_port = 7000
+        token = "x"
+        work_conn_tls = false
+
+        [log]
+        format = "yaml"
+    "#;
+    let cfg: ClientConfig = toml::from_str(text).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "invalid log.format must fail validation"
+    );
+}
+
+#[test]
 fn token_longer_than_protocol_limit_rejected() {
     let token = "x".repeat(crate::constants::MAX_TOKEN_LEN + 1);
     let toml = format!(
@@ -377,6 +396,7 @@ fn tcp_and_udp_may_share_remote_port() {
             server_addr: "s.example.com".into(),
             server_port: 7000,
             token: "x".into(),
+            work_conn_tls: false,
             ..Default::default()
         },
         proxies: vec![
@@ -421,6 +441,7 @@ fn duplicate_remote_port_within_same_protocol_fails() {
             server_addr: "s.example.com".into(),
             server_port: 7000,
             token: "x".into(),
+            work_conn_tls: false,
             ..Default::default()
         },
         proxies,

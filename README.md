@@ -20,6 +20,9 @@ Rust Fast Reverse Proxy —— 用 Rust + tokio 实现的轻量级反向代理�
 cargo build --release
 ```
 
+当前 MSRV 为 **Rust 1.85**（`Cargo.toml` 的 `rust-version`）；CI 的 MSRV job
+会用 1.85.0 验证，避免依赖升级悄悄抬高工具链要求。
+
 ### 发布产物交叉编译（Debian 开发机）
 
 发布产物固定为 x86_64 两个平台（`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`），
@@ -74,6 +77,11 @@ make release
 - Linux x86_64（glibc）`rfrp-<version>-x86_64-linux-gnu.tar.gz`
 - Windows x86_64 `rfrp-<version>-x86_64-windows-gnu.zip`
 
+两个包都包含配置模板与一套**发布时生成的自签演示证书**，解包后可直接执行
+`./rfrp server -c rfrp-server.toml --check` / `./rfrp client -c rfrp-client.toml --check`。
+演示证书的私钥随包分发，**只能用于本地/内网试用，生产必须替换**；发布脚本还会在
+打包前用主机架构二进制实际校验包内模板。
+
 同时生成 `SHA256SUMS`。
 
 生成自签证书：
@@ -111,8 +119,9 @@ rfrp client -c examples/rfrp-client.toml --check
 
 其它子命令：
 
-- `rfrp client status -c <config> [--addr <host:port>]`：查询本地 `[client].status_addr`
-  状态端点并打印 `/api/status` 的 JSON，不必开浏览器。
+- `rfrp client status -c <config> [--addr <host:port>] [--check]`：查询本地
+  `[client].status_addr` 状态端点并打印 `/api/status` 的 JSON；加 `--check` 时只校验
+  配置与目标地址，不建立连接。
 - `rfrp completions <bash|zsh|fish|powershell|elvish>`：输出 shell 补全脚本。
 
 ## 监控与运维
@@ -146,7 +155,7 @@ cookie_secure = false       # 置于 HTTPS 反向代理之后时置 true（见�
 | `GET /` | 看板（KPI 卡片、流量走势、代理卡片含公网端口/域名、会话列表；内嵌初始状态，5s 轮询刷新） |
 | `GET /api/status` | JSON：会话与代理清单、pending、UDP 会话、池、指标 |
 | `GET /metrics` | Prometheus 文本 |
-| `GET /healthz` | 健康检查（**免鉴权**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
+| `GET /healthz` | 健康检查（**免鉴权、不参与业务限流**）：accept 循环正常返回 `200 ok`，连续失败返回 `503` |
 
 > 会话 Cookie 只保存随机的服务端会话 ID（不再保存凭据），服务端可撤销并执行
 > `session_ttl_secs`（默认 8 小时）的 TTL；退出登录会同时撤销服务端会话。
@@ -175,6 +184,9 @@ rfrp_accepted_total         控制端口累计接受的 TCP 连接（含控制/�
 rfrp_accept_errors_total    accept 错误累计
 rfrp_accepting              accept 循环是否正常（1/0）
 rfrp_udp_dropped_total      UDP 应用层丢弃的包数（待配对达上限/会话背压；不含内核缓冲溢出）
+rfrp_udp_bytes_received_total   UDP 从客户端收到的字节（包含随后被丢弃的包）
+rfrp_udp_bytes_forwarded_total  UDP 实际成功入队、准备转发给工作连接的字节
+rfrp_heartbeat_resp_dropped_total  控制通道满导致心跳响应被丢弃的次数
 rfrp_proxy_bytes_up_total{proxy="…"}     每代理上行字节
 rfrp_proxy_bytes_down_total{proxy="…"}   每代理下行字节
 rfrp_proxy_connections_total{proxy="…"}  每代理累计连接数
@@ -186,6 +198,7 @@ rfrp_proxy_active_connections{proxy="…"} 每代理活跃连接数
 UDP 没有 TCP 那样的连接状态和送达确认，Dashboard/指标需要按下面语义理解：
 
 - `rfrp_bytes_up_total`：从外部用户侧**收到**的 UDP 字节，包含因待配对上限或会话队列背压而丢弃的包。
+- `rfrp_udp_bytes_received_total`：UDP 专属的“收到字节”；`rfrp_udp_bytes_forwarded_total`：实际成功入队并准备转发给工作连接的字节。两者之差可直接看出应用层丢弃量。
 - `rfrp_bytes_down_total`：尝试发回用户侧的 UDP 字节，在 `send_to` 之前累加；不代表已送达。
 - `rfrp_udp_dropped_total`：只统计**应用层**丢包（pending 上限、队列满/背压），**不包含内核 UDP 接收缓冲溢出**。
 - `rfrp_udp_sessions`：当前活跃的已配对 UDP 会话数。
@@ -226,9 +239,11 @@ status_addr = "127.0.0.1:7400"   # 仅只读、无鉴权，务必绑回环
 | `GET /metrics` | Prometheus 文本 |
 | `GET /healthz` | 隧道健康检查：控制连接已登录返回 `200 ok`，否则 `503` |
 
-客户端指标：`rfrp_client_uptime_seconds`、`rfrp_client_rtt_ms`、`rfrp_client_connected`、`rfrp_client_reconnects_total`、
-`rfrp_client_work_conns_total`、`rfrp_client_work_conn_failures_total`、
+客户端指标：`rfrp_client_uptime_seconds`、`rfrp_client_rtt_ms`、`rfrp_client_connected`、`rfrp_client_work_conn_tls`、
+`rfrp_client_reconnects_total`、`rfrp_client_work_conns_total`、`rfrp_client_work_conn_failures_total`、
 `rfrp_client_proxy_register_failures_total`、`rfrp_client_proxy_register_retry_success_total`。
+`/api/status` 的代理条目还包含 `state`（pending/registered/retrying/failed）与 `last_error`，
+用于区分“配置里有但实际没注册成功”的代理。
 
 ### 日志
 
@@ -264,9 +279,19 @@ rfrp client -c client.toml --watch-config=exit
 子进程异常退出时按指数退避重启。每次启动都使用同目录的私有 stage 配置快照
 （0600），旧 stage 保留到新子进程确认启动成功；新子进程实际启动失败（包括端口
 占用/TLS 加载失败）时，使用旧 stage 启动回退子进程，并持续重试旧配置，避免父进程
-直接退出造成长期离线。用户原配置文件不会被 stage/回滚覆盖。父进程被强杀时，
-子进程 stdin 会 EOF，从而触发自身优雅退出；适合 Windows 控制台和没有服务管理器的
-环境。
+直接退出造成长期离线。新子进程通过 ready 后还有 **60 秒观察期**：观察期内退出会
+回滚旧 stage，避免“能通过启动检查但运行即崩”的配置反复重启。用户原配置文件不会
+被 stage/回滚覆盖。父进程被强杀时，子进程 stdin 会 EOF，从而触发自身优雅退出；
+适合 Windows 控制台和没有服务管理器的环境。
+
+> **客户端 restart 模式的就绪语义**：客户端 ready 只在首次登录成功后写；但
+> supervisor 对客户端采用“子进程仍存活即视为已启动”的宽松策略——服务端暂时不可达
+> 时不会在 30 秒后杀掉它，而是继续监督重试。错误 token / 证书 / 版本仍会因进程
+> 快速退出而被识别为启动失败并回滚。
+
+> **systemd 请优先使用 `--watch-config=exit`**：发布包内的 unit 开启了
+> `ProtectSystem=strict`，`/etc/rfrp` 只读；restart 模式需要在配置同目录创建 stage
+> 快照，在该 hardening 下会失败。exit 模式只做校验与 bind 预检，不需要写 `/etc`。
 
 **exit 模式**：配置变化且校验通过后，进程优雅退出并返回退出码 `75`。系统服务
 管理器应配置为在非零退出后重启，例如 systemd `Restart=on-failure`、NSSM 的
@@ -295,6 +320,14 @@ crates/
 
 ```bash
 cargo test --all
+```
+
+安全与模糊测试（需额外工具；CI 的 `audit` job 会跑 `cargo audit`）：
+
+```bash
+make audit       # cargo audit（依赖漏洞/不维护 crate）
+make miri        # 需 nightly + miri：验证鉴权等纯逻辑
+make fuzz-smoke  # 需 nightly + cargo-fuzz：帧解析/配置解析各 1 万次
 ```
 
 真实进程级 E2E（仅依赖 Python 3 标准库）覆盖：

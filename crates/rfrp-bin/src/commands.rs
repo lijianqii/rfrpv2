@@ -378,11 +378,14 @@ pub async fn run_server(args: ServerArgs, log: LogOverrides) -> ExitCode {
         None => cfg.server.grace(),
     };
     if args.check {
-        print_server_config_summary(&args.config, &cfg, effective_grace);
+        print_server_config_summary(&args.config, &cfg, effective_grace, &log);
         return ExitCode::SUCCESS;
     }
     init_logging(&cfg.log, &log);
-    log_server_summary(&cfg, effective_grace);
+    if exit_watch.is_some() {
+        tracing::info!("config file watcher started");
+    }
+    log_server_summary(&cfg, effective_grace, &log);
     rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
         cfg.server.tcp_keepalive_secs,
     ));
@@ -449,11 +452,14 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
         }
     };
     if args.check {
-        print_client_config_summary(&args.config, &cfg);
+        print_client_config_summary(&args.config, &cfg, &log);
         return ExitCode::SUCCESS;
     }
     init_logging(&cfg.log, &log);
-    log_client_summary(&cfg);
+    if exit_watch.is_some() {
+        tracing::info!("config file watcher started");
+    }
+    log_client_summary(&cfg, &log);
     rfrp_common::util::tcp::init_keepalive(rfrp_common::util::tcp::KeepaliveConfig::from_secs(
         cfg.client.tcp_keepalive_secs,
     ));
@@ -527,7 +533,7 @@ pub async fn run_client(args: ClientArgs, log: LogOverrides) -> ExitCode {
 }
 
 /// `client status` 子命令：查询本地客户端状态端点并打印 `/api/status` 的 JSON。
-pub async fn run_status(config: PathBuf, addr: Option<String>) -> ExitCode {
+pub async fn run_status(config: PathBuf, addr: Option<String>, check: bool) -> ExitCode {
     let cfg = match rfrp_common::config::load_client_config(&config) {
         Ok(c) => c,
         Err(e) => {
@@ -543,6 +549,12 @@ pub async fn run_status(config: PathBuf, addr: Option<String>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    if check {
+        // `--check` 只校验配置/目标地址，不建立连接（与 help 文本一致）。
+        println!("client config OK: {}", config.display());
+        println!("  status endpoint: {target}");
+        return ExitCode::SUCCESS;
+    }
     match fetch_status(&target).await {
         Ok(body) => {
             print!("{body}");

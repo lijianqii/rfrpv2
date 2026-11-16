@@ -3,12 +3,11 @@
 //! 负责加载服务端证书/私钥、构建客户端根证书库，并封装 `TlsAcceptor` / `TlsConnector`，
 //! 供 `rfrps` / `rfrpc` 使用。当前只支持控制链路与工作连接的 TLS，不涉及 HTTPS vhost。
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
@@ -28,23 +27,10 @@ pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 /// 从 PEM 文件加载服务端 TLS 配置（证书 + 私钥）。
 pub fn load_server_tls(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
-    let cert_file = File::open(cert_path).map_err(|e| {
-        config(format!(
-            "cannot read TLS cert {}: {}",
-            cert_path.display(),
-            describe_io_error(&e)
-        ))
-    })?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| config(format!("invalid TLS cert {}: {e}", cert_path.display())))?
         .collect::<std::result::Result<_, _>>()
-        .map_err(|e| {
-            config(format!(
-                "invalid TLS cert {}: {}",
-                cert_path.display(),
-                describe_io_error(&e)
-            ))
-        })?;
+        .map_err(|e| config(format!("invalid TLS cert {}: {e}", cert_path.display())))?;
     if certs.is_empty() {
         return Err(config(format!(
             "no certificate found in {}",
@@ -52,23 +38,8 @@ pub fn load_server_tls(cert_path: &Path, key_path: &Path) -> Result<ServerConfig
         )));
     }
 
-    let key_file = File::open(key_path).map_err(|e| {
-        config(format!(
-            "cannot read TLS key {}: {}",
-            key_path.display(),
-            describe_io_error(&e)
-        ))
-    })?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| {
-            config(format!(
-                "invalid TLS key {}: {}",
-                key_path.display(),
-                describe_io_error(&e)
-            ))
-        })?
-        .ok_or_else(|| config(format!("no private key found in {}", key_path.display())))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| config(format!("invalid TLS key {}: {e}", key_path.display())))?;
 
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
@@ -94,15 +65,9 @@ fn load_root_cert_store(ca_path: Option<&Path>) -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     match ca_path {
         Some(path) => {
-            let file = File::open(path).map_err(|e| {
-                config(format!(
-                    "cannot read CA file {}: {}",
-                    path.display(),
-                    describe_io_error(&e)
-                ))
-            })?;
-            let mut reader = BufReader::new(file);
-            for cert in rustls_pemfile::certs(&mut reader) {
+            let certs = CertificateDer::pem_file_iter(path)
+                .map_err(|e| config(format!("invalid CA file {}: {e}", path.display())))?;
+            for cert in certs {
                 let cert =
                     cert.map_err(|e| config(format!("invalid CA cert {}: {e}", path.display())))?;
                 roots.add(cert).map_err(|e| {

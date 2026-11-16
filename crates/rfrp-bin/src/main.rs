@@ -82,9 +82,15 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Commands::Client {
-            action: Some(ClientAction::Status { config, addr }),
+            action:
+                Some(ClientAction::Status {
+                    config,
+                    addr,
+                    check: status_check,
+                }),
+            check,
             ..
-        } => run_status(config, addr).await,
+        } => run_status(config, addr, check || status_check).await,
         Commands::Client {
             config: Some(config),
             server,

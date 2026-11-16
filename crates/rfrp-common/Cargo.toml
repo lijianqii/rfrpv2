@@ -25,7 +25,6 @@ parking_lot = { workspace = true }
 httparse = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 socket2 = { workspace = true }
 

@@ -345,11 +345,7 @@ mod global_pool_tests {
         .is_ok());
         assert_eq!(state.pooled_work_conns.load(Ordering::Relaxed), 0);
         assert!(
-            session
-                .pools
-                .lock()
-                .get("ssh")
-                .map_or(true, |p| p.is_empty()),
+            session.pools.lock().get("ssh").is_none_or(|p| p.is_empty()),
             "cancelled session must not keep pooled connections"
         );
         drop(keep);

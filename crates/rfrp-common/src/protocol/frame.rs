@@ -29,7 +29,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// 构造帧。调用方应确保 payload 长度 ≤ `FRAME_MAX_PAYLOAD`。
+    /// 构造帧。调用方应确保 payload 长度 ≤ `CONTROL_FRAME_MAX_PAYLOAD`，
+    /// 否则 [`FrameCodec::encode`] 会拒绝。
     pub fn new(version: u8, msg_type: u8, payload: Vec<u8>) -> Self {
         Self {
             version,

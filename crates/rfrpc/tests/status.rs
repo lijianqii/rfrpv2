@@ -68,6 +68,10 @@ async fn status_endpoint_serves_status_and_metrics() {
     assert!(json["rtt_ms"].as_u64().is_some());
     assert_eq!(json["proxies"].as_array().unwrap().len(), 1);
     assert_eq!(json["proxies"][0]["name"], "p1");
+    assert_eq!(
+        json["proxies"][0]["state"], "registered",
+        "status must reflect actual registration result"
+    );
     assert!(json["uptime_seconds"].as_u64().is_some());
 
     // /metrics：Prometheus 文本含客户端指标。
@@ -122,7 +126,7 @@ async fn status_endpoint_unknown_path_404() {
 #[tokio::test]
 async fn status_endpoint_rate_limits_excess_requests() {
     // 状态端点与 Dashboard 一致：每 IP 100 次/分钟；超额必须返回 429，
-    // 避免无鉴权的只读端点被刷。
+    // 避免无鉴权的只读端点被刷。但 /healthz 不参与限流，探活必须始终可用。
     let echo_port = spawn_echo().await;
     let (srv, addr) = start_server(server_config(0)).await;
     let remote = free_port();
@@ -132,13 +136,13 @@ async fn status_endpoint_rate_limits_excess_requests() {
     let cli = start_client(cfg).await;
     assert!(wait_for_proxy(addr, remote, Duration::from_secs(5)).await);
 
-    // 等端点就绪（这一次请求会消耗 1 个配额）。
+    // 等端点就绪（healthz 不消耗限流配额）。
     let _ = get_with_retry(status_port, "/healthz", Duration::from_secs(5)).await;
 
     let mut ok = 0u32;
     let mut limited = 0u32;
     for _ in 0..120 {
-        match http_get(status_port, "/healthz").await.map(|(s, _)| s) {
+        match http_get(status_port, "/api/status").await.map(|(s, _)| s) {
             Ok(200) => ok += 1,
             Ok(429) => limited += 1,
             other => panic!("unexpected status {other:?}"),
@@ -148,7 +152,10 @@ async fn status_endpoint_rate_limits_excess_requests() {
         limited > 0,
         "excess requests must be rate limited (ok={ok}, limited={limited})"
     );
-    assert!(ok >= 95, "most requests should still succeed: {ok}");
+    assert!(ok >= 100, "the first 100 requests should succeed: {ok}");
+
+    let (status, _) = http_get(status_port, "/healthz").await.unwrap();
+    assert_eq!(status, 200, "healthz must bypass the general rate limiter");
 
     srv.abort();
     cli.abort();

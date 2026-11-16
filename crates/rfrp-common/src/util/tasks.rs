@@ -57,7 +57,8 @@ impl TaskGroup {
         })
     }
 
-    /// 标记不再期望新任务。调用后仍应避免继续 spawn；`wait` 以 active 为准。
+    /// 标记不再期望新任务。调用后仍应避免继续 spawn；等待请使用
+    /// [`TaskGroup::close_and_wait`]（它会先 close 再等待）。
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         // 若 wait 在 close 之前进入等待，此时 active 可能已经为 0，
@@ -69,9 +70,18 @@ impl TaskGroup {
         self.inner.active.load(Ordering::Acquire) == 0
     }
 
-    /// 等待所有已登记任务结束。`close` 之后调用可避免“刚检查完又有新任务”的
-    /// 无限等待；退出路径应先停止 accept，再 close/wait。
-    pub async fn wait(&self) {
+    /// 关闭任务组并等待所有已登记任务结束。
+    ///
+    /// 这是公开的等待入口：内部先 `close` 再 `wait`，避免调用方忘记 close
+    /// 导致 active 已为 0 时仍永久等待。退出路径应先停止 accept，再调用本方法。
+    pub async fn close_and_wait(&self) {
+        self.close();
+        self.wait().await;
+    }
+
+    /// 等待所有已登记任务结束。仅由 [`TaskGroup::close_and_wait`] 调用；
+    /// 单独调用时若未 close，会一直等到 close 或最后一个任务结束。
+    async fn wait(&self) {
         loop {
             let notified = self.inner.notify.notified();
             if self.inner.closed.load(Ordering::Acquire)
@@ -102,7 +112,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
         group.close();
-        tokio::time::timeout(Duration::from_secs(1), group.wait())
+        tokio::time::timeout(Duration::from_secs(1), group.close_and_wait())
             .await
             .expect("task group must finish");
         assert!(group.is_empty());
@@ -116,7 +126,7 @@ mod tests {
         });
         let _ = task.await;
         group.close();
-        tokio::time::timeout(Duration::from_secs(1), group.wait())
+        tokio::time::timeout(Duration::from_secs(1), group.close_and_wait())
             .await
             .expect("panicked task must release its slot");
         assert!(group.is_empty());

@@ -2,8 +2,51 @@
 //!
 //! 进程级、跨重连累计；控制循环与工作连接任务共享同一实例。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+
+use parking_lot::Mutex;
+
+/// 单个代理在本会话中的注册状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyState {
+    /// 尚未注册（连接中/重连后等待重新注册）。
+    Pending,
+    /// 已成功注册。
+    Registered,
+    /// 注册失败，后台重试中。
+    Retrying,
+    /// 不可重试的失败，已放弃。
+    Failed,
+}
+
+impl ProxyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Registered => "registered",
+            Self::Retrying => "retrying",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// 代理状态快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyStatus {
+    pub state: ProxyState,
+    pub last_error: Option<String>,
+}
+
+impl Default for ProxyStatus {
+    fn default() -> Self {
+        Self {
+            state: ProxyState::Pending,
+            last_error: None,
+        }
+    }
+}
 
 /// 客户端指标计数器。
 pub struct ClientMetrics {
@@ -25,6 +68,8 @@ pub struct ClientMetrics {
     pub proxy_register_failures_total: AtomicU64,
     /// 后台重试后注册成功的代理数。
     pub proxy_register_retry_success_total: AtomicU64,
+    /// 每个代理的注册状态（供状态端点排障）。
+    pub proxy_states: Mutex<HashMap<String, ProxyStatus>>,
 }
 
 impl Default for ClientMetrics {
@@ -45,6 +90,7 @@ impl ClientMetrics {
             work_conn_tls_actual: AtomicBool::new(false),
             proxy_register_failures_total: AtomicU64::new(0),
             proxy_register_retry_success_total: AtomicU64::new(0),
+            proxy_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -102,6 +148,35 @@ impl ClientMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 更新代理注册状态。
+    pub fn set_proxy_state(&self, name: &str, state: ProxyState, error: Option<String>) {
+        self.proxy_states.lock().insert(
+            name.to_string(),
+            ProxyStatus {
+                state,
+                last_error: error,
+            },
+        );
+    }
+
+    /// 读取代理状态（未知代理按 pending 处理）。
+    pub fn proxy_state(&self, name: &str) -> ProxyStatus {
+        self.proxy_states
+            .lock()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 新一轮控制会话开始：所有代理回到 pending，等待重新注册。
+    pub fn reset_proxy_states<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
+        let mut states = self.proxy_states.lock();
+        states.clear();
+        for name in names {
+            states.insert(name.to_string(), ProxyStatus::default());
+        }
+    }
+
     /// 渲染 Prometheus 文本。
     pub fn render(&self) -> String {
         format!(
@@ -114,6 +189,9 @@ impl ClientMetrics {
              # HELP rfrp_client_connected Whether the control connection is logged in (1/0).\n\
              # TYPE rfrp_client_connected gauge\n\
              rfrp_client_connected {}\n\
+             # HELP rfrp_client_work_conn_tls Whether work connections actually use TLS (1/0).\n\
+             # TYPE rfrp_client_work_conn_tls gauge\n\
+             rfrp_client_work_conn_tls {}\n\
              # HELP rfrp_client_reconnects_total Control connection reconnects.\n\
              # TYPE rfrp_client_reconnects_total counter\n\
              rfrp_client_reconnects_total {}\n\
@@ -132,6 +210,7 @@ impl ClientMetrics {
             self.uptime_secs(),
             self.rtt_ms(),
             u8::from(self.is_connected()),
+            u8::from(self.work_conn_tls()),
             self.reconnects_total.load(Ordering::Relaxed),
             self.work_conns_total.load(Ordering::Relaxed),
             self.work_conn_failures_total.load(Ordering::Relaxed),
@@ -154,17 +233,34 @@ mod tests {
         assert!(text.contains("rfrp_client_reconnects_total 0"));
 
         m.set_connected(true);
+        m.set_work_conn_tls(true);
         m.inc_reconnect();
         m.inc_work_conn();
         m.inc_work_conn_failure();
         m.inc_proxy_register_failure();
         m.inc_proxy_register_retry_success();
+        m.set_proxy_state("p1", ProxyState::Registered, None);
         let text = m.render();
         assert!(text.contains("rfrp_client_connected 1"));
+        assert!(text.contains("rfrp_client_work_conn_tls 1"));
         assert!(text.contains("rfrp_client_reconnects_total 1"));
         assert!(text.contains("rfrp_client_work_conns_total 1"));
         assert!(text.contains("rfrp_client_work_conn_failures_total 1"));
         assert!(text.contains("rfrp_client_proxy_register_failures_total 1"));
         assert!(text.contains("rfrp_client_proxy_register_retry_success_total 1"));
+        assert_eq!(m.proxy_state("p1").state, ProxyState::Registered);
+        assert_eq!(m.proxy_state("missing").state, ProxyState::Pending);
+    }
+
+    #[test]
+    fn proxy_states_reset_per_session() {
+        let m = ClientMetrics::new();
+        m.set_proxy_state("p1", ProxyState::Registered, None);
+        m.set_proxy_state("p2", ProxyState::Failed, Some("invalid field".into()));
+        m.reset_proxy_states(["p1", "p2", "p3"]);
+        for name in ["p1", "p2", "p3"] {
+            assert_eq!(m.proxy_state(name).state, ProxyState::Pending);
+            assert!(m.proxy_state(name).last_error.is_none());
+        }
     }
 }

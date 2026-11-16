@@ -177,8 +177,15 @@ where
                         };
                         match msg {
                             Message::NewProxyResp(r) => {
-                                if let Some(tx) = state.resps.lock().remove(&r.proxy_name) {
-                                    let _ = tx.send(r);
+                                match state.resps.lock().remove(&r.proxy_name) {
+                                    Some(tx) => {
+                                        let cached = r.clone();
+                                        if tx.send(r).is_err() {
+                                            // 接收端已因超时放弃：缓存响应供下一轮重试采用。
+                                            state.remember_late_response(cached);
+                                        }
+                                    }
+                                    None => state.remember_late_response(r),
                                 }
                             }
                             Message::ReqWorkConn(r) => {

@@ -31,6 +31,10 @@ pub struct Metrics {
     pub bytes_up: Arc<AtomicU64>,
     /// 累计下行字节（本地 -> 外部）。
     pub bytes_down: Arc<AtomicU64>,
+    /// UDP 从客户端收到的字节（包含随后因背压/预算被丢弃的包）。
+    pub udp_bytes_received_total: AtomicU64,
+    /// UDP 实际成功入队、准备转发给工作连接的字节。
+    pub udp_bytes_forwarded_total: AtomicU64,
 }
 
 /// 单个代理的累计统计（每代理指标与 Dashboard 用）。
@@ -74,6 +78,8 @@ impl Default for Metrics {
             active_connections: Arc::new(AtomicI64::new(0)),
             bytes_up: Arc::new(AtomicU64::new(0)),
             bytes_down: Arc::new(AtomicU64::new(0)),
+            udp_bytes_received_total: AtomicU64::new(0),
+            udp_bytes_forwarded_total: AtomicU64::new(0),
         }
     }
 }
@@ -132,6 +138,12 @@ impl Metrics {
              rfrp_bytes_up_total {}\n\
              # TYPE rfrp_bytes_down_total counter\n\
              rfrp_bytes_down_total {}\n\
+             # HELP rfrp_udp_bytes_received_total UDP bytes received from clients (includes dropped datagrams).\n\
+             # TYPE rfrp_udp_bytes_received_total counter\n\
+             rfrp_udp_bytes_received_total {}\n\
+             # HELP rfrp_udp_bytes_forwarded_total UDP bytes successfully queued for work connections.\n\
+             # TYPE rfrp_udp_bytes_forwarded_total counter\n\
+             rfrp_udp_bytes_forwarded_total {}\n\
              # HELP rfrp_rtt_ms Control connection round-trip time in milliseconds (0 = unknown); max across active sessions.\n\
              # TYPE rfrp_rtt_ms gauge\n\
              rfrp_rtt_ms {}\n\
@@ -157,6 +169,8 @@ impl Metrics {
             self.active_connections.load(Ordering::Relaxed),
             self.bytes_up.load(Ordering::Relaxed),
             self.bytes_down.load(Ordering::Relaxed),
+            self.udp_bytes_received_total.load(Ordering::Relaxed),
+            self.udp_bytes_forwarded_total.load(Ordering::Relaxed),
             rtt_ms,
             self.accepted_total.load(Ordering::Relaxed),
             self.accept_errors_total.load(Ordering::Relaxed),
@@ -300,6 +314,8 @@ mod tests {
         assert!(text.contains("rfrp_active_connections"));
         assert!(text.contains("rfrp_bytes_up_total"));
         assert!(text.contains("rfrp_bytes_down_total"));
+        assert!(text.contains("rfrp_udp_bytes_received_total"));
+        assert!(text.contains("rfrp_udp_bytes_forwarded_total"));
         assert!(text.contains("rfrp_udp_sessions_total"));
     }
 

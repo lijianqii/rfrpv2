@@ -42,15 +42,13 @@ pub const PROTOCOL_VERSIONS_SUPPORTED: &[u8] = &[PROTOCOL_VERSION];
 /// 帧头长度：Version(1) + MsgType(1) + Length(4)。
 pub const FRAME_HEADER_LEN: usize = 6;
 
-/// 单帧 Payload 上限（16 MiB）。
-pub const FRAME_MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
-
-/// 控制消息单帧上限（64 KiB）。
+/// 控制消息单帧上限（64 KiB），也是当前实现对所有帧的唯一实际上限。
 ///
-/// 控制消息（Login/NewProxy/心跳/Close 等）远小于此；服务端在认证前读取首帧时
-/// 也使用该上限，避免未认证连接只发 6 字节头声明 16 MiB 就触发等量内存分配。
-/// 配合 [`MAX_UNAUTHENTICATED_CONNECTIONS`]，未认证阶段的最坏预分配被限制在
-/// 约 64 MiB（1024 × 64 KiB），而不是 16 GiB。
+/// 帧头的 Length 字段是 u32（理论上限 4 GiB），但控制消息（Login/NewProxy/
+/// 心跳/Close 等）远小于 64 KiB。服务端在认证前读取首帧时也使用该上限，
+/// 避免未认证连接只发 6 字节头声明超大长度就触发等量内存分配。配合
+/// [`MAX_UNAUTHENTICATED_CONNECTIONS`]，未认证阶段的最坏预分配被限制在
+/// 约 64 MiB（1024 × 64 KiB）。
 pub const CONTROL_FRAME_MAX_PAYLOAD: u32 = 64 * 1024;
 
 /// work_id = 0 的保留值，表示「池化预备 / 补充池」语义（DESIGN §8.2）。

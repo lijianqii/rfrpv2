@@ -43,10 +43,12 @@ pub struct RequestHead {
     /// 消息边界歧义（重复 `Content-Length`、非法长度、`CL + Transfer-Encoding`）。
     /// 调用方应直接返回 400，避免前后端对请求体长度产生不同解释。
     pub framing_error: bool,
+    /// 请求行/头部无法解析。调用方应返回 400，而不是把它当成 `GET /` 处理。
+    pub parse_error: bool,
 }
 
 impl RequestHead {
-    /// 解析请求头；解析失败时退化为 `GET /`，由调用方决定返回 404 还是登录页。
+    /// 解析请求头；无法解析时 `parse_error=true`，调用方应返回 400。
     pub fn parse(head: &[u8]) -> Self {
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
@@ -55,44 +57,49 @@ impl RequestHead {
             path: "/".into(),
             ..Default::default()
         };
-        if let Ok(httparse::Status::Complete(_)) = req.parse(head) {
-            if let Some(m) = req.method {
-                out.method = m.to_string();
+        match req.parse(head) {
+            Ok(httparse::Status::Complete(_)) => {}
+            _ => {
+                out.parse_error = true;
+                return out;
             }
-            if let Some(p) = req.path {
-                out.path = p.to_string();
-            }
-            let mut content_length_seen = false;
-            let mut transfer_encoding_seen = false;
-            for h in req.headers.iter() {
-                let value = std::str::from_utf8(h.value).unwrap_or("").trim();
-                if h.name.eq_ignore_ascii_case("content-length") {
-                    if content_length_seen {
-                        out.framing_error = true;
-                    }
-                    content_length_seen = true;
-                    match value.parse() {
-                        Ok(n) => out.content_length = n,
-                        Err(_) => out.framing_error = true,
-                    }
-                } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                    if transfer_encoding_seen {
-                        out.framing_error = true;
-                    }
-                    transfer_encoding_seen = true;
-                } else if h.name.eq_ignore_ascii_case("accept") {
-                    out.accept_html = value.to_ascii_lowercase().contains("text/html");
-                } else if h.name.eq_ignore_ascii_case("authorization") {
-                    out.authorization = Some(value.to_string());
-                } else if h.name.eq_ignore_ascii_case("cookie") {
-                    out.cookie = Some(value.to_string());
-                } else if h.name.eq_ignore_ascii_case("x-forwarded-for") {
-                    out.x_forwarded_for.push(value.to_string());
+        }
+        if let Some(m) = req.method {
+            out.method = m.to_string();
+        }
+        if let Some(p) = req.path {
+            out.path = p.to_string();
+        }
+        let mut content_length_seen = false;
+        let mut transfer_encoding_seen = false;
+        for h in req.headers.iter() {
+            let value = std::str::from_utf8(h.value).unwrap_or("").trim();
+            if h.name.eq_ignore_ascii_case("content-length") {
+                if content_length_seen {
+                    out.framing_error = true;
                 }
+                content_length_seen = true;
+                match value.parse() {
+                    Ok(n) => out.content_length = n,
+                    Err(_) => out.framing_error = true,
+                }
+            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                if transfer_encoding_seen {
+                    out.framing_error = true;
+                }
+                transfer_encoding_seen = true;
+            } else if h.name.eq_ignore_ascii_case("accept") {
+                out.accept_html = value.to_ascii_lowercase().contains("text/html");
+            } else if h.name.eq_ignore_ascii_case("authorization") {
+                out.authorization = Some(value.to_string());
+            } else if h.name.eq_ignore_ascii_case("cookie") {
+                out.cookie = Some(value.to_string());
+            } else if h.name.eq_ignore_ascii_case("x-forwarded-for") {
+                out.x_forwarded_for.push(value.to_string());
             }
-            if content_length_seen && transfer_encoding_seen {
-                out.framing_error = true;
-            }
+        }
+        if content_length_seen && transfer_encoding_seen {
+            out.framing_error = true;
         }
         out
     }
@@ -226,8 +233,11 @@ where
         401 => "Unauthorized",
         404 => "Not Found",
         429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
-        _ => "OK",
+        504 => "Gateway Timeout",
+        _ => "Unknown",
     };
     let mut resp = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
@@ -497,12 +507,26 @@ mod tests {
         assert_eq!(req.authorization.as_deref(), Some("Basic abc"));
         assert_eq!(req.cookie.as_deref(), Some("a=1; b=2"));
 
-        // 解析失败时退化为 GET /（由调用方决定返回 404 还是登录页）。
+        // 解析失败时保留默认的 GET /，但置位 parse_error；调用方应返回 400，
+        // 而不是把畸形请求当成正常首页请求处理。
         let req = RequestHead::parse(b"garbage");
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/");
         assert_eq!(req.content_length, 0);
         assert!(!req.accept_html);
         assert!(req.authorization.is_none());
+        assert!(req.parse_error);
+    }
+
+    #[tokio::test]
+    async fn response_reason_phrase_for_common_errors() {
+        let (mut client, mut server) = duplex(4096);
+        write_response(&mut server, 500, "text/plain", "err", None)
+            .await
+            .unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
     }
 }

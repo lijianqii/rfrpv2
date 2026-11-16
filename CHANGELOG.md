@@ -6,6 +6,47 @@
 
 ## [Unreleased]
 
+### 2026-11-16 加固与一致性修复
+
+- **发布包开箱可用**：打包时为配置模板生成一套自签演示证书（并显著标注仅供试用），
+  发布脚本在打包前用主机架构二进制对包内模板实际执行 `--check`。
+- **客户端 supervisor 就绪语义**：`--watch-config=restart` 下客户端 30s 内未登录成功
+  但子进程仍存活时，不再判启动失败；继续监督重试，错误 token/证书/版本仍会因快速退出
+  被识别并回滚。
+- **`/healthz` 免限流**：Dashboard 与客户端状态端点的健康检查不再消耗通用请求配额，
+  避免共享出口 IP 的探活被 429 误判；普通 429 响应补充 `Retry-After`。
+- **vhost 过载返回 503**：达到 `max_active_connections` 时，vhost 用户收到
+  `503 + Retry-After`，而不是静默连接重置。
+- **`rfrp client status --check`**：只校验配置与目标地址，不建立连接（修正帮助文本与
+  实际行为不一致）。
+- **客户端退出及时性**：等待 LoginResp 与控制链路 TLS 握手时也监听退出令牌，
+  SIGTERM/SIGINT 不再等满 10s；新增“服务端不回 LoginResp 时客户端 3s 内退出”的
+  回归测试。
+- **控制帧上限收敛**：移除未使用的 16 MiB `FRAME_MAX_PAYLOAD`，统一为 64 KiB
+  `CONTROL_FRAME_MAX_PAYLOAD`，并补编码侧边界测试。
+- **客户端状态可排障**：`/api/status` 每个代理新增 `state`
+  （pending/registered/retrying/failed）与 `last_error`；修正 IPv6 地址拼接。
+- **指标补齐**：导出 `rfrp_client_work_conn_tls`；`/api/status` 增加
+  `heartbeat_resp_dropped_total`；注册超时/响应通道丢弃计入失败计数。
+- **日志安全与校验**：新建日志文件使用 0600；`[log]` 的 level/format/output 在配置
+  校验阶段拒绝非法值；`--check` 与启动摘要显示生效的日志设置。
+- **清理健壮性瑕疵**：去除配置校验路径的 `expect`；Dashboard 会话表满时淘汰最旧会话
+  而不是清空全部；Basic 认证的用户名/密码比较都执行，消除用户名时序旁路；
+  修正 HTTP 500/502/504 原因短语与畸形请求应返回 400 的处理。
+- **文档与发布元数据**：修正 DESIGN 的依赖表/协议版本/里程碑状态/常量清单；README
+  补充 restart 观察期、systemd exit 模式与发布包演示证书说明；Windows PE 版本号由
+  `build.rs` 从 `CARGO_PKG_VERSION` 生成；`make all` 与 `make ci` 去重，
+  `bench-gate` 使用 `--locked`。
+- **MSRV 上调到 1.85**：当前依赖（clap/uuid/proptest 等）已要求 Rust 1.85；
+  `Cargo.toml` 的 `rust-version`、DESIGN 与 CI 的 MSRV job 已同步。1.75 工具链
+  无法再解析当前锁定的依赖。
+- **CI**：新增 GitHub Actions 工作流，覆盖 fmt / clippy / test / MSRV 1.85 /
+  Windows 交叉编译 / `cargo audit`。
+- **遗留边界修复**：客户端缓存“注册超时后迟到的 NewProxyResp”，下一轮重试直接
+  采用，避免服务端已注册成功而客户端收到 `proxy_name exists` 后永久放弃；
+  `TaskGroup` 的公开等待入口改为 `close_and_wait`；代理/UDP 监听复用控制口
+  已解析的绑定 IP，避免每次注册重复解析域名；UDP 指标拆分为 received/forwarded。
+
 ### Added
 
 - **`[server].allow_plaintext_control`**：默认拒绝 `work_conn_tls=true` +

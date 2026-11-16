@@ -438,6 +438,7 @@ impl ServerConfig {
             }
         }
         self.validate_heartbeat()?;
+        self.log.validate()?;
         // allow_ports 格式必须可解析。
         let _ = self.proxy.parse_allow_ports()?;
         for p in [self.proxy.vhost_http_port, self.proxy.vhost_https_port]

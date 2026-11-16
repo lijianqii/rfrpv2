@@ -405,7 +405,7 @@ async fn register_udp_proxy_wires_per_proxy_stats() {
         0,
         &session,
         &state,
-        "127.0.0.1",
+        "127.0.0.1".parse().unwrap(),
         Duration::from_secs(60),
     )
     .await
@@ -465,6 +465,22 @@ async fn udp_metrics_track_pending_paired_and_downstream_bytes() {
             .load(std::sync::atomic::Ordering::Relaxed),
         up,
         "global and per-proxy upstream counters must agree"
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_bytes_received_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        up,
+        "UDP received bytes must include pending-window datagrams"
+    );
+    assert_eq!(
+        proxy
+            .metrics
+            .udp_bytes_forwarded_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        up,
+        "datagrams accepted into the pending queue must be counted as forwarded"
     );
 
     // 建立已配对会话：累计/活跃连接数各 +1。

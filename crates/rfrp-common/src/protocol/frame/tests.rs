@@ -1,9 +1,7 @@
 //! 帧编解码单元测试。
 
 use super::*;
-use crate::constants::{
-    CONTROL_FRAME_MAX_PAYLOAD, FRAME_MAX_PAYLOAD, PROTOCOL_MIN_VERSION, PROTOCOL_VERSION,
-};
+use crate::constants::{CONTROL_FRAME_MAX_PAYLOAD, PROTOCOL_MIN_VERSION, PROTOCOL_VERSION};
 use crate::protocol::msg::{Login, Message, MSG_LOGIN};
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,11 +66,23 @@ fn oversize_payload_rejected() {
     let f = Frame::new(
         PROTOCOL_VERSION,
         0x01,
-        vec![0u8; (FRAME_MAX_PAYLOAD as usize) + 1],
+        vec![0u8; (CONTROL_FRAME_MAX_PAYLOAD as usize) + 1],
     );
     let mut buf = BytesMut::new();
     let err = FrameCodec.encode(f, &mut buf).unwrap_err();
     assert!(matches!(err, Error::Protocol(_)));
+}
+
+#[test]
+fn exact_control_frame_limit_is_accepted() {
+    // 64 KiB 是编码侧的真实边界：恰好等于上限必须成功，多 1 字节必须失败。
+    let payload = vec![0x5a; CONTROL_FRAME_MAX_PAYLOAD as usize];
+    let frame = Frame::new(PROTOCOL_VERSION, 0x01, payload.clone());
+    let mut buf = BytesMut::new();
+    FrameCodec.encode(frame, &mut buf).unwrap();
+    let decoded = FrameCodec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.payload, payload);
+    assert!(buf.is_empty());
 }
 
 #[test]
@@ -107,7 +117,7 @@ fn oversize_length_in_header_rejected_without_payload() {
     let mut buf = BytesMut::new();
     buf.put_u8(PROTOCOL_VERSION);
     buf.put_u8(0x01);
-    buf.put_u32(FRAME_MAX_PAYLOAD + 1);
+    buf.put_u32(CONTROL_FRAME_MAX_PAYLOAD + 1);
     // 仅头部，无任何 payload 字节。
     let err = FrameCodec.decode(&mut buf).unwrap_err();
     assert!(matches!(err, Error::Protocol(_)));
@@ -246,7 +256,7 @@ mod proptests {
         /// 声称超长 length 的帧头必须在等待 payload 之前被拒绝（防缓冲无界增长）。
         #[test]
         fn oversized_length_rejected(extra in any::<u32>()) {
-            let len = FRAME_MAX_PAYLOAD.saturating_add(1).saturating_add(extra);
+            let len = CONTROL_FRAME_MAX_PAYLOAD.saturating_add(1).saturating_add(extra);
             let mut buf = BytesMut::new();
             buf.put_u8(PROTOCOL_VERSION);
             buf.put_u8(0x01);

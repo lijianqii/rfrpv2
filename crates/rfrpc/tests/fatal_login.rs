@@ -40,6 +40,7 @@ async fn fatal_login_exits_without_reconnect() {
             server_addr: addr.ip().to_string(),
             server_port: addr.port(),
             run_id_file: Some(run_id_file.to_string_lossy().to_string()),
+            work_conn_tls: false,
             ..Default::default()
         },
         ..Default::default()
@@ -88,6 +89,7 @@ async fn fatal_tls_certificate_error_exits_without_reconnect() {
             server_port: addr.port(),
             tls_enable: true,
             tls_server_name: Some("localhost".into()),
+            work_conn_tls: false,
             run_id_file: Some(dir.join("run_id").to_string_lossy().to_string()),
             ..Default::default()
         },
@@ -143,6 +145,7 @@ async fn fatal_login_version_mismatch_exits_without_reconnect() {
             server_addr: addr.ip().to_string(),
             server_port: addr.port(),
             run_id_file: Some(run_id_file.to_string_lossy().to_string()),
+            work_conn_tls: false,
             ..Default::default()
         },
         ..Default::default()

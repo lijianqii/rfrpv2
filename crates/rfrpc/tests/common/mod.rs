@@ -222,6 +222,7 @@ pub fn client_config(
             server_addr: server_addr.ip().to_string(),
             server_port: server_addr.port(),
             run_id_file,
+            work_conn_tls: false,
             ..Default::default()
         },
         proxies,
