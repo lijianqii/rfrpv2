@@ -7,7 +7,16 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_rfrp");
 
 fn tmp_config(name: &str, body: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("rfrp-status-{}-{name}.toml", std::process::id()));
+    // 同一测试二进制内用例并行执行：文件名必须唯一，否则一个用例 truncate
+    // 会让另一个用例读到空配置（CI 上已实际触发）。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "rfrp-status-{}-{name}-{stamp}.toml",
+        std::process::id()
+    ));
     std::fs::write(&path, body).unwrap();
     path
 }
