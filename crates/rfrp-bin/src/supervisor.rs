@@ -181,9 +181,11 @@ pub async fn run(config: PathBuf, args: Vec<OsString>) -> ExitCode {
             }
         }
 
-        if let Some(p) = probation.as_ref() {
-            if p.started.elapsed() >= PROBATION {
-                let p = probation.take().expect("checked above");
+        if probation
+            .as_ref()
+            .is_some_and(|p| p.started.elapsed() >= PROBATION)
+        {
+            if let Some(p) = probation.take() {
                 let _ = fs::remove_file(&p.old_stage);
                 let _ = fs::remove_file(&p.old_ready);
                 eprintln!("rfrp supervisor: new config passed probation");

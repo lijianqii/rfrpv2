@@ -50,7 +50,9 @@
   `invalid type` 错误码（不再直接断开控制连接）；CLI 日志覆盖值在 `--check`/启动时
   校验；协议支持版本改用区间表示，消除硬编码列表漂移；明确非 vhost 代理域名
   “单向校验、不预留”的语义并补回归测试；去掉 Windows `canonicalize` 产生的
-  `\\?\` 路径前缀；客户端状态端点 `/healthz` 补 `Cache-Control: no-store`。
+  `\\?\` 路径前缀；客户端状态端点 `/healthz` 补 `Cache-Control: no-store`；
+  生产路径移除剩余的 `expect/unwrap`（TLS 配置、pending 条目、probation、
+  `Server::local_addr`）。
 
 ### Added
 

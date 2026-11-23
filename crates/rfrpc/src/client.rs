@@ -351,7 +351,9 @@ impl Client {
 
         // 控制链路 TLS（仅 tls_enable=true 时启用；工作连接 TLS 由各工作连接按需决定）。
         let stream: BoxedStream = if self.config.client.tls_enable {
-            let tls = tls.as_ref().expect("tls built above");
+            let tls = tls
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("client TLS config missing"))?;
             // 控制链路 TLS 握手必须有超时：服务端/中间设备接受 TCP 但不完成握手时，
             // 否则客户端会永久挂起、既不重连也没有日志（工作连接 TLS 已有超时）。
             // 同时监听退出令牌：SIGTERM 落在握手期间时不应等满 10s。

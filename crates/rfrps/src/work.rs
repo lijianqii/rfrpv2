@@ -127,7 +127,11 @@ where
             );
             return Ok(());
         }
-        map.remove(&work_id).expect("checked above")
+        let Some(pending) = map.remove(&work_id) else {
+            tracing::warn!(work_id, "pending work entry disappeared");
+            return Ok(());
+        };
+        pending
     };
 
     let user = match pending.user {

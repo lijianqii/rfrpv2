@@ -31,6 +31,8 @@ use crate::state::ServerState;
 pub struct Server {
     config: Arc<ServerConfig>,
     listener: TcpListener,
+    /// 控制口实际地址（构造时解析一次，避免 `local_addr().unwrap()`）。
+    local_addr: SocketAddr,
     state: Arc<ServerState>,
     /// 优雅退出宽限期：停止接收后等待在途连接结束的最长时间（§14.4）。
     grace: Duration,
@@ -59,7 +61,8 @@ impl Server {
                 .map_err(|e| bind_error("control listener", &bind, e))?;
         // 代理 / vhost / UDP 监听复用控制口的实际 IP，避免每次注册都解析 bind_addr
         // （域名解析可能阻塞控制读循环）。
-        let bind_ip = listener.local_addr()?.ip();
+        let local_addr = listener.local_addr()?;
+        let bind_ip = local_addr.ip();
         let vhost_http =
             bind_optional(&config.server.bind_addr, config.proxy.vhost_http_port).await?;
         let dashboard = bind_dashboard(&config).await?;
@@ -74,6 +77,7 @@ impl Server {
         Ok(Self {
             config: Arc::new(config),
             listener,
+            local_addr,
             state,
             grace,
             heartbeat_interval,
@@ -87,7 +91,7 @@ impl Server {
 
     /// 实际监听地址（含 OS 分配的端口）。
     pub fn local_addr(&self) -> SocketAddr {
-        self.listener.local_addr().unwrap()
+        self.local_addr
     }
 
     /// 覆盖最大并发用户连接数（主要用于测试）。
@@ -381,7 +385,8 @@ async fn bind_vhost_https(config: &ServerConfig) -> Result<Option<(TcpListener, 
     let Some(port) = config.proxy.vhost_https_port else {
         return Ok(None);
     };
-    let tls = load_vhost_tls(config)?.expect("vhost_https_port checked above");
+    let tls = load_vhost_tls(config)?
+        .ok_or_else(|| Error::Other("vhost_https_port requires vhost TLS config".into()))?;
     let addr = format!("{}:{port}", config.server.bind_addr);
     let listener = TcpListener::bind((config.server.bind_addr.as_str(), port))
         .await
